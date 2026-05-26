@@ -97,8 +97,22 @@ impl EthTx {
     /// `0x0000000A` per the C reference:
     ///   bits[1:0]=10 -> HIGH, bits[3:2]=10 -> HIGH, rest=IDLE.
     /// 2× HIGH = 100 ns of DI=1 = single positive pulse on the line.
+    ///
+    /// Pads with 12 IDLE words after the NLP for the same reason
+    /// `send_raw_frame` does: if a frame TX is dispatched immediately
+    /// after the NLP (e.g. iface.poll runs right after the NLP-tick in
+    /// the main loop), the next preamble would land inside the host's
+    /// expected post-NLP/IFG window and FCS-fail. Critical section
+    /// keeps the DMA_IRQ_0 decoder from preempting the FIFO writes
+    /// (one NLP write alone is safe, but the 12 padding writes spin on
+    /// FIFO availability and so could be preempted mid-loop).
     pub fn send_nlp(&mut self) {
-        let _ = self.tx.write(0x0000_000A_u32);
+        critical_section::with(|_| {
+            let _ = self.tx.write(0x0000_000A_u32);
+            for _ in 0..12 {
+                while !self.tx.write(0u32) {}
+            }
+        });
     }
 
     /// Transmit a raw Ethernet frame body (dst MAC..end of payload, NO
@@ -152,6 +166,20 @@ impl EthTx {
             }
             // TP_IDL: end-of-frame marker.
             while !self.tx.write(0x0000_0AAA_u32) {}
+            // IFG padding: ≥ 9.6 µs of idle after TP_IDL before the next
+            // preamble can start (IEEE 802.3 minimum inter-frame gap).
+            // Each all-zero FIFO word = 16 PIO IDLE dispatches × 50 ns ≈
+            // 800 ns, so 12 words ≈ 9.6 µs. The FIFO is only 8-deep, so
+            // most pushes will spin until the PIO drains earlier ones —
+            // that's the point: keep the FIFO full of IDLE so the line
+            // stays quiet long enough for the host NIC to be ready for
+            // the next preamble. Without this, back-to-back smoltcp
+            // egresses (e.g. queued ARP→ICMP, or ICMP-reply followed by
+            // a UDP TX) leave < 9.6 µs gap and the host scores the
+            // second frame as bad-FCS (regression vs. polled mode).
+            for _ in 0..12 {
+                while !self.tx.write(0u32) {}
+            }
         });
     }
 
@@ -182,6 +210,11 @@ impl EthTx {
             // TP_IDL: end-of-frame marker — single positive pulse so the
             // magnetics secondary returns cleanly to 0 differential.
             while !self.tx.write(0x0000_0AAA_u32) {}
+            // IFG padding (same as send_raw_frame) — ensures the next
+            // preamble has ≥ 9.6 µs of clear air after TP_IDL.
+            for _ in 0..12 {
+                while !self.tx.write(0u32) {}
+            }
         });
     }
 }
