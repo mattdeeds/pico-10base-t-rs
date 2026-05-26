@@ -1,0 +1,4 @@
+/target
+Cargo.lock
+*.uf2
+*.elf

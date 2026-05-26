@@ -1,0 +1,12 @@
+# udev rule for the pico-10base-t-rs USB CDC device.
+#
+# Install as root with:
+#   cp tools/99-pico-rust.rules /etc/udev/rules.d/
+#   udevadm control --reload-rules && udevadm trigger
+#
+# After install the device shows up as /dev/ttyACM<N> readable by users in the
+# `plugdev` group, matching picotool's BOOTSEL device.
+
+# Our application-mode CDC (VID:PID 16c0:27dd, product "Pico-10BASE-T (Rust)")
+SUBSYSTEM=="tty", ATTRS{idVendor}=="16c0", ATTRS{idProduct}=="27dd", \
+    ATTRS{product}=="Pico-10BASE-T (Rust)", GROUP="plugdev", MODE="0660"

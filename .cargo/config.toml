@@ -1,0 +1,18 @@
+# Cargo config for Pico 2 (RP2350) Hazard3 RISC-V core.
+# See https://github.com/rp-rs/rp-hal/tree/main/rp235x-hal-examples for reference.
+
+[build]
+target = "riscv32imac-unknown-none-elf"
+
+[target.riscv32imac-unknown-none-elf]
+# linker arguments:
+#   --nmagic              turn off page alignment of sections (saves flash)
+#   -Trp235x_riscv.x      RISC-V-specific linker script (includes link.x and memory.x)
+rustflags = [
+    "-C", "link-arg=--nmagic",
+    "-C", "link-arg=-Trp235x_riscv.x",
+]
+
+# Flash via picotool over USB BOOTSEL. Auto-reboots from app mode because our
+# firmware exposes USB CDC. probe-rs 0.31 doesn't yet support Hazard3 RP2350.
+runner = "picotool load -fux -t elf"

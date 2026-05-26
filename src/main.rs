@@ -1,0 +1,438 @@
+//! Pico-10BASE-T (Rust / RP2350 Hazard3 / rp235x-hal)
+//!
+//! Phase R1 — USB CDC serial as the debug-log channel + LED heartbeat.
+//! Mirrors what the C version did via the pico-sdk's USB stdio. Once this
+//! is solid we'll layer the TX/RX Ethernet code on top (Phases R2, R3, R4).
+//!
+//! See ../Pico-10BASE-T/ for the C reference implementation we're porting from.
+
+#![no_std]
+#![no_main]
+
+mod crc;
+mod eth_mac;
+mod eth_rx;
+mod eth_tx;
+mod manchester;
+
+use panic_halt as _;
+
+use core::fmt::Write;
+use embedded_hal::digital::OutputPin;
+use heapless::String;
+use rp235x_hal as hal;
+use hal::dma::DMAExt;
+use hal::gpio::FunctionPio0;
+use hal::pio::PIOExt;
+use hal::singleton;
+use hal::Clock; // brings .freq() into scope
+use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
+use smoltcp::socket::udp;
+use smoltcp::phy::{ChecksumCapabilities, Device, TxToken};
+use smoltcp::time::Instant;
+use smoltcp::wire::{
+    ETHERNET_HEADER_LEN, EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress,
+    IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, UDP_HEADER_LEN, UdpPacket,
+    UdpRepr,
+};
+use usb_device::{class_prelude::*, prelude::*};
+use usbd_serial::SerialPort;
+
+const HW_PIN_TXD: u8 = 14; // ISL3177E DI
+const HW_PIN_RXD: u8 = 13; // ISL3177E RO
+
+/// Tell the Boot ROM about our application.
+#[link_section = ".start_block"]
+#[used]
+pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
+
+/// Pico 2 board has a 12 MHz crystal.
+const XTAL_FREQ_HZ: u32 = 12_000_000u32;
+
+#[hal::entry]
+fn main() -> ! {
+    let mut pac = hal::pac::Peripherals::take().unwrap();
+
+    let mut watchdog = hal::Watchdog::new(pac.WATCHDOG);
+    let clocks = hal::clocks::init_clocks_and_plls(
+        XTAL_FREQ_HZ,
+        pac.XOSC,
+        pac.CLOCKS,
+        pac.PLL_SYS,
+        pac.PLL_USB,
+        &mut pac.RESETS,
+        &mut watchdog,
+    )
+    .unwrap();
+
+    let sio = hal::Sio::new(pac.SIO);
+    let pins = hal::gpio::Pins::new(
+        pac.IO_BANK0,
+        pac.PADS_BANK0,
+        sio.gpio_bank0,
+        &mut pac.RESETS,
+    );
+    let mut led = pins.gpio25.into_push_pull_output();
+
+    let timer = hal::Timer::new_timer0(pac.TIMER0, &mut pac.RESETS, &clocks);
+
+    // GP14 → ISL3177E DI, GP13 → ISL3177E RO. Reassign both to PIO0 function.
+    let _tx_pin: hal::gpio::Pin<_, FunctionPio0, _> = pins.gpio14.into_function();
+    let _rx_pin: hal::gpio::Pin<_, FunctionPio0, _> = pins.gpio13.into_function();
+
+    // PIO0 SM0 drives the Manchester TX; SM1 runs the RX sampler.
+    let (mut pio0, sm0, sm1, _sm2, _sm3) = pac.PIO0.split(&mut pac.RESETS);
+    let sys_clk_hz = clocks.system_clock.freq().to_Hz();
+    let eth_tx = eth_tx::EthTx::new(&mut pio0, sm0, HW_PIN_TXD, sys_clk_hz);
+
+    // DMA channels 0 and 1 ferry samples from the PIO RX FIFO into two
+    // 16 KB half-buffers. EthRx::poll_with hands the just-filled half to
+    // the decoder while DMA continues filling the other.
+    let dma = pac.DMA.split(&mut pac.RESETS);
+    let rx_buf_a = singleton!(: [u32; eth_rx::BUF_WORDS] = [0; eth_rx::BUF_WORDS]).unwrap();
+    let rx_buf_b = singleton!(: [u32; eth_rx::BUF_WORDS] = [0; eth_rx::BUF_WORDS]).unwrap();
+    // Carry + stitch buffers for ring-aware scan across DMA half boundaries.
+    // Both static (in BSS via singleton!) — too big to want on the stack.
+    let rx_carry =
+        singleton!(: [u8; eth_rx::MAX_CARRY_BYTES] = [0; eth_rx::MAX_CARRY_BYTES]).unwrap();
+    let rx_stitch =
+        singleton!(: [u8; eth_rx::STITCH_BUF_BYTES] = [0; eth_rx::STITCH_BUF_BYTES]).unwrap();
+    let eth_rx = eth_rx::EthRx::new(
+        &mut pio0,
+        sm1,
+        HW_PIN_RXD,
+        sys_clk_hz,
+        dma.ch0,
+        dma.ch1,
+        rx_buf_a,
+        rx_buf_b,
+        rx_carry,
+        rx_stitch,
+    );
+
+    // Install EthRx into the shared static the DMA_IRQ_0 handler reads,
+    // then unmask the IRQ + enable Hazard3 machine-external interrupts.
+    // From this point on, decoding is interrupt-driven — the main loop
+    // never polls EthRx; smoltcp drains the inbox via EthMac::Device::
+    // receive instead.
+    let _ = eth_mac::install_rx(eth_rx);
+    unsafe {
+        hal::arch::interrupt_unmask(hal::pac::Interrupt::DMA_IRQ_0);
+        hal::arch::interrupt_enable();
+    }
+
+    // EthMac now owns just the TX side + a scratch buffer; RX state lives
+    // in the shared static. smoltcp's Interface still sees a single
+    // Device handle.
+    let mut mac = eth_mac::EthMac::new(eth_tx);
+
+    let our_mac = EthernetAddress([0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC]);
+    let our_ip = IpAddress::Ipv4(Ipv4Address::new(192, 168, 37, 24));
+    let mut iface_config = Config::new(HardwareAddress::Ethernet(our_mac));
+    iface_config.random_seed = timer.get_counter().ticks();
+    let now0_inst = Instant::from_micros(timer.get_counter().ticks() as i64);
+    let mut iface = Interface::new(iface_config, &mut mac, now0_inst);
+    iface.update_ip_addrs(|addrs| {
+        addrs.push(IpCidr::new(our_ip, 24)).unwrap();
+    });
+
+    let mut sockets_storage: [SocketStorage; 4] = [SocketStorage::EMPTY; 4];
+    let mut sockets = SocketSet::new(&mut sockets_storage[..]);
+
+    // R4.6: UDP echo socket on port 1234. Storage lives in main's stack
+    // (the singleton! macro would be nicer but for a one-off it's overkill).
+    let mut udp_rx_meta = [udp::PacketMetadata::EMPTY; 8];
+    let mut udp_rx_payload = [0u8; 2048];
+    let mut udp_tx_meta = [udp::PacketMetadata::EMPTY; 8];
+    let mut udp_tx_payload = [0u8; 2048];
+    let udp_rx_buffer = udp::PacketBuffer::new(&mut udp_rx_meta[..], &mut udp_rx_payload[..]);
+    let udp_tx_buffer = udp::PacketBuffer::new(&mut udp_tx_meta[..], &mut udp_tx_payload[..]);
+    let udp_socket = udp::Socket::new(udp_rx_buffer, udp_tx_buffer);
+    let udp_handle: SocketHandle = sockets.add(udp_socket);
+
+    // Mirror the C reference's network parameters so the host's existing
+    // ethtool / IP route setup keeps working.
+    let endpoint = eth_tx::UdpEndpoint {
+        src_mac: [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC],
+        dst_mac: [0xFF; 6], // broadcast
+        src_ip: [192, 168, 37, 24],
+        dst_ip: [192, 168, 37, 19],
+        src_port: 1234,
+        dst_port: 1234,
+    };
+
+    // USB CDC: appears on the host as /dev/ttyACM0.
+    let usb_bus = UsbBusAllocator::new(hal::usb::UsbBus::new(
+        pac.USB,
+        pac.USB_DPRAM,
+        clocks.usb_clock,
+        true,
+        &mut pac.RESETS,
+    ));
+    let mut serial = SerialPort::new(&usb_bus);
+
+    // VID:PID 2e8a:000a is the Raspberry Pi Foundation's allocation for the
+    // pico-sdk "stdio_usb" CDC device. picotool recognizes this pair and can
+    // force-reboot the chip into BOOTSEL mode via USB (no button press needed).
+    let mut usb_dev = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0x2e8a, 0x000a))
+        .strings(&[StringDescriptors::default()
+            .manufacturer("pico-10base-t-rs")
+            .product("Pico-10BASE-T (Rust)")
+            .serial_number("R1")])
+        .unwrap()
+        .max_packet_size_0(64)
+        .unwrap()
+        .device_class(2) // USB CDC
+        .build();
+
+    // NLPs at 16 ms intervals; UDP frames at 200 ms; smoltcp-built UDP at
+    // 500 ms (R4.2 verification); heartbeat log at 1 s.
+    let now0 = timer.get_counter().ticks();
+    let mut next_nlp = now0;
+    let mut next_udp = now0 + 200_000;
+    let mut next_smol_udp = now0 + 350_000;
+    let mut next_log = now0 + 1_000_000;
+    let mut nlps_sent: u32 = 0;
+    let mut udp_sent: u32 = 0;
+    let mut smol_udp_sent: u32 = 0;
+    let mut log_tick: u32 = 0;
+    let mut led_state = false;
+    let mut payload_buf: String<64> = String::new();
+    let mut smol_payload_buf: String<48> = String::new();
+
+    let mut line: String<160> = String::new();
+
+    loop {
+        usb_dev.poll(&mut [&mut serial]);
+        let now = timer.get_counter().ticks();
+
+        // RX decoding is interrupt-driven now (DMA_IRQ_0 handler in
+        // eth_mac.rs) — no per-iteration poll needed. The main loop's
+        // 2.18 ms iteration budget is gone.
+
+        // R4.4: smoltcp drives ingress (drains the inbox) + egress (any
+        // queued ARP/ICMP/socket TX). Cheap when there's nothing to do.
+        let now_inst = Instant::from_micros(now as i64);
+        iface.poll(now_inst, &mut mac, &mut sockets);
+
+        // R4.6: UDP echo on port 1234. Bind lazily on first poll; on each
+        // iteration, drain any received datagrams and echo them back to
+        // the sender. Cap on echoed-per-poll keeps the main loop bounded.
+        {
+            let socket = sockets.get_mut::<udp::Socket>(udp_handle);
+            if !socket.is_open() {
+                let _ = socket.bind(1234);
+            }
+            let mut echo_buf = [0u8; 512];
+            for _ in 0..4 {
+                match socket.recv_slice(&mut echo_buf) {
+                    Ok((len, meta)) => {
+                        let _ = socket.send_slice(&echo_buf[..len], meta.endpoint);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        // NLP every 16 ms — IEEE 802.3 link-integrity keepalive.
+        if now >= next_nlp {
+            next_nlp = next_nlp.wrapping_add(16_000);
+            mac.send_nlp();
+            nlps_sent = nlps_sent.wrapping_add(1);
+        }
+
+        // UDP broadcast every 200 ms — mirrors the C reference's payload.
+        if now >= next_udp {
+            next_udp = next_udp.wrapping_add(200_000);
+            payload_buf.clear();
+            let _ = write!(
+                payload_buf,
+                "Hello World!! Raspico 10BASE-T Rust !! n={}",
+                udp_sent
+            );
+            mac.send_udp_broadcast(&endpoint, payload_buf.as_bytes());
+            udp_sent = udp_sent.wrapping_add(1);
+        }
+
+        // R4.2: a UDP broadcast built via smoltcp's wire::Repr emit-into,
+        // shipped through the EthMac::Device::transmit → EthTxToken path.
+        // Runs alongside the existing send_udp_broadcast so the two can be
+        // compared on the host listener.
+        if now >= next_smol_udp {
+            next_smol_udp = next_smol_udp.wrapping_add(500_000);
+            smol_payload_buf.clear();
+            let _ = write!(smol_payload_buf, "smoltcp tx n={}", smol_udp_sent);
+            let payload = smol_payload_buf.as_bytes();
+
+            let src_ip = Ipv4Address::new(192, 168, 37, 24);
+            let dst_ip = Ipv4Address::new(192, 168, 37, 255);
+            let udp_repr = UdpRepr {
+                src_port: 4321,
+                dst_port: 1234,
+            };
+            let ip_repr = Ipv4Repr {
+                src_addr: src_ip,
+                dst_addr: dst_ip,
+                next_header: IpProtocol::Udp,
+                payload_len: UDP_HEADER_LEN + payload.len(),
+                hop_limit: 64,
+            };
+            let body_len = ETHERNET_HEADER_LEN + ip_repr.buffer_len() + ip_repr.payload_len;
+
+            let now_inst = Instant::from_micros(now as i64);
+            if let Some(token) = mac.transmit(now_inst) {
+                token.consume(body_len, |buf| {
+                    let mut eth = EthernetFrame::new_unchecked(buf);
+                    eth.set_src_addr(EthernetAddress([0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC]));
+                    eth.set_dst_addr(EthernetAddress::BROADCAST);
+                    eth.set_ethertype(EthernetProtocol::Ipv4);
+
+                    let mut ip = Ipv4Packet::new_unchecked(eth.payload_mut());
+                    ip_repr.emit(&mut ip, &ChecksumCapabilities::default());
+
+                    let mut udp = UdpPacket::new_unchecked(ip.payload_mut());
+                    udp_repr.emit(
+                        &mut udp,
+                        &IpAddress::Ipv4(src_ip),
+                        &IpAddress::Ipv4(dst_ip),
+                        payload.len(),
+                        |b| b.copy_from_slice(payload),
+                        &ChecksumCapabilities::default(),
+                    );
+                });
+            }
+            smol_udp_sent = smol_udp_sent.wrapping_add(1);
+        }
+
+        // Status print every 1 s.
+        if now >= next_log {
+            next_log = next_log.wrapping_add(1_000_000);
+            log_tick = log_tick.wrapping_add(1);
+            led_state = !led_state;
+            if led_state {
+                led.set_high().unwrap();
+            } else {
+                led.set_low().unwrap();
+            }
+
+            line.clear();
+            let _ = writeln!(
+                line,
+                "[R2b] t={} nlps={} udp_sent={}",
+                log_tick, nlps_sent, udp_sent
+            );
+            nlps_sent = 0;
+            let _ = serial.write(line.as_bytes());
+
+            // Snapshot the IRQ-managed RX stats (this also resets the
+            // window-scoped fields back to 0).
+            let rx = eth_mac::snapshot_rx_stats();
+            let last_dst_mac: [u8; 6] = if rx.last_frame_snapshot_len >= 6 {
+                let mut m = [0u8; 6];
+                m.copy_from_slice(&rx.last_frame_snapshot[..6]);
+                m
+            } else {
+                [0; 6]
+            };
+            line.clear();
+            let _ = writeln!(
+                line,
+                "[Rx] dec={} ok={} fail={} dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                rx.frames_decoded,
+                rx.fcs_ok,
+                rx.fcs_fail,
+                last_dst_mac[0],
+                last_dst_mac[1],
+                last_dst_mac[2],
+                last_dst_mac[3],
+                last_dst_mac[4],
+                last_dst_mac[5]
+            );
+            let _ = serial.write(line.as_bytes());
+            line.clear();
+            let _ = writeln!(
+                line,
+                "[Mac] iface_rx={} tx_arp={} tx_icmp={} tx_udp={} tx_other={} inbox_drop={} inbox_hwm={} carry_cap={} last_tx_len={}",
+                mac.stats.rx_handed_out,
+                mac.stats.tx_arp,
+                mac.stats.tx_icmp,
+                mac.stats.tx_udp,
+                mac.stats.tx_other,
+                rx.inbox_dropped,
+                rx.inbox_high_water,
+                rx.carry_capped,
+                mac.stats.last_tx_len,
+            );
+            let _ = serial.write(line.as_bytes());
+            // Hex dump of the most recent TX body.
+            let tx_n = (mac.stats.last_tx_len as usize).min(mac.stats.last_tx.len());
+            let mut row = 0;
+            while row * 16 < tx_n {
+                line.clear();
+                let _ = write!(line, "  tx {:04x}:", row * 16);
+                let mut col = 0;
+                while col < 16 && row * 16 + col < tx_n {
+                    let _ = write!(line, " {:02x}", mac.stats.last_tx[row * 16 + col]);
+                    col += 1;
+                }
+                let _ = writeln!(line);
+                let _ = serial.write(line.as_bytes());
+                row += 1;
+            }
+            mac.stats.rx_handed_out = 0;
+            mac.stats.tx_handed_out = 0;
+            mac.stats.tx_consumed = 0;
+            mac.stats.tx_arp = 0;
+            mac.stats.tx_icmp = 0;
+            mac.stats.tx_udp = 0;
+            mac.stats.tx_other = 0;
+
+            // Pretty-print the most recently decoded frame, same shape as
+            // ../Pico-10BASE-T/src/eth_rx.c:eth_rx_decode_frame() output.
+            if rx.last_frame_snapshot_len > 0 {
+                let f = &rx.last_frame_snapshot[..rx.last_frame_snapshot_len];
+                let etype = if f.len() >= 14 {
+                    u16::from_be_bytes([f[12], f[13]])
+                } else {
+                    0
+                };
+                line.clear();
+                let _ = writeln!(
+                    line,
+                    "[Rx] frame {} bytes, FCS {} - dst {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} src {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} type={:04x}",
+                    rx.last_frame_len,
+                    if rx.last_frame_was_ok { "OK" } else { "FAIL" },
+                    f[0], f[1], f[2], f[3], f[4], f[5],
+                    f[6], f[7], f[8], f[9], f[10], f[11],
+                    etype,
+                );
+                let _ = serial.write(line.as_bytes());
+                let dump_n = f.len().min(64);
+                let mut row = 0;
+                while row * 16 < dump_n {
+                    line.clear();
+                    let _ = write!(line, "  {:04x}:", row * 16);
+                    let mut col = 0;
+                    while col < 16 && row * 16 + col < dump_n {
+                        let _ = write!(line, " {:02x}", f[row * 16 + col]);
+                        col += 1;
+                    }
+                    let _ = writeln!(line);
+                    let _ = serial.write(line.as_bytes());
+                    row += 1;
+                }
+            }
+
+        }
+    }
+}
+
+/// Picotool 'binary info' so `picotool info` reports something useful.
+#[link_section = ".bi_entries"]
+#[used]
+pub static PICOTOOL_ENTRIES: [hal::binary_info::EntryAddr; 4] = [
+    hal::binary_info::rp_cargo_bin_name!(),
+    hal::binary_info::rp_cargo_version!(),
+    hal::binary_info::rp_program_description!(c"Pico-10BASE-T (Rust port, Phase R1)"),
+    hal::binary_info::rp_program_url!(c"https://github.com/kingyoPiyo/Pico-10BASE-T"),
+];
