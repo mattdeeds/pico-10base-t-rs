@@ -1,7 +1,7 @@
 # Clock-recovery decoder — design plan
 
-Status: **Phase 0 + 1 algorithm DONE** (2026-05-27); Phase 2 next (production
-implementation — likely PIO). Unblocks full-MTU RX, the #1 router-foundation
+Status: **Phase 0 + 1 algorithm DONE** (2026-05-27); Phase 2 = PIO-side
+production implementation, planned in **`docs/pio-decoder-plan.md`**. Unblocks full-MTU RX, the #1 router-foundation
 blocker found in A1. See RESUME.md "Router project — A1 link characterization"
 and the `project-vision-router` memory. The offline bench lives in
 `tools/clock-recovery/` (corpus + `harness.py` + `capture.py`).
