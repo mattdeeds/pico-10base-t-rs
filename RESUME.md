@@ -207,7 +207,9 @@ core, stack/routing on the other) + a bigger inbox + flow control.
 
 **Revised priority order (A1 reshaped it — these now precede NAT/wireless):**
 1. **Decoder clock recovery** (full-MTU RX). Without it the link can't carry
-   real traffic at all. Biggest blocker; was hidden until A1.
+   real traffic at all. Biggest blocker; was hidden until A1. **Design plan:
+   [`docs/clock-recovery-decoder-plan.md`](docs/clock-recovery-decoder-plan.md)**
+   (offline sample corpus first, then DPLL/edge-resync vs PIO-side recovery).
 2. **Core separation + buffering** so decode-under-load doesn't starve routing.
 3. **Collisions / half-duplex** (full-duplex HW or PIO CSMA) — matters once 1+2
    are fixed; secondary today.
