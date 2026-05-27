@@ -31,13 +31,8 @@ use hal::singleton;
 use hal::Clock; // brings .freq() into scope
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::socket::{tcp, udp};
-use smoltcp::phy::{ChecksumCapabilities, Device, TxToken};
 use smoltcp::time::Instant;
-use smoltcp::wire::{
-    ETHERNET_HEADER_LEN, EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress,
-    IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, UDP_HEADER_LEN, UdpPacket,
-    UdpRepr,
-};
+use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 use usb_device::{class_prelude::*, prelude::*};
 use usbd_serial::SerialPort;
 
@@ -219,20 +214,16 @@ fn main() -> ! {
         .device_class(2) // USB CDC
         .build();
 
-    // NLPs at 16 ms intervals; UDP frames at 200 ms; smoltcp-built UDP at
-    // 500 ms (R4.2 verification); heartbeat log at 1 s.
+    // NLPs at 16 ms intervals; UDP broadcast at 200 ms; heartbeat log at 1 s.
     let now0 = timer.get_counter().ticks();
     let mut next_nlp = now0;
     let mut next_udp = now0 + 200_000;
-    let mut next_smol_udp = now0 + 350_000;
     let mut next_log = now0 + 1_000_000;
     let mut nlps_sent: u32 = 0;
     let mut udp_sent: u32 = 0;
-    let mut smol_udp_sent: u32 = 0;
     let mut log_tick: u32 = 0;
     let mut led_state = false;
     let mut payload_buf: String<64> = String::new();
-    let mut smol_payload_buf: String<48> = String::new();
 
     let mut line: String<160> = String::new();
 
@@ -255,63 +246,9 @@ fn main() -> ! {
         let now_inst = Instant::from_micros(now as i64);
         iface.poll(now_inst, &mut mac, &mut sockets);
 
-        // R4.6: UDP echo on port 1234. Bind lazily on first poll; on each
-        // iteration, drain any received datagrams and echo them back to
-        // the sender. Cap on echoed-per-poll keeps the main loop bounded.
-        {
-            let socket = sockets.get_mut::<udp::Socket>(udp_handle);
-            if !socket.is_open() {
-                let _ = socket.bind(1234);
-            }
-            // Sized for a full-MTU UDP datagram (1500 - 20 IP - 8 UDP = 1472
-            // payload). Was 512, which silently truncated larger echoes — and
-            // masked the fact that RX now decodes full-MTU frames after the
-            // single-pass decoder lifted the old ~199-byte cap.
-            let mut echo_buf = [0u8; 1472];
-            for _ in 0..4 {
-                match socket.recv_slice(&mut echo_buf) {
-                    Ok((len, meta)) => {
-                        let _ = socket.send_slice(&echo_buf[..len], meta.endpoint);
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-
-        // R7: tiny HTTP server on port 80. Re-listens after each closed
-        // connection. Drains the request best-effort (we don't parse it),
-        // then writes a fixed-shape HTTP/1.0 response with build info +
-        // uptime and closes. Validates TCP retransmission/windowing
-        // through our RX path.
-        {
-            let socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
-            if !socket.is_open() {
-                let _ = socket.listen(80);
-            }
-            if socket.may_recv() {
-                // Eat whatever the client sent (we don't actually parse it).
-                let _ = socket.recv(|buf| (buf.len(), ()));
-            }
-            if socket.can_send() {
-                let mut body: String<160> = String::new();
-                let _ = write!(
-                    body,
-                    "Hello from Pico-10BASE-T (Rust)!\r\n\
-                     uptime={}s nlps={} udp_sent={}\r\n",
-                    log_tick, nlps_sent, udp_sent
-                );
-                let mut head: String<128> = String::new();
-                let _ = write!(
-                    head,
-                    "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = socket.send_slice(head.as_bytes());
-                let _ = socket.send_slice(body.as_bytes());
-                socket.close();
-            }
-        }
+        // R4.6: UDP echo on port 1234. R7: tiny HTTP server on port 80.
+        serve_udp_echo(&mut sockets, udp_handle);
+        serve_http(&mut sockets, tcp_handle, log_tick, nlps_sent, udp_sent);
 
         // NLP every 16 ms — IEEE 802.3 link-integrity keepalive.
         if now >= next_nlp {
@@ -333,57 +270,7 @@ fn main() -> ! {
             udp_sent = udp_sent.wrapping_add(1);
         }
 
-        // R4.2: a UDP broadcast built via smoltcp's wire::Repr emit-into,
-        // shipped through the EthMac::Device::transmit → EthTxToken path.
-        // Runs alongside the existing send_udp_broadcast so the two can be
-        // compared on the host listener.
-        if now >= next_smol_udp {
-            next_smol_udp = next_smol_udp.wrapping_add(500_000);
-            smol_payload_buf.clear();
-            let _ = write!(smol_payload_buf, "smoltcp tx n={}", smol_udp_sent);
-            let payload = smol_payload_buf.as_bytes();
-
-            let src_ip = Ipv4Address::new(192, 168, 37, 24);
-            let dst_ip = Ipv4Address::new(192, 168, 37, 255);
-            let udp_repr = UdpRepr {
-                src_port: 4321,
-                dst_port: 1234,
-            };
-            let ip_repr = Ipv4Repr {
-                src_addr: src_ip,
-                dst_addr: dst_ip,
-                next_header: IpProtocol::Udp,
-                payload_len: UDP_HEADER_LEN + payload.len(),
-                hop_limit: 64,
-            };
-            let body_len = ETHERNET_HEADER_LEN + ip_repr.buffer_len() + ip_repr.payload_len;
-
-            let now_inst = Instant::from_micros(now as i64);
-            if let Some(token) = mac.transmit(now_inst) {
-                token.consume(body_len, |buf| {
-                    let mut eth = EthernetFrame::new_unchecked(buf);
-                    eth.set_src_addr(EthernetAddress(our_mac_bytes));
-                    eth.set_dst_addr(EthernetAddress::BROADCAST);
-                    eth.set_ethertype(EthernetProtocol::Ipv4);
-
-                    let mut ip = Ipv4Packet::new_unchecked(eth.payload_mut());
-                    ip_repr.emit(&mut ip, &ChecksumCapabilities::default());
-
-                    let mut udp = UdpPacket::new_unchecked(ip.payload_mut());
-                    udp_repr.emit(
-                        &mut udp,
-                        &IpAddress::Ipv4(src_ip),
-                        &IpAddress::Ipv4(dst_ip),
-                        payload.len(),
-                        |b| b.copy_from_slice(payload),
-                        &ChecksumCapabilities::default(),
-                    );
-                });
-            }
-            smol_udp_sent = smol_udp_sent.wrapping_add(1);
-        }
-
-        // Status print every 1 s.
+        // Heartbeat + status print every 1 s.
         if now >= next_log {
             next_log = next_log.wrapping_add(1_000_000);
             log_tick = log_tick.wrapping_add(1);
@@ -393,93 +280,147 @@ fn main() -> ! {
             } else {
                 led.set_low().unwrap();
             }
-
-            line.clear();
-            let _ = writeln!(
-                line,
-                "[R2b] t={} nlps={} udp_sent={}",
-                log_tick, nlps_sent, udp_sent
-            );
-            nlps_sent = 0;
-            let _ = serial.write(line.as_bytes());
-
-            // Snapshot the IRQ-managed RX stats (this also resets the
-            // window-scoped fields back to 0).
-            let rx = eth_mac::snapshot_rx_stats();
-            let last_dst_mac: [u8; 6] = if rx.last_frame_snapshot_len >= 6 {
-                let mut m = [0u8; 6];
-                m.copy_from_slice(&rx.last_frame_snapshot[..6]);
-                m
-            } else {
-                [0; 6]
-            };
-            line.clear();
-            let _ = writeln!(
-                line,
-                "[Rx] dec={} ok={} fail={} filt={} dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                rx.frames_decoded,
-                rx.fcs_ok,
-                rx.fcs_fail,
-                rx.frames_filtered,
-                last_dst_mac[0],
-                last_dst_mac[1],
-                last_dst_mac[2],
-                last_dst_mac[3],
-                last_dst_mac[4],
-                last_dst_mac[5]
-            );
-            let _ = serial.write(line.as_bytes());
-            line.clear();
-            let _ = writeln!(
-                line,
-                "[Mac] iface_rx={} tx_arp={} tx_icmp={} tx_udp={} tx_other={} inbox_drop={} inbox_hwm={} carry_cap={} last_tx_len={}",
-                mac.stats.rx_handed_out,
-                mac.stats.tx_arp,
-                mac.stats.tx_icmp,
-                mac.stats.tx_udp,
-                mac.stats.tx_other,
-                rx.inbox_dropped,
-                rx.inbox_high_water,
-                rx.carry_capped,
-                mac.stats.last_tx_len,
-            );
-            let _ = serial.write(line.as_bytes());
-            // Hex dump of the most recent TX body.
-            let tx_n = (mac.stats.last_tx_len as usize).min(mac.stats.last_tx.len());
-            hex_dump(&mut serial, &mut line, "tx ", &mac.stats.last_tx[..tx_n]);
-            mac.stats.rx_handed_out = 0;
-            mac.stats.tx_handed_out = 0;
-            mac.stats.tx_consumed = 0;
-            mac.stats.tx_arp = 0;
-            mac.stats.tx_icmp = 0;
-            mac.stats.tx_udp = 0;
-            mac.stats.tx_other = 0;
-
-            // Pretty-print the most recently decoded frame, same shape as
-            // ../Pico-10BASE-T/src/eth_rx.c:eth_rx_decode_frame() output.
-            if rx.last_frame_snapshot_len > 0 {
-                let f = &rx.last_frame_snapshot[..rx.last_frame_snapshot_len];
-                let etype = if f.len() >= 14 {
-                    u16::from_be_bytes([f[12], f[13]])
-                } else {
-                    0
-                };
-                line.clear();
-                let _ = writeln!(
-                    line,
-                    "[Rx] frame {} bytes, FCS {} - dst {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} src {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} type={:04x}",
-                    rx.last_frame_len,
-                    if rx.last_frame_was_ok { "OK" } else { "FAIL" },
-                    f[0], f[1], f[2], f[3], f[4], f[5],
-                    f[6], f[7], f[8], f[9], f[10], f[11],
-                    etype,
-                );
-                let _ = serial.write(line.as_bytes());
-                let dump_n = f.len().min(64);
-                hex_dump(&mut serial, &mut line, "", &f[..dump_n]);
-            }
-
+            log_status(&mut serial, &mut line, &mut mac, log_tick, nlps_sent, udp_sent);
+            nlps_sent = 0; // [R2b] reports nlps as a per-second rate
         }
+    }
+}
+
+/// R4.6: UDP echo on port 1234 — bind lazily, then drain up to a few received
+/// datagrams per poll and echo each back to its sender (the per-poll cap keeps
+/// the loop bounded). `echo_buf` is sized for a full-MTU UDP payload
+/// (1500 − 20 IP − 8 UDP = 1472), so larger echoes aren't truncated.
+fn serve_udp_echo(sockets: &mut SocketSet, handle: SocketHandle) {
+    let socket = sockets.get_mut::<udp::Socket>(handle);
+    if !socket.is_open() {
+        let _ = socket.bind(1234);
+    }
+    let mut echo_buf = [0u8; 1472];
+    for _ in 0..4 {
+        match socket.recv_slice(&mut echo_buf) {
+            Ok((len, meta)) => {
+                let _ = socket.send_slice(&echo_buf[..len], meta.endpoint);
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// R7: tiny HTTP/1.0 server on port 80 — re-listens after each closed
+/// connection, drains the request best-effort (we don't parse it), and writes
+/// a fixed-shape 200 OK with build info + uptime, then closes. Exercises TCP
+/// handshake / retransmission / windowing through the RX path.
+fn serve_http(
+    sockets: &mut SocketSet,
+    handle: SocketHandle,
+    uptime_s: u32,
+    nlps: u32,
+    udp_sent: u32,
+) {
+    let socket = sockets.get_mut::<tcp::Socket>(handle);
+    if !socket.is_open() {
+        let _ = socket.listen(80);
+    }
+    if socket.may_recv() {
+        let _ = socket.recv(|buf| (buf.len(), ()));
+    }
+    if socket.can_send() {
+        let mut body: String<160> = String::new();
+        let _ = write!(
+            body,
+            "Hello from Pico-10BASE-T (Rust)!\r\n\
+             uptime={}s nlps={} udp_sent={}\r\n",
+            uptime_s, nlps, udp_sent
+        );
+        let mut head: String<128> = String::new();
+        let _ = write!(
+            head,
+            "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = socket.send_slice(head.as_bytes());
+        let _ = socket.send_slice(body.as_bytes());
+        socket.close();
+    }
+}
+
+/// Emit the once-per-second status block over USB CDC: the `[R2b]` heartbeat,
+/// the `[Rx]` decode summary (snapshots + resets the IRQ-managed RX stats),
+/// the `[Mac]` TX-categorization line + TX hex dump, and a pretty-print + hex
+/// dump of the most recently decoded frame.
+fn log_status<B: UsbBus>(
+    serial: &mut SerialPort<'_, B>,
+    line: &mut String<160>,
+    mac: &mut eth_mac::EthMac,
+    log_tick: u32,
+    nlps_sent: u32,
+    udp_sent: u32,
+) {
+    line.clear();
+    let _ = writeln!(line, "[R2b] t={} nlps={} udp_sent={}", log_tick, nlps_sent, udp_sent);
+    let _ = serial.write(line.as_bytes());
+
+    // Snapshot the IRQ-managed RX stats (also resets the window-scoped fields).
+    let rx = eth_mac::snapshot_rx_stats();
+    let last_dst_mac: [u8; 6] = if rx.last_frame_snapshot_len >= 6 {
+        let mut m = [0u8; 6];
+        m.copy_from_slice(&rx.last_frame_snapshot[..6]);
+        m
+    } else {
+        [0; 6]
+    };
+    line.clear();
+    let _ = writeln!(
+        line,
+        "[Rx] dec={} ok={} fail={} filt={} dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        rx.frames_decoded, rx.fcs_ok, rx.fcs_fail, rx.frames_filtered,
+        last_dst_mac[0], last_dst_mac[1], last_dst_mac[2],
+        last_dst_mac[3], last_dst_mac[4], last_dst_mac[5]
+    );
+    let _ = serial.write(line.as_bytes());
+
+    line.clear();
+    let _ = writeln!(
+        line,
+        "[Mac] iface_rx={} tx_arp={} tx_icmp={} tx_udp={} tx_other={} inbox_drop={} inbox_hwm={} carry_cap={} last_tx_len={}",
+        mac.stats.rx_handed_out, mac.stats.tx_arp, mac.stats.tx_icmp, mac.stats.tx_udp,
+        mac.stats.tx_other, rx.inbox_dropped, rx.inbox_high_water, rx.carry_capped,
+        mac.stats.last_tx_len,
+    );
+    let _ = serial.write(line.as_bytes());
+    let tx_n = (mac.stats.last_tx_len as usize).min(mac.stats.last_tx.len());
+    hex_dump(serial, line, "tx ", &mac.stats.last_tx[..tx_n]);
+    mac.stats.rx_handed_out = 0;
+    mac.stats.tx_handed_out = 0;
+    mac.stats.tx_consumed = 0;
+    mac.stats.tx_arp = 0;
+    mac.stats.tx_icmp = 0;
+    mac.stats.tx_udp = 0;
+    mac.stats.tx_other = 0;
+
+    // Pretty-print the most recently decoded frame, same shape as
+    // ../Pico-10BASE-T/src/eth_rx.c:eth_rx_decode_frame() output.
+    if rx.last_frame_snapshot_len > 0 {
+        let f = &rx.last_frame_snapshot[..rx.last_frame_snapshot_len];
+        let etype = if f.len() >= 14 {
+            u16::from_be_bytes([f[12], f[13]])
+        } else {
+            0
+        };
+        line.clear();
+        let _ = writeln!(
+            line,
+            "[Rx] frame {} bytes, FCS {} - dst {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} src {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} type={:04x}",
+            rx.last_frame_len,
+            if rx.last_frame_was_ok { "OK" } else { "FAIL" },
+            f[0], f[1], f[2], f[3], f[4], f[5],
+            f[6], f[7], f[8], f[9], f[10], f[11],
+            etype,
+        );
+        let _ = serial.write(line.as_bytes());
+        let dump_n = f.len().min(64);
+        hex_dump(serial, line, "", &f[..dump_n]);
     }
 }
 
