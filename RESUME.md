@@ -17,7 +17,8 @@ For the C reference and the proven Manchester / decoder design, see [`../Pico-10
 | **R6** — IRQ-driven RX | ✅ | RX state moved into a module-level `Mutex<RefCell<Option<EthRxShared>>>`; DMA channels `enable_irq0()`'d so each half-completion fires `DMA_IRQ_0`, whose handler runs the full stitch + decode + inbox-push pipeline. Main loop no longer polls — `iface.poll` drains the inbox via `Device::receive`. **2.18 ms main-loop budget is gone.** `EthTx::send_raw_frame`, `send_udp_broadcast`, and `send_nlp` wrap their PIO writes in `critical_section::with` (so the IRQ can't preempt mid-frame and underrun the FIFO) and pad ≥ 9.6 µs of IDLE after every TP_IDL / NLP (so back-to-back TX paths leave the IEEE 802.3-required inter-frame gap before the next preamble). Concurrent stress matches the polled R5 baseline: **UDP 100%, ping 99.7%, host RX errs 0–2 / 30 s.** |
 | **R7** — MAC filtering | ✅ | New `EthRx::peek_dst_mac` decodes just the 6 dst-MAC bytes (no Vec allocation, ~1–2 µs) before the IRQ handler decides whether to pay for the full decode + CRC + inbox push. `EthRxShared` learns our MAC via the updated `install_rx(rx, our_mac)` signature; accepts unicast-to-us + all multicast/broadcast (smoltcp does finer-grained filtering downstream). Adds `frames_filtered` to the 1 Hz log. Concurrent stress unaffected: UDP 99.7%, ping 100%, errs ≤1. `filt=0` during normal traffic on this LAN because everything visible is either to-us or IPv6 link-local multicast — the reject path is verified by inspection rather than counter (AF_PACKET-injected unicast-to-unknown-MAC test frames don't actually leave the host's Broadcom NIC in 10HD-half mode, presumably driver-side filtering on raw frames with no ARP target). |
 | **R8** — TCP listener | ✅ | `socket-tcp` added to smoltcp feature set; tiny HTTP server on port 80 serves a 200 OK with build info + per-second nlps/udp_sent counters. 1 KB RX + 1 KB TX buffers, re-listens after each closed connection. Concurrent stress (ping + UDP echo + 15 sequential curls): ping 300/300, UDP 299/300, curls 15/15, errs 1/30s — every protocol still at or above polled R5 baseline. Validates that the IRQ-driven RX path + smoltcp handle full TCP handshake + retransmission/windowing/FIN cleanly. |
-| **Beyond R8** — pick from improvements list below | ⏳ | next |
+| **R9** — picotool reset interface | ✅ | New `src/pico_reset.rs` implements a `UsbClass` with a single vendor-specific interface (class=0xFF, sub=0x00, proto=0x01, no endpoints) matching the pico-sdk's `stdio_usb` reset interface. Picotool sends a control transfer (request 0x01 = BOOTSEL); our `control_out` queues the reboot, the next main-loop iteration calls `hal::reboot::reboot(BootSel{...}, Normal)`. Also derives the USB serial from the chip ID (`{wafer_id:08X}{device_id:08X}` via `rom_data::sys_info_api::chip_info()`) so it matches the bootrom's BOOTSEL serial — picotool tracks serials across the app→BOOTSEL transition. `cargo run` / `picotool load -fux -t elf` now self-reboot + flash with **no manual BOOTSEL and no OpenOCD fallback**. Gotcha #4 retired. |
+| **Beyond R9** — pick from improvements list below | ⏳ | next |
 
 Last verified: 2026-05-26 (post-R6, IRQ-driven RX with TX critsec + IFG padding on every TX path). Two-run avg of the 30-sec concurrent stress: ping 99.7%, UDP echo 100.0%, host RX errs ≤2/30s — matches or exceeds the polled R5 baseline on every metric while keeping the IRQ architectural benefit. Telemetry: `dec=20 ok=20 fail=0 inbox_drop=0 inbox_hwm=1–2 carry_cap=0`. The journey from R6's initial 20 errs/30s down to ~1: TX critsec (20 → 8), `send_raw_frame` IFG padding (8 → 4), `send_nlp` IFG padding (4 → 2.5), `send_udp_broadcast` IFG padding (2.5 → ≤2). The pattern was the same every time — once IRQs can preempt the main loop, any TX path that doesn't both critsec its FIFO writes *and* pad post-TP_IDL with ≥ 9.6 µs of IDLE can land its tail under the host NIC's expected IFG window and corrupt the next frame the host receives.
 
@@ -35,6 +36,7 @@ Last verified: 2026-05-26 (post-R6, IRQ-driven RX with TX critsec + IFG padding 
 | `.cargo/config.toml` | RISC-V target, linker args, picotool runner (with OpenOCD fallback) |
 | `memory.x` + `rp235x_riscv.x` | Linker scripts for Hazard3 |
 | `tools/99-pico-rust.rules` | udev rule to put `/dev/ttyACM*` in the `plugdev` group |
+| `src/pico_reset.rs` | `PicoResetInterface` — vendor USB class implementing the pico-sdk reset interface so `picotool -f` can self-reboot us into BOOTSEL (R9) |
 
 ## Toolchain summary
 
@@ -50,12 +52,13 @@ Last verified: 2026-05-26 (post-R6, IRQ-driven RX with TX critsec + IFG padding 
 ## Build / flash / smoke test from a fresh checkout
 
 ```bash
-# 1. Build (cargo run auto-flashes via picotool when the device exposes USB CDC)
+# 1. Build + flash via `cargo run` — auto-reboots from app into BOOTSEL
+#    via the R9 reset interface, no manual button-press needed.
 cd ~/projects/pico-10base-t-rs
-cargo build --release
-cargo run --release    # may need OpenOCD fallback on the very first flash
+cargo run --release
 
-# 2. OpenOCD fallback (use if picotool reports "Unable to locate reset interface"):
+# 2. OpenOCD fallback (only needed for first flash onto a chip whose app
+#    doesn't yet expose the R9 reset interface, or for recovery):
 openocd -s ~/src/openocd-rp/tcl \
         -f interface/cmsis-dap.cfg -f target/rp2350-riscv.cfg \
         -c "adapter speed 5000" -c "init" \
@@ -132,7 +135,7 @@ curl -s --max-time 5 http://192.168.37.24/
 1. **`out pc, N` in PIO jumps to *absolute* addresses.** The Manchester dispatch table MUST live at PIO instruction offsets 0..2. Without `.origin 0` in the `pio_asm!` block, `pio::install()` puts the program elsewhere (we saw offset 26), and the SM jumps off into empty `0x0000` slots, silently looping. The symptom is sneaky: SM reports "running," FIFO drains, pin reads as `Output`/`PIO0`-funcseled, GPIO_IN shows toggling — but on the wire there are no NLPs and the host carrier never comes up.
 2. **`StateMachine::start()` consumes `self`.** If you do `sm.start();` without binding the returned `StateMachine<_, Running>`, you've created and immediately dropped the running handle. Whether that disables the SM depends on internals; always bind it: `let sm = sm.start();` and store in your struct.
 3. **`panic-probe` is Cortex-M only** — it emits a `compile_error!` on `riscv32`. Use a plain `#[panic_handler]` that logs via your own channel (we use defmt+RTT-style printf via USB CDC).
-4. **picotool's `-f` auto-reboot needs the pico-sdk's "reset interface"** (vendor-specific USB endpoint), not just a CDC ACM with `VID:PID=2e8a:000a`. Bare `usbd-serial` advertises the right VID:PID but doesn't expose the reset interface, so picotool errors with `Unable to locate reset interface`. Solutions: either fall back to OpenOCD for flashing, or add a custom USB vendor interface. **Open TODO**, deferred for now.
+4. **picotool's `-f` auto-reboot needs the pico-sdk's "reset interface"** (vendor-specific USB endpoint), not just a CDC ACM with `VID:PID=2e8a:000a`. Bare `usbd-serial` advertises the right VID:PID but doesn't expose the reset interface, so picotool errors with `Unable to locate reset interface`. **Resolved in R9** — `src/pico_reset.rs` implements the interface as a `UsbClass` (vendor class, sub=0x00, proto=0x01, no endpoints) and reboots from main-loop context via `hal::reboot::reboot(BootSel{...}, Normal)`. Two gotchas inside the gotcha: (a) picotool sends a **Class** request type (`bmRequestType=0x21`), not Vendor, even though our interface descriptor says class=0xFF — TinyUSB's vendor driver dispatches both; usb-device routes strictly, so we have to accept both `RequestType::Class` *and* `RequestType::Vendor`. (b) Picotool tracks the device by USB serial number across the app→BOOTSEL reboot, so the app's serial must match what the bootrom advertises in BOOTSEL mode (= the chip ID, formatted as `{wafer_id:08X}{device_id:08X}` from `rom_data::sys_info_api::chip_info()`); using a static string like `"R1"` triggers a successful reboot followed by "no accessible RP-series devices in BOOTSEL mode were found with serial number R1".
 5. **`cat /dev/ttyACM1` may show nothing** even when the firmware is writing fine. `usbd-serial` only delivers buffered bytes once a host asserts DTR; plain `cat` doesn't set DTR via termios. Use a tool that does (pyserial, `minicom`, `screen`, or the `TIOCMBIS + TIOCM_DTR` ioctl shown in the verify recipe). Dropped diagnostic time chasing this once — easy to forget.
 6. **`hal::singleton!(: [u32; N] = ...)` is the canonical way to allocate a `&'static mut` DMA buffer** in rp235x-hal. `&'static mut [u32; N]` impls `StableDeref` (via `stable_deref_trait`) and behaves correctly through `embedded-dma`'s blanket `WriteBuffer` impl. No `Box`, no `UnsafeCell` wrapping needed; no special alignment beyond u32 since we use `double_buffer` (not RP2350's endless-ring mode).
 7. **PIO TX FIFO underruns mid-frame if the CPU pauses between writes.** The original `EthTx::send_raw_frame` pushed the body bytes, then computed CRC-32 (bit-by-bit, ~27 µs at 150 MHz for a 98-byte frame), then pushed FCS bytes. The 8-deep TX FIFO drains in ~6 µs at 20 MHz half-bit rate, so during the CRC compute the wire stalled, the receiver lost Manchester sync, and the host NIC scored a bad FCS on every frame that hit this path. **Fix: precompute the CRC before *any* PIO writes** so the per-byte writes run uninterrupted. Symptoms were sneaky — UDP broadcasts (built whole-frame in a buffer first) worked perfectly, but anything routed through smoltcp's `TxToken::consume → send_raw_frame` (ARP replies, ICMP echo replies, smoltcp-emitted UDP) failed silently because we didn't see the NIC's RX-error counter until we explicitly looked. Verified by `cat /proc/net/dev` ticking up RX-errors by exactly one per sent frame.
@@ -151,15 +154,13 @@ curl -s --max-time 5 http://192.168.37.24/
 
 ## Future work
 
-### Beyond R8 — improvements (priority order, pick whichever bites)
+### Beyond R9 — improvements (priority order, pick whichever bites)
 
 1. **Multicast group subscriptions.** Currently the MAC filter accepts *all* multicast (anything with I/G bit set) and relies on smoltcp to drop ones we don't care about. Fine for small workloads, wasteful on a busy multicast LAN. Once smoltcp's multicast subscription API is wired, narrow `mac_accept` to specific group MACs.
 
 2. **Pico-side HTTP request parsing.** The R8 server ignores the request line entirely — every GET (and every other verb) gets the same response. Route on method+path so we can expose distinct endpoints (e.g., `/stats`, `/frames`, `/reset`).
 
-3. **picotool reset interface.** Gotcha #4 — `cargo run` still needs an OpenOCD fallback or a manual BOOTSEL because `usbd-serial` doesn't expose the pico-sdk vendor reset endpoint. Adding a custom USB vendor class would let `picotool load -fux` self-reboot.
-
-4. **Clean up the `static mut RAW_FRAME` warning** in `send_udp_broadcast` — pre-existing, harmless, but it'll become a hard error in a future Rust edition.
+3. **Clean up the `static mut RAW_FRAME` warning** in `send_udp_broadcast` — pre-existing, harmless, but it'll become a hard error in a future Rust edition.
 
 ### Cleanup wishlist
 - Add picotool reset interface so `cargo run` flashes without the OpenOCD fallback (custom usb-device vendor class)

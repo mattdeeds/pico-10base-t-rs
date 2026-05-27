@@ -14,6 +14,7 @@ mod eth_mac;
 mod eth_rx;
 mod eth_tx;
 mod manchester;
+mod pico_reset;
 
 use panic_halt as _;
 
@@ -181,15 +182,35 @@ fn main() -> ! {
         &mut pac.RESETS,
     ));
     let mut serial = SerialPort::new(&usb_bus);
+    // Vendor "reset interface" so `picotool -f` can self-reboot us into
+    // BOOTSEL without the manual button-press / OpenOCD fallback.
+    let mut reset_iface = pico_reset::PicoResetInterface::new(&usb_bus);
+
+    // Serial number = chip ID, matching the format the BOOTSEL bootrom
+    // advertises (16 hex chars = wafer_id || device_id). picotool tracks
+    // serials across the app→BOOTSEL transition; if they don't match
+    // (e.g. with a static string), `picotool -f` reboots us into BOOTSEL
+    // successfully but then fails to identify the BOOTSEL device as the
+    // same one it asked to reboot, and gives up.
+    let mut serial_str: String<16> = String::new();
+    match hal::rom_data::sys_info_api::chip_info() {
+        Ok(Some(info)) => {
+            let _ = write!(serial_str, "{:08X}{:08X}", info.wafer_id, info.device_id);
+        }
+        _ => {
+            let _ = write!(serial_str, "0000000000000000");
+        }
+    }
 
     // VID:PID 2e8a:000a is the Raspberry Pi Foundation's allocation for the
     // pico-sdk "stdio_usb" CDC device. picotool recognizes this pair and can
-    // force-reboot the chip into BOOTSEL mode via USB (no button press needed).
+    // force-reboot the chip into BOOTSEL mode via the vendor reset interface
+    // we register below.
     let mut usb_dev = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0x2e8a, 0x000a))
         .strings(&[StringDescriptors::default()
             .manufacturer("pico-10base-t-rs")
             .product("Pico-10BASE-T (Rust)")
-            .serial_number("R1")])
+            .serial_number(serial_str.as_str())])
         .unwrap()
         .max_packet_size_0(64)
         .unwrap()
@@ -214,7 +235,13 @@ fn main() -> ! {
     let mut line: String<160> = String::new();
 
     loop {
-        usb_dev.poll(&mut [&mut serial]);
+        usb_dev.poll(&mut [&mut serial, &mut reset_iface]);
+        // If a USB control transfer requested a reboot (e.g. picotool -f),
+        // honor it from clean main-loop context so the STATUS stage of
+        // the originating SETUP transaction completed first.
+        if let Some(kind) = reset_iface.take_pending_reboot() {
+            hal::reboot::reboot(kind, pico_reset::RebootArch::Normal);
+        }
         let now = timer.get_counter().ticks();
 
         // RX decoding is interrupt-driven now (DMA_IRQ_0 handler in
