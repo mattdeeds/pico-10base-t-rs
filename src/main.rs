@@ -1,8 +1,9 @@
 //! Pico-10BASE-T (Rust / RP2350 Hazard3 / rp235x-hal)
 //!
-//! Phase R1 — USB CDC serial as the debug-log channel + LED heartbeat.
-//! Mirrors what the C version did via the pico-sdk's USB stdio. Once this
-//! is solid we'll layer the TX/RX Ethernet code on top (Phases R2, R3, R4).
+//! Full software 10BASE-T NIC: PIO Manchester TX + PIO/DMA RX sampler with
+//! an IRQ-driven decoder, bridged to smoltcp (ARP + ICMP + UDP echo + a tiny
+//! HTTP server). USB CDC carries the debug log; a vendor reset interface lets
+//! `picotool -f` self-reboot into BOOTSEL. See RESUME.md for the phase log.
 //!
 //! See ../Pico-10BASE-T/ for the C reference implementation we're porting from.
 
@@ -15,6 +16,7 @@ mod eth_rx;
 mod eth_tx;
 mod manchester;
 mod pico_reset;
+mod pio_util;
 
 use panic_halt as _;
 
@@ -440,19 +442,7 @@ fn main() -> ! {
             let _ = serial.write(line.as_bytes());
             // Hex dump of the most recent TX body.
             let tx_n = (mac.stats.last_tx_len as usize).min(mac.stats.last_tx.len());
-            let mut row = 0;
-            while row * 16 < tx_n {
-                line.clear();
-                let _ = write!(line, "  tx {:04x}:", row * 16);
-                let mut col = 0;
-                while col < 16 && row * 16 + col < tx_n {
-                    let _ = write!(line, " {:02x}", mac.stats.last_tx[row * 16 + col]);
-                    col += 1;
-                }
-                let _ = writeln!(line);
-                let _ = serial.write(line.as_bytes());
-                row += 1;
-            }
+            hex_dump(&mut serial, &mut line, "tx ", &mac.stats.last_tx[..tx_n]);
             mac.stats.rx_handed_out = 0;
             mac.stats.tx_handed_out = 0;
             mac.stats.tx_consumed = 0;
@@ -482,22 +472,31 @@ fn main() -> ! {
                 );
                 let _ = serial.write(line.as_bytes());
                 let dump_n = f.len().min(64);
-                let mut row = 0;
-                while row * 16 < dump_n {
-                    line.clear();
-                    let _ = write!(line, "  {:04x}:", row * 16);
-                    let mut col = 0;
-                    while col < 16 && row * 16 + col < dump_n {
-                        let _ = write!(line, " {:02x}", f[row * 16 + col]);
-                        col += 1;
-                    }
-                    let _ = writeln!(line);
-                    let _ = serial.write(line.as_bytes());
-                    row += 1;
-                }
+                hex_dump(&mut serial, &mut line, "", &f[..dump_n]);
             }
 
         }
+    }
+}
+
+/// Write a 16-bytes-per-row hex dump of `data` to the USB CDC serial port,
+/// one `serial.write` per row. `label` is inserted after the two-space
+/// indent and before the offset (e.g. `"tx "` → `  tx 0000: ..`, `""` →
+/// `  0000: ..`). `line` is a caller-owned scratch buffer, reused per row.
+fn hex_dump<B: UsbBus>(
+    serial: &mut SerialPort<'_, B>,
+    line: &mut String<160>,
+    label: &str,
+    data: &[u8],
+) {
+    for (row, chunk) in data.chunks(16).enumerate() {
+        line.clear();
+        let _ = write!(line, "  {}{:04x}:", label, row * 16);
+        for b in chunk {
+            let _ = write!(line, " {:02x}", b);
+        }
+        let _ = writeln!(line);
+        let _ = serial.write(line.as_bytes());
     }
 }
 
@@ -507,6 +506,6 @@ fn main() -> ! {
 pub static PICOTOOL_ENTRIES: [hal::binary_info::EntryAddr; 4] = [
     hal::binary_info::rp_cargo_bin_name!(),
     hal::binary_info::rp_cargo_version!(),
-    hal::binary_info::rp_program_description!(c"Pico-10BASE-T (Rust port, Phase R1)"),
+    hal::binary_info::rp_program_description!(c"Pico-10BASE-T (Rust port)"),
     hal::binary_info::rp_program_url!(c"https://github.com/kingyoPiyo/Pico-10BASE-T"),
 ];

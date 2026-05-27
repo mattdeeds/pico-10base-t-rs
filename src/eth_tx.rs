@@ -29,12 +29,20 @@ pub struct UdpEndpoint {
     pub dst_port: u16,
 }
 
+/// Maximum on-wire frame the UDP builder can produce:
+/// preamble(7) + SFD(1) + eth(14) + ip(20) + udp(8) + payload(<=1472) + FCS(4).
+const MAX_TX_FRAME: usize = 1526;
+
 /// PIO TX state machine handle. We hold onto the running StateMachine so that
 /// Rust's type-state ownership doesn't drop it (which would be a footgun).
 pub struct EthTx {
     _sm: StateMachine<(PIO0, SM0), Running>,
     tx: Tx<(PIO0, SM0)>,
     ip_identifier: u16,
+    /// Scratch buffer the UDP broadcast builder assembles into before the
+    /// per-byte Manchester FIFO writes. Owned here (was a `static mut`) so
+    /// there's no aliasing footgun and no Rust-2024 hard error.
+    raw_frame: [u8; MAX_TX_FRAME],
 }
 
 impl EthTx {
@@ -66,9 +74,7 @@ impl EthTx {
         // 20 MHz PIO clock from sys_clk_hz; one PIO cycle = 50 ns = Manchester
         // half-bit. At sys_clk=150 MHz the divider is 7.5 (= 7 + 128/256);
         // ±3.3 ns jitter is well within 10BASE-T tolerance.
-        let div = (sys_clk_hz as f32) / 20_000_000.0;
-        let div_int = div as u16;
-        let div_frac = ((div - div_int as f32) * 256.0) as u8;
+        let (div_int, div_frac) = crate::pio_util::clock_divider(sys_clk_hz, 20_000_000.0);
 
         let (mut sm, _rx, tx) = hal::pio::PIOBuilder::from_installed_program(installed)
             .side_set_pin_base(tx_pin_id)
@@ -89,6 +95,7 @@ impl EthTx {
             _sm: sm,
             tx,
             ip_identifier: 0,
+            raw_frame: [0; MAX_TX_FRAME],
         }
     }
 
@@ -186,14 +193,8 @@ impl EthTx {
     /// Build a broadcast UDP packet around `payload` and emit it on the line.
     /// Payload max is set by the size of the internal frame buffer (~1472 B).
     pub fn send_udp_broadcast(&mut self, ep: &UdpEndpoint, payload: &[u8]) {
-        // Maximum frame: preamble(7) + SFD(1) + eth(14) + ip(20) + udp(8) +
-        //                payload(<=1472) + FCS(4) = 1526
-        const MAX_FRAME: usize = 1526;
-        static mut RAW_FRAME: [u8; MAX_FRAME] = [0; MAX_FRAME];
-
-        // Safety: single-threaded use; we don't aliasing the static.
-        let raw = unsafe { &mut RAW_FRAME };
-        let total_bytes = build_eth_ipv4_udp_frame(ep, payload, raw, self.ip_identifier);
+        let total_bytes =
+            build_eth_ipv4_udp_frame(ep, payload, &mut self.raw_frame, self.ip_identifier);
         self.ip_identifier = self.ip_identifier.wrapping_add(1);
 
         // Critical section: same reason as send_raw_frame — keep the
@@ -201,7 +202,8 @@ impl EthTx {
         // underrunning the PIO TX FIFO.
         critical_section::with(|_| {
             // Manchester-encode each byte and push to the PIO FIFO.
-            for &b in raw[..total_bytes].iter() {
+            // (disjoint borrows: reads self.raw_frame, writes self.tx)
+            for &b in self.raw_frame[..total_bytes].iter() {
                 let word = MANCHESTER_TABLE[b as usize];
                 while !self.tx.write(word) {
                     // Spin until FIFO has space.

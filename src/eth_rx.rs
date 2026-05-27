@@ -105,9 +105,7 @@ impl EthRx {
 
         // 60 MHz from sys_clk_hz. At sys_clk=150 MHz that's div=2.5
         // (int=2, frac=128/256). ~3.3 ns jitter — well within tolerance.
-        let div = (sys_clk_hz as f32) / (SAMPLE_HZ as f32);
-        let div_int = div as u16;
-        let div_frac = ((div - div_int as f32) * 256.0) as u8;
+        let (div_int, div_frac) = crate::pio_util::clock_divider(sys_clk_hz, SAMPLE_HZ as f32);
 
         let (mut sm, rx, _tx) = hal::pio::PIOBuilder::from_installed_program(installed)
             .in_pin_base(rx_pin_id)
@@ -165,9 +163,10 @@ impl EthRx {
 
     /// Find the next active run (bytes that are neither 0x00 nor 0xFF) of
     /// length ≥ `min_len`, starting at or after `start`. Skips any runs
-    /// shorter than `min_len` (NLPs / noise). Used by [`EthMac::poll`] to
-    /// walk every frame-shaped run in a stitched buffer, not just the
-    /// longest one — fixes loss when two frames land in the same DMA half.
+    /// shorter than `min_len` (NLPs / noise). The DMA_IRQ_0 handler
+    /// (`EthRxShared::process_completed_half`) calls this in a loop to walk
+    /// every frame-shaped run in a stitched buffer, not just the longest
+    /// one — fixes loss when two frames land in the same DMA half.
     pub fn find_active_run_from(
         bytes: &[u8],
         start: usize,

@@ -22,12 +22,15 @@ For the C reference and the proven Manchester / decoder design, see [`../Pico-10
 
 Last verified: 2026-05-26 (post-R6, IRQ-driven RX with TX critsec + IFG padding on every TX path). Two-run avg of the 30-sec concurrent stress: ping 99.7%, UDP echo 100.0%, host RX errs ≤2/30s — matches or exceeds the polled R5 baseline on every metric while keeping the IRQ architectural benefit. Telemetry: `dec=20 ok=20 fail=0 inbox_drop=0 inbox_hwm=1–2 carry_cap=0`. The journey from R6's initial 20 errs/30s down to ~1: TX critsec (20 → 8), `send_raw_frame` IFG padding (8 → 4), `send_nlp` IFG padding (4 → 2.5), `send_udp_broadcast` IFG padding (2.5 → ≤2). The pattern was the same every time — once IRQs can preempt the main loop, any TX path that doesn't both critsec its FIFO writes *and* pad post-TP_IDL with ≥ 9.6 µs of IDLE can land its tail under the host NIC's expected IFG window and corrupt the next frame the host receives.
 
+**Performance + idiom review (2026-05-27, branch `review-efficiency-idiom`):** efficiency/idiom pass with on-device cycle measurement (Hazard3 `mcycle` CSR @ 150 MHz, telemetry exfiltrated over the UDP broadcast because USB CDC reads go flaky after BOOTSEL re-enumeration — see the `on-device-benchmarking` memory). Applied four safe, behavior-preserving idiom fixes, verified on the wire (UDP 5/s byte-perfect, ping 5/5 @ 2.4–4.9 ms RTT). Measurement **re-prioritized** the deferred efficiency work (decode beats CRC) — see "Performance: measured hot-path costs + plans" under Future work. Headline: worst-case RX IRQ handler = **2.57 ms**, *over* the 2.18 ms half-fill budget under heavy RX load.
+
 ## File map
 
 | File | Purpose |
 |---|---|
 | `src/main.rs` | Boot, USB CDC setup, NLP cadence (16 ms), UDP send loop (200 ms), UDP echo socket (port 1234), HTTP server (port 80, R8), heartbeat log + per-second RX status & frame hex dump |
-| `src/eth_tx.rs` | `EthTx` struct — PIO program install, frame builder, `send_nlp` / `send_udp_broadcast` |
+| `src/eth_tx.rs` | `EthTx` struct — PIO program install, frame builder, `send_nlp` / `send_udp_broadcast`. Owns the `raw_frame` UDP-build scratch buffer (was a `static mut`, fixed in the 2026-05-27 review) |
+| `src/pio_util.rs` | `clock_divider(sys_clk_hz, target_hz) -> (int, frac)` — shared PIO fixed-point divider math used by both TX (20 MHz) and RX (60 MHz) `new()` (2026-05-27 review) |
 | `src/eth_rx.rs` | `EthRx` struct — PIO sampler, DMA double-buffer with **carry+stitch buffers** (R5), `poll_with` closure handoff over the stitched view, `find_active_run_from` (iterates all runs, not just longest), `peek_dst_mac` (R7, no-alloc dst-MAC pre-decode for the IRQ-side filter), `decode_frame` + `derive_frame_len` + `verify_fcs` |
 | `src/eth_mac.rs` | `EthMac` — wraps just `EthTx` + a TX scratch buffer + TX stats. RX state lives in a module-level `Mutex<RefCell<Option<EthRxShared>>>` populated via `install_rx(rx, our_mac)`; the `DMA_IRQ_0` handler enters a critical section to run the stitch + `peek_dst_mac` filter + decode + push pipeline. `Device::receive` pops from the shared inbox via a small critical section. |
 | `src/crc.rs` | CRC-32/IEEE-802.3 (poly `0xEDB88320`), shared by TX (FCS gen) and RX (FCS verify). Provides `crc32_ieee802_3_padded` for runt-frame TX that pads body to 60 bytes before the FCS |
@@ -146,14 +149,48 @@ curl -s --max-time 5 http://192.168.37.24/
 ## Known limitations / TODOs
 
 - **Residual FCS fails (~0–1/sec under load).** A few RX decodes per second still mark FCS-fail (the `fail=N` field in the `[Rx]` log line). `carry_cap=0` rules out cap-clipping, so the cause is elsewhere — likely some combination of: (a) genuine wire bit-errors, (b) phase-lock edge cases when the run starts on a noisy NLP, (c) the decoder's "longest run" → "find next run" change occasionally finding a spurious noise blob between frames. Not affecting user-visible reliability (smoltcp doesn't see these); worth instrumenting only if it becomes the bottleneck.
-- **RX is polled, not IRQ-driven.** `EthMac::poll` is called every main-loop iteration; the main loop must complete each iteration in under 2.18 ms (one DMA-half fill time) or samples drop. Currently safe — the longest blocking call (TX of an 86-byte UDP frame) is ~200 µs, and `iface.poll` itself is fast.
+- **RX IRQ handler worst case (2.57 ms) exceeds the 2.18 ms half-fill budget under heavy load.** Measured 2026-05-27 via the `mcycle` CSR. The `DMA_IRQ_0` handler (`process_completed_half`) must finish before the *other* DMA half fills (2.18 ms) or samples drop. Steady state is fine, but a half densely packed with active runs during a UDP blast can push it over. Decomposition of the worst case: stitch copy ≈ 296 µs (16 KB memcpy), plus per-frame `decode_frame`+`verify_fcs` ≈ 238 µs each (dominated by the two-pass bit ops, **not** the CRC — see below). Rare today (still ~99% under stress) but real headroom pressure; the Performance plans below target it. Note the same handler runtime doubles as accidental carrier-sense (gotcha #10), so shortening it is a genuine trade-off, not a free win.
+- **`decode_frame` truncates frames larger than ~199 bytes.** The bit loop is `for j in 0..1600` into a `Vec<u8, 2048>`, so it recovers at most ~1600 bits ≈ 199 frame bytes (three inconsistent constants: 1600 loop / 2048 bit-Vec / 1600 frame cap). Frames over ~199 B would be cut short → FCS-fail. Not hit by current traffic (ping 98 B, broadcasts/echo ~60 B), so **full-MTU RX does not actually work today despite `MTU = 1500`**. The single-pass decoder rewrite (Performance plan #1) is the place to size this to `MAX_FRAME_BYTES` and fix it.
 - **ARP cache can stick in `FAILED` state on the host** if an early ARP probe times out (before the Pico is up, or during a flash cycle). Linux backoffs prevent retries for minutes, making `ping` look broken when it's actually waiting. Workaround: a single `ping -c 1 192.168.37.24` (or `ip neigh del 192.168.37.24` with root) clears the FAILED entry; subsequent traffic re-resolves.
-- **picotool reset interface not implemented** — see gotcha #4. Manual OpenOCD flash works fine as a fallback.
-- **`static mut RAW_FRAME` in `send_udp_broadcast`** triggers a Rust 2024 compatibility warning. Functionally fine on a single-threaded core; would clean up with `UnsafeCell` or move the buffer to `EthTx` state.
+- ~~**picotool reset interface not implemented**~~ — done in R9 (gotcha #4 retired).
+- ~~**`static mut RAW_FRAME` in `send_udp_broadcast`** triggers a Rust 2024 warning~~ — fixed in the 2026-05-27 review: it's now the owned `EthTx.raw_frame` field. Disjoint-borrow trick lets the critsec loop read `self.raw_frame` while writing `self.tx`.
 - **sys_clk runs at 150 MHz**, not 120 MHz like the C version. Both PIO TX (div 7.5 → 20 MHz half-bit) and PIO RX (div 2.5 → 60 MHz sample) use fractional dividers with ±3.3 ns jitter. Confirmed working end-to-end at this rate; could be cleaned up by dropping to 120 MHz for integer dividers.
 - **USB CDC drops bytes when log throughput is high.** Frame hex dumps occasionally come through truncated/interleaved at the host. The data we get is correct; this is just a TX-buffer-full silent-drop on the device side (`let _ = serial.write(...)`). Throttle further or implement a write loop that yields if it becomes a real problem.
 
 ## Future work
+
+### Performance: measured hot-path costs + plans (2026-05-27)
+
+On-device measurement (Hazard3 `mcycle` @ 150 MHz, 6.67 ns/cyc), worst case under a UDP blast + ping:
+
+| What | Cost | Notes |
+|---|---|---|
+| Isolated CRC-32 | ~12.2 cyc/byte (~81 ns/B) | 60 B = 4.9 µs; ~123 µs at full MTU |
+| `decode_frame` + `verify_fcs` | **238 µs** worst/frame | ~214 µs is bit extraction+packing; only ~16 µs CRC at current ~199 B frames |
+| Stitch copy (`poll_with`) | **296 µs** worst | 16 KB `copy_from_slice`, ~458×/s |
+| Full RX IRQ handler | **2.57 ms** worst | **over** the 2.18 ms half-fill budget under load |
+
+**Surprise from measuring: decode beats CRC.** By inspection I'd ranked the bit-by-bit CRC #1; on-device it's the two-pass bit twiddling in `decode_frame` that dominates the IRQ.
+
+**Every item below shortens the RX IRQ handler — which is also the accidental carrier-sense window (gotcha #10).** So none is a guaranteed win; each MUST be validated on-wire, not assumed. The reverted R10 multicast attempt hit exactly this wall.
+
+**Validation protocol (run after EACH change):** 30-sec concurrent stress — `ping -c 600 -i 0.05 192.168.37.24` + a host UDP echo loop + the host UDP listener on 1234 — and record (a) ping reply %, (b) UDP echo %, (c) host RX-error delta from `cat /proc/net/dev`. Baseline to beat: ping ≥ 99.7%, UDP echo ~100%, host RX errs ≤ 2/30 s. Any drop = carrier-sense loss → the speedup traded latency for collisions; back it out or pair it with real PIO carrier-sense.
+
+1. **Single-pass decoder — priority #1, biggest lever.** Replace the two-pass `decode_frame` (sample bits → `Vec<u8,2048>` → pack → `Vec<u8,1600>`).
+   - (a) After F-find + SFD-find, build output bytes directly: for each frame byte `i`, read 8 sample bits at `f + 4 + 6*(start_bit + i*8 + j)` and pack — no per-bit intermediate Vec, no second pass.
+   - (b) Bound the walk by available samples and size output to `MAX_FRAME_BYTES`, *not* a magic 1600 — this also **fixes the ~199-byte truncation** so full-MTU RX works.
+   - (c) Factor the duplicated F-find + SFD-find out of `decode_frame` and `peek_dst_mac` into shared private helpers.
+   - Expected ~half of 238 µs/frame; directly attacks the 2.57 ms worst case. Then run the validation protocol.
+
+2. **Stitch scan-in-place — priority #2.** The 16 KB copy in `poll_with` runs every half.
+   - (a) When `carry_len == 0` (idle boundary, the common case), hand the decoder `new_bytes` directly — no copy.
+   - (b) When `carry_len > 0`, only the leading run can straddle: stitch just `carry + leading active region`, scan the rest of `new_bytes` in place (invoke the closure twice, or pass two slices).
+   - Expected: removes most of the 296 µs in the common case. Validate.
+
+3. **Table-driven CRC-32 — priority #3, TX-side win.** Replace bit-by-bit `step_byte`.
+   - (a) `const fn`-generate a 256-entry table (1 KB flash) or 16-entry nibble table (64 B); keep `crc32_ieee802_3` / `_padded` signatures.
+   - (b) Apply on TX unconditionally (~8× on `send_raw_frame` / `build_eth_ipv4_udp_frame`).
+   - (c) RX `verify_fcs` benefit is small at ~199 B but grows once #1 enables full-MTU RX; validate after enabling on RX.
 
 ### Beyond R9 — improvements (priority order, pick whichever bites)
 
@@ -161,15 +198,17 @@ curl -s --max-time 5 http://192.168.37.24/
 
 2. **Pico-side HTTP request parsing.** The R8 server ignores the request line entirely — every GET (and every other verb) gets the same response. Route on method+path so we can expose distinct endpoints (e.g., `/stats`, `/frames`, `/reset`).
 
-3. **Clean up the `static mut RAW_FRAME` warning** in `send_udp_broadcast` — pre-existing, harmless, but it'll become a hard error in a future Rust edition.
+3. ~~**Clean up the `static mut RAW_FRAME` warning**~~ — done in the 2026-05-27 review (now `EthTx.raw_frame`).
 
 ### Cleanup wishlist
-- Add picotool reset interface so `cargo run` flashes without the OpenOCD fallback (custom usb-device vendor class)
-- Replace `static mut RAW_FRAME` in `send_udp_broadcast` with an owned-by-`EthTx` buffer (the legacy `static mut` warning has been there since R2)
+- ~~Add picotool reset interface~~ — done (R9).
+- ~~Replace `static mut RAW_FRAME` with an owned-by-`EthTx` buffer~~ — done (2026-05-27 review).
 - Replace the `EthMac` diagnostic stats fields (`tx_arp`, `tx_icmp`, `tx_udp`, `tx_other`, `last_tx`, etc.) with a compile-time toggle — they're useful when bringing up a new feature but bloat both code and the 1 Hz log line in steady state
+- Decompose `main()` (~450 lines) — extract the UDP-echo, HTTP-serve, smoltcp-UDP-demo, and 1 Hz logging blocks into helpers (behavior-preserving; flagged but not done in the 2026-05-27 review). The R4.2 smoltcp-UDP demo block + `next_smol_udp`/`smol_udp_sent` may be dead scaffolding worth removing.
+- Inbox copies move the full 1600-byte `Vec` per push/pop (~1.4 MB/s) regardless of frame length; a length-prefixed byte ring would be compact but more complex — low priority.
 - Consider dropping sys_clk to 120 MHz to get integer PIO dividers (matches the C version's choice and reduces TX jitter)
-- Move `EthTx::new` to consume rather than borrow `pio` so the type is cleaner
-- USB CDC frame-dump throttling — currently the 1 Hz hex dump can interleave with `[Mac]` lines when the USB IN buffer is near full; implement a small write-loop with `usb_dev.poll()` between chunks
+- ~~Move `EthTx::new` to consume rather than borrow `pio`~~ — not feasible: `EthRx` needs the same `PIO0` borrow for SM1, so `pio` must be shared by reference.
+- USB CDC frame-dump throttling — currently the 1 Hz hex dump can interleave with `[Mac]` lines when the USB IN buffer is near full; implement a small write-loop with `usb_dev.poll()` between chunks. (Note: CDC reads also go unreliable after repeated BOOTSEL re-enumeration — use the UDP payload as a telemetry channel instead; see the `on-device-benchmarking` memory.)
 
 ## Memory cues for future Claude
 
@@ -180,3 +219,7 @@ Auto-memory directory: `~/.claude/projects/-home-mattdeeds-projects-Pico-10BASE-
 - `network-setup.md` — `ethtool autoneg off` requirement after every host reboot
 
 `MEMORY.md` in that directory is the index.
+
+This Rust repo also has its own memory dir: `~/.claude/projects/-home-mattdeeds-projects-pico-10base-t-rs/memory/`:
+- `on-device-benchmarking.md` — `mcycle` CSR + `mcountinhibit` enable, and why telemetry goes over UDP not USB CDC
+- `review-2026-05-efficiency-findings.md` — measured RX IRQ hot-path costs; decode beats CRC; 2.57 ms worst-case IRQ
