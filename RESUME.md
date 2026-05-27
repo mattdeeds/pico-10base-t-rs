@@ -16,7 +16,8 @@ For the C reference and the proven Manchester / decoder design, see [`../Pico-10
 | **R5** — ring-aware RX scan + multi-slot inbox | ✅ | `EthRx::poll_with` now stitches the previous half's trailing-active tail in front of the new half before invoking the decoder, so frames straddling the DMA boundary survive. `EthMac::poll` walks every active run in the stitched buffer (not just the longest), and the inbox is now a 4-slot `heapless::Deque` (last-writer-wins with drop-oldest on overflow). Concurrent ping+UDP-echo under load: **UDP 98.3% / ping 99.3%** (up from 52% / 96%). |
 | **R6** — IRQ-driven RX | ✅ | RX state moved into a module-level `Mutex<RefCell<Option<EthRxShared>>>`; DMA channels `enable_irq0()`'d so each half-completion fires `DMA_IRQ_0`, whose handler runs the full stitch + decode + inbox-push pipeline. Main loop no longer polls — `iface.poll` drains the inbox via `Device::receive`. **2.18 ms main-loop budget is gone.** `EthTx::send_raw_frame`, `send_udp_broadcast`, and `send_nlp` wrap their PIO writes in `critical_section::with` (so the IRQ can't preempt mid-frame and underrun the FIFO) and pad ≥ 9.6 µs of IDLE after every TP_IDL / NLP (so back-to-back TX paths leave the IEEE 802.3-required inter-frame gap before the next preamble). Concurrent stress matches the polled R5 baseline: **UDP 100%, ping 99.7%, host RX errs 0–2 / 30 s.** |
 | **R7** — MAC filtering | ✅ | New `EthRx::peek_dst_mac` decodes just the 6 dst-MAC bytes (no Vec allocation, ~1–2 µs) before the IRQ handler decides whether to pay for the full decode + CRC + inbox push. `EthRxShared` learns our MAC via the updated `install_rx(rx, our_mac)` signature; accepts unicast-to-us + all multicast/broadcast (smoltcp does finer-grained filtering downstream). Adds `frames_filtered` to the 1 Hz log. Concurrent stress unaffected: UDP 99.7%, ping 100%, errs ≤1. `filt=0` during normal traffic on this LAN because everything visible is either to-us or IPv6 link-local multicast — the reject path is verified by inspection rather than counter (AF_PACKET-injected unicast-to-unknown-MAC test frames don't actually leave the host's Broadcom NIC in 10HD-half mode, presumably driver-side filtering on raw frames with no ARP target). |
-| **Beyond R7** — pick from improvements list below | ⏳ | next |
+| **R8** — TCP listener | ✅ | `socket-tcp` added to smoltcp feature set; tiny HTTP server on port 80 serves a 200 OK with build info + per-second nlps/udp_sent counters. 1 KB RX + 1 KB TX buffers, re-listens after each closed connection. Concurrent stress (ping + UDP echo + 15 sequential curls): ping 300/300, UDP 299/300, curls 15/15, errs 1/30s — every protocol still at or above polled R5 baseline. Validates that the IRQ-driven RX path + smoltcp handle full TCP handshake + retransmission/windowing/FIN cleanly. |
+| **Beyond R8** — pick from improvements list below | ⏳ | next |
 
 Last verified: 2026-05-26 (post-R6, IRQ-driven RX with TX critsec + IFG padding on every TX path). Two-run avg of the 30-sec concurrent stress: ping 99.7%, UDP echo 100.0%, host RX errs ≤2/30s — matches or exceeds the polled R5 baseline on every metric while keeping the IRQ architectural benefit. Telemetry: `dec=20 ok=20 fail=0 inbox_drop=0 inbox_hwm=1–2 carry_cap=0`. The journey from R6's initial 20 errs/30s down to ~1: TX critsec (20 → 8), `send_raw_frame` IFG padding (8 → 4), `send_nlp` IFG padding (4 → 2.5), `send_udp_broadcast` IFG padding (2.5 → ≤2). The pattern was the same every time — once IRQs can preempt the main loop, any TX path that doesn't both critsec its FIFO writes *and* pad post-TP_IDL with ≥ 9.6 µs of IDLE can land its tail under the host NIC's expected IFG window and corrupt the next frame the host receives.
 
@@ -24,13 +25,13 @@ Last verified: 2026-05-26 (post-R6, IRQ-driven RX with TX critsec + IFG padding 
 
 | File | Purpose |
 |---|---|
-| `src/main.rs` | Boot, USB CDC setup, NLP cadence (16 ms), UDP send loop (200 ms), heartbeat log + per-second RX status & frame hex dump |
+| `src/main.rs` | Boot, USB CDC setup, NLP cadence (16 ms), UDP send loop (200 ms), UDP echo socket (port 1234), HTTP server (port 80, R8), heartbeat log + per-second RX status & frame hex dump |
 | `src/eth_tx.rs` | `EthTx` struct — PIO program install, frame builder, `send_nlp` / `send_udp_broadcast` |
 | `src/eth_rx.rs` | `EthRx` struct — PIO sampler, DMA double-buffer with **carry+stitch buffers** (R5), `poll_with` closure handoff over the stitched view, `find_active_run_from` (iterates all runs, not just longest), `peek_dst_mac` (R7, no-alloc dst-MAC pre-decode for the IRQ-side filter), `decode_frame` + `derive_frame_len` + `verify_fcs` |
 | `src/eth_mac.rs` | `EthMac` — wraps just `EthTx` + a TX scratch buffer + TX stats. RX state lives in a module-level `Mutex<RefCell<Option<EthRxShared>>>` populated via `install_rx(rx, our_mac)`; the `DMA_IRQ_0` handler enters a critical section to run the stitch + `peek_dst_mac` filter + decode + push pipeline. `Device::receive` pops from the shared inbox via a small critical section. |
 | `src/crc.rs` | CRC-32/IEEE-802.3 (poly `0xEDB88320`), shared by TX (FCS gen) and RX (FCS verify). Provides `crc32_ieee802_3_padded` for runt-frame TX that pads body to 60 bytes before the FCS |
 | `src/manchester.rs` | 256-entry Manchester lookup table, copied verbatim from `../Pico-10BASE-T/src/udp.c` |
-| `Cargo.toml` | rp235x-hal, smoltcp 0.13 (`medium-ethernet, proto-ipv4, socket-udp, auto-icmp-echo-reply` — no defaults, no alloc, no log), usb-device, usbd-serial, heapless, pio |
+| `Cargo.toml` | rp235x-hal, smoltcp 0.13 (`medium-ethernet, proto-ipv4, socket-udp, socket-tcp, auto-icmp-echo-reply` — no defaults, no alloc, no log), usb-device, usbd-serial, heapless, pio |
 | `.cargo/config.toml` | RISC-V target, linker args, picotool runner (with OpenOCD fallback) |
 | `memory.x` + `rp235x_riscv.x` | Linker scripts for Hazard3 |
 | `tools/99-pico-rust.rules` | udev rule to put `/dev/ttyACM*` in the `plugdev` group |
@@ -116,6 +117,12 @@ for i in range(10):
     except socket.timeout: print(f"TIMEOUT {msg.decode()}")'
 # expect 9-10 of 10 echoed back byte-perfect
 
+# 4d. TCP verify (R8): GET / on port 80.
+curl -s --max-time 5 http://192.168.37.24/
+# expect:
+#   Hello from Pico-10BASE-T (Rust)!
+#   uptime=<n>s nlps=<n> udp_sent=<n>
+
 # Tip: a fresh-cache ARP probe sometimes lands in a "FAILED" state from a
 # prior stale entry; the first `ping -c 1` clears it, subsequent pings work.
 ```
@@ -144,11 +151,15 @@ for i in range(10):
 
 ## Future work
 
-### Beyond R7 — improvements (priority order, pick whichever bites)
+### Beyond R8 — improvements (priority order, pick whichever bites)
 
-1. **TCP socket.** Add `socket-tcp` to the smoltcp feature list and bind a listener (e.g., a tiny HTTP server returning the per-second RX stats). Validates retransmission / windowing through our RX path under more demanding traffic patterns than UDP echo. The MAC filter's reject path is also untested in our current environment (host NIC won't TX AF_PACKET-injected frames to unknown unicast MACs in 10HD-half) — a TCP listener with synthetic traffic from another LAN device would exercise it naturally.
+1. **Multicast group subscriptions.** Currently the MAC filter accepts *all* multicast (anything with I/G bit set) and relies on smoltcp to drop ones we don't care about. Fine for small workloads, wasteful on a busy multicast LAN. Once smoltcp's multicast subscription API is wired, narrow `mac_accept` to specific group MACs.
 
-2. **Multicast group subscriptions.** Currently the MAC filter accepts *all* multicast (anything with I/G bit set) and relies on smoltcp to drop ones we don't care about. Fine for small workloads, wasteful on a busy multicast LAN. Once smoltcp's multicast subscription API is wired, narrow `mac_accept` to specific group MACs.
+2. **Pico-side HTTP request parsing.** The R8 server ignores the request line entirely — every GET (and every other verb) gets the same response. Route on method+path so we can expose distinct endpoints (e.g., `/stats`, `/frames`, `/reset`).
+
+3. **picotool reset interface.** Gotcha #4 — `cargo run` still needs an OpenOCD fallback or a manual BOOTSEL because `usbd-serial` doesn't expose the pico-sdk vendor reset endpoint. Adding a custom USB vendor class would let `picotool load -fux` self-reboot.
+
+4. **Clean up the `static mut RAW_FRAME` warning** in `send_udp_broadcast` — pre-existing, harmless, but it'll become a hard error in a future Rust edition.
 
 ### Cleanup wishlist
 - Add picotool reset interface so `cargo run` flashes without the OpenOCD fallback (custom usb-device vendor class)

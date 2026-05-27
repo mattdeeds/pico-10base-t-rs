@@ -22,6 +22,7 @@ smoltcp = { version = "0.13", default-features = false, features = [
     "medium-ethernet",
     "proto-ipv4",
     "socket-udp",
+    "socket-tcp",
     "auto-icmp-echo-reply",
 ] }
 usb-device = "0.3.2"

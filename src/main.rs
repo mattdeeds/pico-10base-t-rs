@@ -27,7 +27,7 @@ use hal::pio::PIOExt;
 use hal::singleton;
 use hal::Clock; // brings .freq() into scope
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
-use smoltcp::socket::udp;
+use smoltcp::socket::{tcp, udp};
 use smoltcp::phy::{ChecksumCapabilities, Device, TxToken};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
@@ -137,7 +137,7 @@ fn main() -> ! {
         addrs.push(IpCidr::new(our_ip, 24)).unwrap();
     });
 
-    let mut sockets_storage: [SocketStorage; 4] = [SocketStorage::EMPTY; 4];
+    let mut sockets_storage: [SocketStorage; 5] = [SocketStorage::EMPTY; 5];
     let mut sockets = SocketSet::new(&mut sockets_storage[..]);
 
     // R4.6: UDP echo socket on port 1234. Storage lives in main's stack
@@ -150,6 +150,16 @@ fn main() -> ! {
     let udp_tx_buffer = udp::PacketBuffer::new(&mut udp_tx_meta[..], &mut udp_tx_payload[..]);
     let udp_socket = udp::Socket::new(udp_rx_buffer, udp_tx_buffer);
     let udp_handle: SocketHandle = sockets.add(udp_socket);
+
+    // R7: a tiny HTTP server on port 80. 1 KB each direction is enough
+    // for a 1-shot GET / response and validates retransmission/windowing
+    // through our RX path under a more demanding protocol than UDP.
+    let mut tcp_rx_storage = [0u8; 1024];
+    let mut tcp_tx_storage = [0u8; 1024];
+    let tcp_rx_buffer = tcp::SocketBuffer::new(&mut tcp_rx_storage[..]);
+    let tcp_tx_buffer = tcp::SocketBuffer::new(&mut tcp_tx_storage[..]);
+    let tcp_socket = tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer);
+    let tcp_handle: SocketHandle = sockets.add(tcp_socket);
 
     // Mirror the C reference's network parameters so the host's existing
     // ethtool / IP route setup keeps working.
@@ -232,6 +242,41 @@ fn main() -> ! {
                     }
                     Err(_) => break,
                 }
+            }
+        }
+
+        // R7: tiny HTTP server on port 80. Re-listens after each closed
+        // connection. Drains the request best-effort (we don't parse it),
+        // then writes a fixed-shape HTTP/1.0 response with build info +
+        // uptime and closes. Validates TCP retransmission/windowing
+        // through our RX path.
+        {
+            let socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
+            if !socket.is_open() {
+                let _ = socket.listen(80);
+            }
+            if socket.may_recv() {
+                // Eat whatever the client sent (we don't actually parse it).
+                let _ = socket.recv(|buf| (buf.len(), ()));
+            }
+            if socket.can_send() {
+                let mut body: String<160> = String::new();
+                let _ = write!(
+                    body,
+                    "Hello from Pico-10BASE-T (Rust)!\r\n\
+                     uptime={}s nlps={} udp_sent={}\r\n",
+                    log_tick, nlps_sent, udp_sent
+                );
+                let mut head: String<128> = String::new();
+                let _ = write!(
+                    head,
+                    "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.send_slice(head.as_bytes());
+                let _ = socket.send_slice(body.as_bytes());
+                socket.close();
             }
         }
 
