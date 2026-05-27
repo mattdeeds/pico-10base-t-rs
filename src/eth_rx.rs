@@ -317,7 +317,9 @@ impl EthRx {
     ///    `f + 4 + 6k` per bit, and reads the packed buffer unchecked over a
     ///    range proven in-bounds. Output is sized to `MAX_FRAME_BYTES` (a
     ///    full 1518-byte frame), so unlike the old two-pass version it does
-    ///    not truncate frames past ~199 bytes.
+    ///    not truncate frames past ~199 bytes — but it *is* bounded by the
+    ///    header-declared frame length (see inline) so an over-long active
+    ///    run can't force a full-buffer decode.
     pub fn decode_frame(
         bytes: &[u8],
         base: usize,
@@ -349,23 +351,49 @@ impl EthRx {
         } else {
             0
         };
-        let nframe = (avail_bits / 8).min(MAX_FRAME_BYTES);
+        let nframe_avail = (avail_bits / 8).min(MAX_FRAME_BYTES);
+
+        // Decode-length cap: pack the 18-byte header (14 Ethernet + 4 IPv4
+        // ver..total-len), then bound the rest to the length the header
+        // *declares* rather than however long the active run happens to be.
+        // Keeps a long run (merged frames / noise) from costing a full
+        // MAX_FRAME_BYTES decode — the old two-pass `for j in 0..1600` used to
+        // bound this accidentally. Behaviour-preserving: a normal run is ~its
+        // own frame length, and `verify_fcs`/`derive_frame_len` already use
+        // the same declared length, so the decoded bytes the caller keeps are
+        // identical — only trailing bytes past the frame are no longer packed.
+        // Unknown EtherTypes can't be bounded from the header → uncapped.
+        const HDR_BYTES: usize = 18;
+        let mut nframe = nframe_avail;
 
         let mut frame: heapless::Vec<u8, MAX_FRAME_BYTES> = heapless::Vec::new();
         let mut off = first_off;
-        for _ in 0..nframe {
+        let mut i = 0;
+        while i < nframe {
             let mut byte: u8 = 0;
             for j in 0..8 {
-                // SAFETY: the last bit packed is at off = first_off +
-                // 6*(nframe*8 - 1) < limit = base_bit + nsamples <= buf_bits
-                // (nsamples is clamped to the buffer), so off >> 3 <
-                // bytes.len() for every read.
+                // SAFETY: nframe <= nframe_avail, so the last bit packed is at
+                // off <= first_off + 6*(nframe_avail*8 - 1) < limit =
+                // base_bit + nsamples <= buf_bits (nsamples is clamped to the
+                // buffer), so off >> 3 < bytes.len() for every read.
                 let s = (unsafe { *bytes.get_unchecked(off >> 3) } >> (off & 7)) & 1;
                 byte |= s << j;
                 off += 6;
             }
             // nframe <= MAX_FRAME_BYTES == capacity, so this never fails.
             let _ = frame.push(byte);
+            i += 1;
+            if i == HDR_BYTES {
+                let etype = u16::from_be_bytes([frame[12], frame[13]]);
+                let declared = match etype {
+                    0x0800 => {
+                        (14 + u16::from_be_bytes([frame[16], frame[17]]) as usize + 4).max(64)
+                    }
+                    0x0806 => 64,
+                    _ => nframe_avail, // unknown — leave uncapped
+                };
+                nframe = declared.min(nframe_avail);
+            }
         }
         Some(frame)
     }
@@ -419,16 +447,28 @@ impl EthRx {
         computed == on_wire
     }
 
-    /// Non-blocking. If a DMA half just completed, invoke `f` with a
-    /// stitched view = previous half's trailing active tail + the just-
-    /// finished half. Then update the carry from the trailing active tail
-    /// of the just-finished half, and re-arm DMA. Caller must call this
-    /// at least once per ~2.18 ms (one half-fill time) or samples drop.
+    /// Non-blocking. If a DMA half just completed, hand the just-finished
+    /// half to `f` for scanning, carrying any frame that straddled the
+    /// boundary across the swap, then update the carry and re-arm DMA.
+    /// Caller must call this at least once per ~2.18 ms (one half-fill time)
+    /// or samples drop.
     ///
-    /// The stitching means a frame straddling the half boundary appears
-    /// as one contiguous active run starting somewhere inside the carry
-    /// region and ending somewhere inside the new half — the decoder
-    /// scans it as a single frame instead of seeing two truncated halves.
+    /// Scan-in-place to avoid a 16 KB copy every half (it was ~296 µs of the
+    /// RX IRQ budget). The previous half's trailing-active tail lives in
+    /// `carry`:
+    /// - `carry_len == 0` (the common case — previous half ended idle):
+    ///   nothing straddles, so `f` is called once on the new half directly,
+    ///   no copy.
+    /// - `carry_len > 0`: a frame straddled — its head is in `carry`, its
+    ///   tail is the leading active run of the new half (up to the first idle
+    ///   byte). Only `carry + that tail` is stitched into `stitch` (small);
+    ///   `f` is then called a second time on the remainder of the new half in
+    ///   place. The split point is an idle byte, so no active run is cut
+    ///   across the two calls — `f` sees every frame whole, exactly as it did
+    ///   with the old full-buffer stitch.
+    ///
+    /// So `f` may be invoked once or twice per completed half; each call gets
+    /// a self-contained slice and the caller scans runs within it.
     pub fn poll_with<F: FnMut(&[u8])>(&mut self, mut f: F) {
         let xfer = self.xfer.take().unwrap();
         if !xfer.is_done() {
@@ -441,12 +481,23 @@ impl EthRx {
             core::slice::from_raw_parts(finished.as_ptr() as *const u8, BUF_BYTES)
         };
 
-        // Stitch: prev carry | current half.
         let cl = self.carry_len;
-        self.stitch[..cl].copy_from_slice(&self.carry[..cl]);
-        self.stitch[cl..cl + BUF_BYTES].copy_from_slice(new_bytes);
-        let total = cl + BUF_BYTES;
-        f(&self.stitch[..total]);
+        if cl == 0 {
+            f(new_bytes);
+        } else {
+            // Leading active run of the new half = the straddling frame's
+            // tail; it ends at the first idle byte.
+            let mut k = 0;
+            while k < BUF_BYTES && new_bytes[k] != 0x00 && new_bytes[k] != 0xFF {
+                k += 1;
+            }
+            // Stitch only carry + that tail (cl + k <= STITCH_BUF_BYTES).
+            self.stitch[..cl].copy_from_slice(&self.carry[..cl]);
+            self.stitch[cl..cl + k].copy_from_slice(&new_bytes[..k]);
+            f(&self.stitch[..cl + k]);
+            // Remainder of the new half, scanned in place (no copy).
+            f(&new_bytes[k..]);
+        }
 
         // Build the next carry: walk back from the end of the just-
         // finished half while bytes are "active" (non-0x00, non-0xFF), so
