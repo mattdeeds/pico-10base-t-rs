@@ -5,6 +5,14 @@ edition = "2021"
 rust-version = "1.82"
 description = "10BASE-T Ethernet TX+RX on Pico 2 (RP2350 Hazard3) using ISL3177E + magnetics"
 
+[features]
+# Verbose per-second diagnostics over USB CDC: the [Mac] TX-categorization
+# line, the TX/frame hex dumps, and the decoded-frame pretty-print. Off by
+# default so steady-state builds stay lean (shorter log + smaller binary);
+# enable with `--features diag` when bringing up a feature. The cheap [R2b]
+# heartbeat + [Rx] decode summary always print.
+diag = []
+
 [dependencies]
 critical-section = "1.2.0"
 embedded-hal = "1.0.0"

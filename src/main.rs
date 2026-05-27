@@ -349,6 +349,7 @@ fn serve_http(
 /// the `[Rx]` decode summary (snapshots + resets the IRQ-managed RX stats),
 /// the `[Mac]` TX-categorization line + TX hex dump, and a pretty-print + hex
 /// dump of the most recently decoded frame.
+#[cfg_attr(not(feature = "diag"), allow(unused_variables))] // `mac` only used under `diag`
 fn log_status<B: UsbBus>(
     serial: &mut SerialPort<'_, B>,
     line: &mut String<160>,
@@ -380,47 +381,54 @@ fn log_status<B: UsbBus>(
     );
     let _ = serial.write(line.as_bytes());
 
-    line.clear();
-    let _ = writeln!(
-        line,
-        "[Mac] iface_rx={} tx_arp={} tx_icmp={} tx_udp={} tx_other={} inbox_drop={} inbox_hwm={} carry_cap={} last_tx_len={}",
-        mac.stats.rx_handed_out, mac.stats.tx_arp, mac.stats.tx_icmp, mac.stats.tx_udp,
-        mac.stats.tx_other, rx.inbox_dropped, rx.inbox_high_water, rx.carry_capped,
-        mac.stats.last_tx_len,
-    );
-    let _ = serial.write(line.as_bytes());
-    let tx_n = (mac.stats.last_tx_len as usize).min(mac.stats.last_tx.len());
-    hex_dump(serial, line, "tx ", &mac.stats.last_tx[..tx_n]);
-    mac.stats.rx_handed_out = 0;
-    mac.stats.tx_handed_out = 0;
-    mac.stats.tx_consumed = 0;
-    mac.stats.tx_arp = 0;
-    mac.stats.tx_icmp = 0;
-    mac.stats.tx_udp = 0;
-    mac.stats.tx_other = 0;
-
-    // Pretty-print the most recently decoded frame, same shape as
-    // ../Pico-10BASE-T/src/eth_rx.c:eth_rx_decode_frame() output.
-    if rx.last_frame_snapshot_len > 0 {
-        let f = &rx.last_frame_snapshot[..rx.last_frame_snapshot_len];
-        let etype = if f.len() >= 14 {
-            u16::from_be_bytes([f[12], f[13]])
-        } else {
-            0
-        };
+    // Verbose diagnostics (off unless `--features diag`): the [Mac]
+    // TX-categorization line + TX hex dump, and the decoded-frame
+    // pretty-print + hex dump. These dominate the per-second CDC output and
+    // pull in the EthMac TX stats; the lean default build skips them.
+    #[cfg(feature = "diag")]
+    {
         line.clear();
         let _ = writeln!(
             line,
-            "[Rx] frame {} bytes, FCS {} - dst {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} src {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} type={:04x}",
-            rx.last_frame_len,
-            if rx.last_frame_was_ok { "OK" } else { "FAIL" },
-            f[0], f[1], f[2], f[3], f[4], f[5],
-            f[6], f[7], f[8], f[9], f[10], f[11],
-            etype,
+            "[Mac] iface_rx={} tx_arp={} tx_icmp={} tx_udp={} tx_other={} inbox_drop={} inbox_hwm={} carry_cap={} last_tx_len={}",
+            mac.stats.rx_handed_out, mac.stats.tx_arp, mac.stats.tx_icmp, mac.stats.tx_udp,
+            mac.stats.tx_other, rx.inbox_dropped, rx.inbox_high_water, rx.carry_capped,
+            mac.stats.last_tx_len,
         );
         let _ = serial.write(line.as_bytes());
-        let dump_n = f.len().min(64);
-        hex_dump(serial, line, "", &f[..dump_n]);
+        let tx_n = (mac.stats.last_tx_len as usize).min(mac.stats.last_tx.len());
+        hex_dump(serial, line, "tx ", &mac.stats.last_tx[..tx_n]);
+        mac.stats.rx_handed_out = 0;
+        mac.stats.tx_handed_out = 0;
+        mac.stats.tx_consumed = 0;
+        mac.stats.tx_arp = 0;
+        mac.stats.tx_icmp = 0;
+        mac.stats.tx_udp = 0;
+        mac.stats.tx_other = 0;
+
+        // Pretty-print the most recently decoded frame, same shape as
+        // ../Pico-10BASE-T/src/eth_rx.c:eth_rx_decode_frame() output.
+        if rx.last_frame_snapshot_len > 0 {
+            let f = &rx.last_frame_snapshot[..rx.last_frame_snapshot_len];
+            let etype = if f.len() >= 14 {
+                u16::from_be_bytes([f[12], f[13]])
+            } else {
+                0
+            };
+            line.clear();
+            let _ = writeln!(
+                line,
+                "[Rx] frame {} bytes, FCS {} - dst {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} src {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} type={:04x}",
+                rx.last_frame_len,
+                if rx.last_frame_was_ok { "OK" } else { "FAIL" },
+                f[0], f[1], f[2], f[3], f[4], f[5],
+                f[6], f[7], f[8], f[9], f[10], f[11],
+                etype,
+            );
+            let _ = serial.write(line.as_bytes());
+            let dump_n = f.len().min(64);
+            hex_dump(serial, line, "", &f[..dump_n]);
+        }
     }
 }
 
@@ -428,6 +436,8 @@ fn log_status<B: UsbBus>(
 /// one `serial.write` per row. `label` is inserted after the two-space
 /// indent and before the offset (e.g. `"tx "` → `  tx 0000: ..`, `""` →
 /// `  0000: ..`). `line` is a caller-owned scratch buffer, reused per row.
+/// Only used by the verbose `diag` diagnostics.
+#[cfg(feature = "diag")]
 fn hex_dump<B: UsbBus>(
     serial: &mut SerialPort<'_, B>,
     line: &mut String<160>,
