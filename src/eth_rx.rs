@@ -310,40 +310,62 @@ impl EthRx {
     /// 3. SFD = first `1,1` pair in the decoded bit stream — the last two
     ///    bits of the 0xD5 SFD byte (LSB-first).
     /// 4. Pack post-SFD bits LSB-first straight into frame bytes — single
-    ///    pass, reading each data bit on demand via [`data_bit`] rather than
-    ///    buffering every bit into an intermediate `Vec` first. Output is
-    ///    sized to `MAX_FRAME_BYTES` (a full 1518-byte frame), so unlike the
-    ///    old two-pass version it does not truncate frames past ~199 bytes.
+    ///    pass, no intermediate bit `Vec`. The packer is the decode hot path
+    ///    (~71% of the cost — see RESUME perf notes), so it hoists the
+    ///    sample-availability bound out of the loop (whole-byte count up
+    ///    front), strides the sample offset by 6 instead of recomputing
+    ///    `f + 4 + 6k` per bit, and reads the packed buffer unchecked over a
+    ///    range proven in-bounds. Output is sized to `MAX_FRAME_BYTES` (a
+    ///    full 1518-byte frame), so unlike the old two-pass version it does
+    ///    not truncate frames past ~199 bytes.
     pub fn decode_frame(
         bytes: &[u8],
         base: usize,
         nbytes: usize,
     ) -> Option<heapless::Vec<u8, MAX_FRAME_BYTES>> {
-        let nsamples = nbytes * 8;
         let base_bit = base * 8;
+        // Clamp samples to the buffer so the unchecked reads in the packer
+        // are sound even if a caller passes nbytes past the slice end. For
+        // valid runs (base + nbytes <= bytes.len()) this is a no-op.
+        let buf_bits = bytes.len() * 8;
+        if base_bit >= buf_bits {
+            return None;
+        }
+        let nsamples = (nbytes * 8).min(buf_bits - base_bit);
 
         let f = find_first_falling_edge(bytes, base_bit, nsamples)?;
         let sfd_end = find_sfd_end(bytes, base_bit, f, nsamples, SFD_SEARCH_BITS)?;
 
-        // Pack post-SFD bits LSB-first, one byte at a time, straight from
-        // on-demand sample reads. Stop at the first byte whose 8 data bits
-        // aren't fully present (run exhausted) — dropping the partial byte
-        // matches the old `avail / 8` truncation — or once the output fills
-        // MAX_FRAME_BYTES.
+        // Data bit m of the frame (m = 0 at start_bit) is the sample at
+        // absolute offset `first_off + 6*m`. Compute how many *whole* frame
+        // bytes the run can supply once, up front — dropping any partial
+        // trailing byte matches the old `avail / 8` truncation — then pack
+        // with a striding offset and no per-bit bound check or `Option`.
         let start_bit = sfd_end + 1;
+        let limit = base_bit + nsamples;
+        let first_off = base_bit + f + 4 + 6 * start_bit;
+        let avail_bits = if first_off < limit {
+            (limit - 1 - first_off) / 6 + 1
+        } else {
+            0
+        };
+        let nframe = (avail_bits / 8).min(MAX_FRAME_BYTES);
+
         let mut frame: heapless::Vec<u8, MAX_FRAME_BYTES> = heapless::Vec::new();
-        for i in 0..MAX_FRAME_BYTES {
+        let mut off = first_off;
+        for _ in 0..nframe {
             let mut byte: u8 = 0;
             for j in 0..8 {
-                let k = start_bit + i * 8 + j;
-                let Some(b) = data_bit(bytes, base_bit, f, k, nsamples) else {
-                    return Some(frame);
-                };
-                byte |= b << j;
+                // SAFETY: the last bit packed is at off = first_off +
+                // 6*(nframe*8 - 1) < limit = base_bit + nsamples <= buf_bits
+                // (nsamples is clamped to the buffer), so off >> 3 <
+                // bytes.len() for every read.
+                let s = (unsafe { *bytes.get_unchecked(off >> 3) } >> (off & 7)) & 1;
+                byte |= s << j;
+                off += 6;
             }
-            if frame.push(byte).is_err() {
-                break;
-            }
+            // nframe <= MAX_FRAME_BYTES == capacity, so this never fails.
+            let _ = frame.push(byte);
         }
         Some(frame)
     }
