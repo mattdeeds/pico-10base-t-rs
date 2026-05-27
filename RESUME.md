@@ -183,8 +183,19 @@ the sample point off the bit centre over a long frame — drift can exceed a ful
 bit over a 1.2 ms full-MTU frame. (AC-coupling baseline wander may compound it.)
 **Fundamental to the decoder — full-duplex hardware does NOT fix this.** ⇒ can't
 carry full-MTU TCP bulk traffic. Fix needs decoder **clock recovery** (re-sync
-phase on the Manchester mid-bit transition each bit) and/or PHY signal-integrity
-work. A per-byte error-position test would confirm the drift hypothesis.
+phase on the Manchester mid-bit transition each bit).
+
+**CONFIRMED by a per-byte error-position test** (full-MTU known-pattern frames
+at 120 pps; device bins payload byte-errors by position): error rate vs frame
+offset — bytes 42–593 **0.0 %**, 594–777 2.8 %, 778–961 24 %, 962–1145 **50 %**,
+1146–1329 74 %, 1330–1513 89 %. The first ~575 bytes are *perfect*, then errors
+ramp monotonically through exactly **50 % near byte ~1050** (sample point landing
+on a bit boundary) to ~89 % at the tail. Uniform PHY noise would be *flat*; this
+clean 0 %→ramp is the textbook clock-drift signature. **So the blocker is our
+decode algorithm (firmware-fixable via clock recovery), NOT the analog PHY.**
+Usable frame size today ≈ ~575 B (matches 512 B @85 %, 1518 B @1.7 %). The
+sample point drifts ~half a bit over ~500 µs, so recovery need only re-center
+every ≪ that — trivial given a Manchester transition every 100 ns.
 
 **Finding 2 — single core collapses under load.** Under a saturating flood the
 RX IRQ starves the main loop and the 4-slot inbox overflows, so bidirectional
