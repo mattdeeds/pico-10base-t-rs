@@ -1,8 +1,9 @@
 # Clock-recovery decoder — design plan
 
-Status: planning (2026-05-27). Unblocks full-MTU RX, the #1 router-foundation
-blocker found in A1. See RESUME.md "Router project — A1 link characterization"
-and the `project-vision-router` memory.
+Status: **Phase 0 DONE** (2026-05-27); Phase 1 next. Unblocks full-MTU RX, the
+#1 router-foundation blocker found in A1. See RESUME.md "Router project — A1
+link characterization" and the `project-vision-router` memory. The offline
+bench lives in `tools/clock-recovery/` (corpus + `harness.py` + `capture.py`).
 
 ## 1. Problem (from A1, confirmed)
 
@@ -58,7 +59,15 @@ the mid-bit transition (HB[0]→HB[1]) is at `F + 3 + 6k`; a bit-boundary
 transition at `F + 6(k+1)` appears only between equal-valued consecutive bits.
 Clock recovery tracks **mid-bit** edges and must ignore/handle boundary edges.
 
-## 4. Phase 0 — Offline bench & sample corpus  ← do first, highest leverage
+## 4. Phase 0 — Offline bench & sample corpus  ✅ DONE (2026-05-27)
+
+Built and committed in `tools/clock-recovery/`: temporary capture firmware
+exfiltrated full-MTU run samples over UDP; collected a corpus of full-MTU
+captures (`corpus/*.bin`, payload `i&0xFF`); `harness.py` runs a candidate
+decoder and scores per-byte error-position bins + FCS-ok. The current open-loop
+decoder reproduces offline exactly: **0% for ~575 B, ramp to ~82–89%, FCS-ok
+0/N** — the validated baseline for Phase 1. Capture firmware reverted from
+`main` (re-creation documented in the tools README). Original design below.
 
 A decoder rewrite iterated on-device is slow (flash cycle per try) and
 non-reproducible (the wire varies run-to-run). Capturing real samples once and
