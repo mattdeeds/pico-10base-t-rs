@@ -91,6 +91,34 @@ def decode_edge_track(buf, W=1):
         tr = nxt if nxt is not None else tr + P  # coast through a missed edge
     return F, _pack(bits)
 
+def decode_pio_model(buf, D=4):
+    # Phase 2a: software model of the PIO decoder (streaming, no F/SFD
+    # pre-align). Poll sample-by-sample for a level change (edge); emit the
+    # pre-edge level as the bit; skip D samples past the boundary edge;
+    # resample. Then CPU-side: find SFD in the emitted bitstream + extract.
+    # D=4 at 60 MHz (6 samples/bit); maps to ~10-11 cycles at a 150 MHz SM.
+    ns = len(buf) * 8
+    pos = 0; y = sample_bit(buf, 0); bits = []
+    while True:
+        pos += 1
+        if pos >= ns: break
+        if sample_bit(buf, pos) != y:
+            bits.append(y)
+            pos += D
+            if pos >= ns: break
+            y = sample_bit(buf, pos)
+    sfd = None
+    for k in range(1, len(bits)):
+        if bits[k] == 1 and bits[k - 1] == 1: sfd = k; break
+    if sfd is None: return None, None
+    start = sfd + 1
+    frame = bytearray(); i = 0
+    while start + i * 8 + 8 <= len(bits):
+        b = 0
+        for j in range(8): b |= bits[start + i * 8 + j] << j
+        frame.append(b); i += 1
+    return None, bytes(frame)
+
 # --- CRC-32 / IEEE-802.3 for FCS-ok ---
 _T = []
 for _n in range(256):
@@ -128,3 +156,4 @@ def score(name, dec):
 if __name__ == "__main__":
     score("current (open-loop) — baseline", decode_current)
     score("edge-track (clock recovery)", decode_edge_track)
+    score("pio-model (streaming, D=4)", decode_pio_model)

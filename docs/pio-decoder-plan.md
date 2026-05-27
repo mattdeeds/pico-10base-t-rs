@@ -1,7 +1,20 @@
 # PIO clock-recovery decoder — design plan (Phase 2)
 
-Status: planning (2026-05-27). Production implementation of the clock recovery
-validated offline in Phase 1. Parent: `docs/clock-recovery-decoder-plan.md`.
+Status: **Phase 2a DONE** (2026-05-27); 2b (PIO program) next. Production
+implementation of the clock recovery validated offline in Phase 1. Parent:
+`docs/clock-recovery-decoder-plan.md`.
+
+**Phase 2a result:** the streaming PIO decoder *logic* — poll for a level
+change, emit the pre-edge level as the bit, skip `D` samples past the boundary
+edge, resample, then CPU-side SFD-find on the emitted bitstream — is **validated
+on the corpus** (`harness.py::decode_pio_model`): **FCS-ok N/N, tail bin 0%**,
+matching edge-track. The boundary-skip delay works at **D=4** (of 6 samples/bit
+at the 60 MHz corpus rate); D=3 catches the boundary edge and D=5 overshoots
+when drift quantizes a bit to 5 samples — i.e. the working window is *one
+sample* at this coarse rate. The real PIO at a 150 MHz SM (15 cycles/bit) has
+2.5× finer timing, mapping D to **~10–11 cycles with ~7 cycles of margin** — far
+more robust. To tune the delay precisely (and confirm the margin), **capture a
+150 MHz-resolution corpus** before/while writing the PIO program (2b).
 
 ## 1. Why PIO (not CPU)
 
