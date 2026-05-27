@@ -263,7 +263,11 @@ fn main() -> ! {
             if !socket.is_open() {
                 let _ = socket.bind(1234);
             }
-            let mut echo_buf = [0u8; 512];
+            // Sized for a full-MTU UDP datagram (1500 - 20 IP - 8 UDP = 1472
+            // payload). Was 512, which silently truncated larger echoes — and
+            // masked the fact that RX now decodes full-MTU frames after the
+            // single-pass decoder lifted the old ~199-byte cap.
+            let mut echo_buf = [0u8; 1472];
             for _ in 0..4 {
                 match socket.recv_slice(&mut echo_buf) {
                     Ok((len, meta)) => {

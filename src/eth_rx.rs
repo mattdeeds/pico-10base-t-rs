@@ -20,6 +20,8 @@ use hal::pio::{
     Buffers, PinDir, Rx, Running, ShiftDirection, StateMachine, UninitStateMachine, SM1,
 };
 
+use crate::eth_mac::MAX_FRAME_BYTES;
+
 /// Sample rate — 3 samples per Manchester half-bit (half-bit = 50 ns @ 10 Mbps).
 pub const SAMPLE_HZ: u32 = 60_000_000;
 
@@ -41,6 +43,12 @@ pub const MAX_CARRY_BYTES: usize = 16 * 1024;
 /// Caller sees one contiguous slice across the boundary.
 pub const STITCH_BUF_BYTES: usize = BUF_BYTES + MAX_CARRY_BYTES;
 
+/// Upper bound on the SFD search in `decode_frame` — preserves the historical
+/// 1600-bit extraction cap. The SFD normally appears within the first ~64 data
+/// bits (7-byte preamble + SFD); this only bounds the pathological no-SFD case
+/// so a noise run can't spin the search unboundedly.
+const SFD_SEARCH_BITS: usize = 1600;
+
 type RxFifo = Rx<(PIO0, SM1)>;
 pub type RxBuf = &'static mut [u32; BUF_WORDS];
 pub type CarryBuf = &'static mut [u8; MAX_CARRY_BYTES];
@@ -59,6 +67,63 @@ type Xfer = double_buffer::Transfer<
 #[inline]
 fn sample_bit(bytes: &[u8], bit_offset: usize) -> u8 {
     (bytes[bit_offset >> 3] >> (bit_offset & 7)) & 1
+}
+
+/// Find F — the first H→L transition within the first `nsamples` samples of
+/// the run, as a sample offset from `base_bit`. F marks the start of
+/// half-bit 0. Returns `None` if no falling edge is present. Shared by
+/// `decode_frame` and `peek_dst_mac`.
+#[inline]
+fn find_first_falling_edge(bytes: &[u8], base_bit: usize, nsamples: usize) -> Option<usize> {
+    let mut prev = sample_bit(bytes, base_bit);
+    for i in 1..nsamples {
+        let s = sample_bit(bytes, base_bit + i);
+        if prev == 1 && s == 0 {
+            return Some(i);
+        }
+        prev = s;
+    }
+    None
+}
+
+/// The phase-locked data bit at logical half-bit index `k`: the sample at
+/// `F + 4 + 6k` (the midpoint of the second half-bit of Manchester pair k —
+/// 3 samples per half-bit). Returns `None` once that sample would fall past
+/// `nsamples`, i.e. the run ran out before bit `k`. This is the per-bit
+/// primitive the single-pass decoder reads on demand, instead of
+/// materializing every bit into an intermediate `Vec`.
+#[inline]
+fn data_bit(bytes: &[u8], base_bit: usize, f: usize, k: usize, nsamples: usize) -> Option<u8> {
+    let idx = f + 4 + 6 * k;
+    if idx >= nsamples {
+        None
+    } else {
+        Some(sample_bit(bytes, base_bit + idx))
+    }
+}
+
+/// Locate the SFD end: the index of the *second* `1` in the first `1,1`
+/// data-bit pair (the trailing two bits of the 0xD5 SFD byte, LSB-first).
+/// Reads data bits on demand up to `max_bits`, stopping early if the run's
+/// samples are exhausted. Frame data starts at the next bit (`sfd_end + 1`).
+/// Returns `None` if no SFD pair is found within the searched window.
+#[inline]
+fn find_sfd_end(
+    bytes: &[u8],
+    base_bit: usize,
+    f: usize,
+    nsamples: usize,
+    max_bits: usize,
+) -> Option<usize> {
+    let mut prev = data_bit(bytes, base_bit, f, 0, nsamples)?;
+    for k in 1..max_bits {
+        let cur = data_bit(bytes, base_bit, f, k, nsamples)?;
+        if cur == 1 && prev == 1 {
+            return Some(k);
+        }
+        prev = cur;
+    }
+    None
 }
 
 /// PIO RX + DMA double-buffer state. Holds the running SM (so it isn't
@@ -207,56 +272,28 @@ impl EthRx {
         let nsamples = nbytes * 8;
         let base_bit = base * 8;
 
-        // First H→L transition (same as decode_frame).
-        let mut f: Option<usize> = None;
-        let mut prev = sample_bit(bytes, base_bit);
-        for i in 1..nsamples {
-            let s = sample_bit(bytes, base_bit + i);
-            if prev == 1 && s == 0 {
-                f = Some(i);
-                break;
-            }
-            prev = s;
-        }
-        let f = f?;
+        let f = find_first_falling_edge(bytes, base_bit, nsamples)?;
 
-        // Cap at 200 bits: 7 bytes preamble (56 bits) + 1 SFD (8) + 48 MAC
-        // bits = 112 minimum, but SFD can appear later if the first H→L
-        // wasn't exactly at HB[0]. 200 gives slack without wasting work.
+        // Cap the SFD search at 200 bits: 56 preamble + 8 SFD + 48 MAC = 112
+        // minimum, but the SFD can appear later if the first H→L wasn't
+        // exactly at HB[0]. 200 gives slack without wasting work.
         const MAX_BITS: usize = 200;
-        let mut bits = [0u8; MAX_BITS];
-        let mut nbits = 0;
-        for j in 0..MAX_BITS {
-            let idx = f + 4 + 6 * j;
-            if idx >= nsamples {
-                break;
-            }
-            bits[j] = sample_bit(bytes, base_bit + idx);
-            nbits = j + 1;
-        }
+        let sfd_end = find_sfd_end(bytes, base_bit, f, nsamples, MAX_BITS)?;
 
-        // SFD: first `1,1` pair (last two bits of 0xD5 LSB-first).
-        let mut sfd_end: Option<usize> = None;
-        for i in 1..nbits {
-            if bits[i] == 1 && bits[i - 1] == 1 {
-                sfd_end = Some(i);
-                break;
-            }
-        }
-        let sfd_end = sfd_end?;
-
-        // Need 48 bits after SFD for the dst MAC.
+        // The 48 dst-MAC bits must fit within the same 200-bit window
+        // (matches the old `start_bit + 48 > nbits` guard).
         let start_bit = sfd_end + 1;
-        if start_bit + 48 > nbits {
+        if start_bit + 48 > MAX_BITS {
             return None;
         }
         let mut mac = [0u8; 6];
-        for i in 0..6 {
+        for (i, slot) in mac.iter_mut().enumerate() {
             let mut b: u8 = 0;
             for j in 0..8 {
-                b |= bits[start_bit + i * 8 + j] << j;
+                let k = start_bit + i * 8 + j;
+                b |= data_bit(bytes, base_bit, f, k, nsamples)? << j;
             }
-            mac[i] = b;
+            *slot = b;
         }
         Some(mac)
     }
@@ -264,7 +301,7 @@ impl EthRx {
     /// Phase-lock + Manchester-decode + SFD-align a frame-shaped active
     /// run in `bytes`. `base` is the byte offset of the run within `bytes`,
     /// `nbytes` its length. Returns the unverified post-SFD frame bytes
-    /// (CRC verification happens in [`crc32_ieee802_3`] / R3.6).
+    /// (CRC verification happens in [`verify_fcs`] / R3.6).
     ///
     /// Algorithm — see `eth_rx_decode_frame` in `../Pico-10BASE-T/src/eth_rx.c`:
     /// 1. Find F = first H→L transition in the run = start of HB[0].
@@ -272,62 +309,41 @@ impl EthRx {
     ///    so the midpoint of HB[2k+1] is sample 4 + 6k from F).
     /// 3. SFD = first `1,1` pair in the decoded bit stream — the last two
     ///    bits of the 0xD5 SFD byte (LSB-first).
-    /// 4. Pack post-SFD bits LSB-first into frame bytes.
+    /// 4. Pack post-SFD bits LSB-first straight into frame bytes — single
+    ///    pass, reading each data bit on demand via [`data_bit`] rather than
+    ///    buffering every bit into an intermediate `Vec` first. Output is
+    ///    sized to `MAX_FRAME_BYTES` (a full 1518-byte frame), so unlike the
+    ///    old two-pass version it does not truncate frames past ~199 bytes.
     pub fn decode_frame(
         bytes: &[u8],
         base: usize,
         nbytes: usize,
-    ) -> Option<heapless::Vec<u8, 1600>> {
+    ) -> Option<heapless::Vec<u8, MAX_FRAME_BYTES>> {
         let nsamples = nbytes * 8;
         let base_bit = base * 8;
 
-        // First H→L transition.
-        let mut f: Option<usize> = None;
-        let mut prev = sample_bit(bytes, base_bit);
-        for i in 1..nsamples {
-            let s = sample_bit(bytes, base_bit + i);
-            if prev == 1 && s == 0 {
-                f = Some(i);
-                break;
-            }
-            prev = s;
-        }
-        let f = f?;
+        let f = find_first_falling_edge(bytes, base_bit, nsamples)?;
+        let sfd_end = find_sfd_end(bytes, base_bit, f, nsamples, SFD_SEARCH_BITS)?;
 
-        // Phase-locked data bits.
-        let mut bits: heapless::Vec<u8, 2048> = heapless::Vec::new();
-        for j in 0..1600usize {
-            let idx = f + 4 + 6 * j;
-            if idx >= nsamples {
-                break;
-            }
-            if bits.push(sample_bit(bytes, base_bit + idx)).is_err() {
-                break;
-            }
-        }
-
-        // SFD: first `1,1` pair.
-        let mut sfd_end: Option<usize> = None;
-        for i in 1..bits.len() {
-            if bits[i] == 1 && bits[i - 1] == 1 {
-                sfd_end = Some(i);
-                break;
-            }
-        }
-        let sfd_end = sfd_end?;
-
-        // Pack post-SFD bits LSB-first into bytes.
+        // Pack post-SFD bits LSB-first, one byte at a time, straight from
+        // on-demand sample reads. Stop at the first byte whose 8 data bits
+        // aren't fully present (run exhausted) — dropping the partial byte
+        // matches the old `avail / 8` truncation — or once the output fills
+        // MAX_FRAME_BYTES.
         let start_bit = sfd_end + 1;
-        let avail = bits.len().saturating_sub(start_bit);
-        let nframe = (avail / 8).min(1600);
-
-        let mut frame: heapless::Vec<u8, 1600> = heapless::Vec::new();
-        for i in 0..nframe {
+        let mut frame: heapless::Vec<u8, MAX_FRAME_BYTES> = heapless::Vec::new();
+        for i in 0..MAX_FRAME_BYTES {
             let mut byte: u8 = 0;
             for j in 0..8 {
-                byte |= bits[start_bit + i * 8 + j] << j;
+                let k = start_bit + i * 8 + j;
+                let Some(b) = data_bit(bytes, base_bit, f, k, nsamples) else {
+                    return Some(frame);
+                };
+                byte |= b << j;
             }
-            let _ = frame.push(byte);
+            if frame.push(byte).is_err() {
+                break;
+            }
         }
         Some(frame)
     }
