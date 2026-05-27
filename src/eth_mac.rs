@@ -43,15 +43,24 @@ pub const FRAME_SNAP_BYTES: usize = 128;
 pub struct EthRxShared {
     rx: EthRx,
     inbox: Deque<Vec<u8, MAX_FRAME_BYTES>, INBOX_SLOTS>,
+    /// Our 6-byte MAC. Used by the IRQ-side filter to skip frames not
+    /// addressed to us before paying for the full decode + CRC + push.
+    our_mac: [u8; 6],
     pub stats: EthRxStats,
 }
 
 #[derive(Clone, Copy)]
 pub struct EthRxStats {
-    /// Total decode attempts in the window (one per active run found).
+    /// Total decode attempts in the window (one per active run found
+    /// AND accepted by the MAC filter).
     pub frames_decoded: u32,
     pub fcs_ok: u32,
     pub fcs_fail: u32,
+    /// Active runs that peek_dst_mac accepted but couldn't actually
+    /// decode (rare — usually means active-run length was a noise blob).
+    /// Note: separate from `fcs_fail` which is for runs that decoded
+    /// but failed CRC.
+    pub frames_filtered: u32,
     pub inbox_dropped: u32,
     pub inbox_high_water: u8,
     pub carry_capped: u32,
@@ -68,6 +77,7 @@ impl Default for EthRxStats {
             frames_decoded: 0,
             fcs_ok: 0,
             fcs_fail: 0,
+            frames_filtered: 0,
             inbox_dropped: 0,
             inbox_high_water: 0,
             carry_capped: 0,
@@ -84,10 +94,11 @@ impl Default for EthRxStats {
 /// DMA IRQ. The IRQ handler refuses to run if this is still `None`.
 static SHARED_RX: Mutex<RefCell<Option<EthRxShared>>> = Mutex::new(RefCell::new(None));
 
-/// Move an `EthRx` into the shared static. Call once, after constructing
-/// `EthRx` and before unmasking `DMA_IRQ_0`. Returns `false` if `SHARED_RX`
-/// was already populated (shouldn't happen — programmer error).
-pub fn install_rx(rx: EthRx) -> bool {
+/// Move an `EthRx` into the shared static, along with our MAC for the
+/// IRQ-side MAC filter. Call once, after constructing `EthRx` and before
+/// unmasking `DMA_IRQ_0`. Returns `false` if `SHARED_RX` was already
+/// populated (shouldn't happen — programmer error).
+pub fn install_rx(rx: EthRx, our_mac: [u8; 6]) -> bool {
     critical_section::with(|cs| {
         let mut slot = SHARED_RX.borrow_ref_mut(cs);
         if slot.is_some() {
@@ -96,10 +107,21 @@ pub fn install_rx(rx: EthRx) -> bool {
         slot.replace(EthRxShared {
             rx,
             inbox: Deque::new(),
+            our_mac,
             stats: EthRxStats::default(),
         });
         true
     })
+}
+
+/// Should the IRQ-side MAC filter accept a frame with this destination?
+/// Accepts: unicast addressed to us, broadcast, any multicast (per the
+/// I/G bit — bit 0 of byte 0). smoltcp does the finer-grained filtering
+/// later (it'll silently drop multicasts we're not subscribed to), but
+/// this gate at least skips the bulk of stranger-unicast traffic.
+#[inline]
+fn mac_accept(dst: &[u8; 6], our: &[u8; 6]) -> bool {
+    dst == our || (dst[0] & 0x01) != 0
 }
 
 /// Snapshot + reset the IRQ-managed RX stats. Called by the main loop
@@ -126,10 +148,21 @@ impl EthRxShared {
     fn process_completed_half(&mut self) {
         let inbox = &mut self.inbox;
         let stats = &mut self.stats;
+        let our_mac = self.our_mac;
         self.rx.poll_with(|bytes| {
             let mut cursor = 0;
             while let Some((off, len)) = EthRx::find_active_run_from(bytes, cursor, 100) {
                 cursor = off + len;
+                // MAC filter first — cheap peek (~1–2 µs) that skips the
+                // full decode + CRC + push for frames not addressed to
+                // us. We accept unicast-to-us + all multicast/broadcast.
+                let Some(dst) = EthRx::peek_dst_mac(bytes, off, len) else {
+                    continue;
+                };
+                if !mac_accept(&dst, &our_mac) {
+                    stats.frames_filtered = stats.frames_filtered.wrapping_add(1);
+                    continue;
+                }
                 let Some(mut frame) = EthRx::decode_frame(bytes, off, len) else {
                     continue;
                 };

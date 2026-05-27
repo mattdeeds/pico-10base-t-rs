@@ -195,6 +195,73 @@ impl EthRx {
         }
     }
 
+    /// Decode just the destination MAC of a frame-shaped active run —
+    /// stops as soon as the 6 dst-MAC bytes are recovered. Same phase-lock
+    /// and SFD-find logic as [`decode_frame`], but capped at ~200 bits
+    /// (preamble + SFD slack + 48 MAC bits) and uses a fixed stack array
+    /// instead of allocating a `Vec`. Cost is ~1–2 µs per call vs ~10 µs
+    /// for a full `decode_frame`, so the IRQ-side MAC filter can skip the
+    /// expensive full decode + CRC + inbox push for frames not addressed
+    /// to us. Returns `None` if F or SFD couldn't be located, or if there
+    /// weren't enough samples to recover all 6 bytes.
+    pub fn peek_dst_mac(bytes: &[u8], base: usize, nbytes: usize) -> Option<[u8; 6]> {
+        let nsamples = nbytes * 8;
+        let base_bit = base * 8;
+
+        // First H→L transition (same as decode_frame).
+        let mut f: Option<usize> = None;
+        let mut prev = sample_bit(bytes, base_bit);
+        for i in 1..nsamples {
+            let s = sample_bit(bytes, base_bit + i);
+            if prev == 1 && s == 0 {
+                f = Some(i);
+                break;
+            }
+            prev = s;
+        }
+        let f = f?;
+
+        // Cap at 200 bits: 7 bytes preamble (56 bits) + 1 SFD (8) + 48 MAC
+        // bits = 112 minimum, but SFD can appear later if the first H→L
+        // wasn't exactly at HB[0]. 200 gives slack without wasting work.
+        const MAX_BITS: usize = 200;
+        let mut bits = [0u8; MAX_BITS];
+        let mut nbits = 0;
+        for j in 0..MAX_BITS {
+            let idx = f + 4 + 6 * j;
+            if idx >= nsamples {
+                break;
+            }
+            bits[j] = sample_bit(bytes, base_bit + idx);
+            nbits = j + 1;
+        }
+
+        // SFD: first `1,1` pair (last two bits of 0xD5 LSB-first).
+        let mut sfd_end: Option<usize> = None;
+        for i in 1..nbits {
+            if bits[i] == 1 && bits[i - 1] == 1 {
+                sfd_end = Some(i);
+                break;
+            }
+        }
+        let sfd_end = sfd_end?;
+
+        // Need 48 bits after SFD for the dst MAC.
+        let start_bit = sfd_end + 1;
+        if start_bit + 48 > nbits {
+            return None;
+        }
+        let mut mac = [0u8; 6];
+        for i in 0..6 {
+            let mut b: u8 = 0;
+            for j in 0..8 {
+                b |= bits[start_bit + i * 8 + j] << j;
+            }
+            mac[i] = b;
+        }
+        Some(mac)
+    }
+
     /// Phase-lock + Manchester-decode + SFD-align a frame-shaped active
     /// run in `bytes`. `base` is the byte offset of the run within `bytes`,
     /// `nbytes` its length. Returns the unverified post-SFD frame bytes

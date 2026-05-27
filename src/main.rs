@@ -110,12 +110,13 @@ fn main() -> ! {
         rx_stitch,
     );
 
-    // Install EthRx into the shared static the DMA_IRQ_0 handler reads,
-    // then unmask the IRQ + enable Hazard3 machine-external interrupts.
-    // From this point on, decoding is interrupt-driven — the main loop
-    // never polls EthRx; smoltcp drains the inbox via EthMac::Device::
-    // receive instead.
-    let _ = eth_mac::install_rx(eth_rx);
+    // Install EthRx + our MAC (for the IRQ-side MAC filter) into the
+    // shared static the DMA_IRQ_0 handler reads, then unmask the IRQ +
+    // enable Hazard3 machine-external interrupts. From this point on,
+    // decoding is interrupt-driven — the main loop never polls EthRx;
+    // smoltcp drains the inbox via EthMac::Device::receive instead.
+    let our_mac_bytes: [u8; 6] = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC];
+    let _ = eth_mac::install_rx(eth_rx, our_mac_bytes);
     unsafe {
         hal::arch::interrupt_unmask(hal::pac::Interrupt::DMA_IRQ_0);
         hal::arch::interrupt_enable();
@@ -126,7 +127,7 @@ fn main() -> ! {
     // Device handle.
     let mut mac = eth_mac::EthMac::new(eth_tx);
 
-    let our_mac = EthernetAddress([0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC]);
+    let our_mac = EthernetAddress(our_mac_bytes);
     let our_ip = IpAddress::Ipv4(Ipv4Address::new(192, 168, 37, 24));
     let mut iface_config = Config::new(HardwareAddress::Ethernet(our_mac));
     iface_config.random_seed = timer.get_counter().ticks();
@@ -153,7 +154,7 @@ fn main() -> ! {
     // Mirror the C reference's network parameters so the host's existing
     // ethtool / IP route setup keeps working.
     let endpoint = eth_tx::UdpEndpoint {
-        src_mac: [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC],
+        src_mac: our_mac_bytes,
         dst_mac: [0xFF; 6], // broadcast
         src_ip: [192, 168, 37, 24],
         dst_ip: [192, 168, 37, 19],
@@ -283,7 +284,7 @@ fn main() -> ! {
             if let Some(token) = mac.transmit(now_inst) {
                 token.consume(body_len, |buf| {
                     let mut eth = EthernetFrame::new_unchecked(buf);
-                    eth.set_src_addr(EthernetAddress([0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC]));
+                    eth.set_src_addr(EthernetAddress(our_mac_bytes));
                     eth.set_dst_addr(EthernetAddress::BROADCAST);
                     eth.set_ethertype(EthernetProtocol::Ipv4);
 
@@ -337,10 +338,11 @@ fn main() -> ! {
             line.clear();
             let _ = writeln!(
                 line,
-                "[Rx] dec={} ok={} fail={} dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                "[Rx] dec={} ok={} fail={} filt={} dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                 rx.frames_decoded,
                 rx.fcs_ok,
                 rx.fcs_fail,
+                rx.frames_filtered,
                 last_dst_mac[0],
                 last_dst_mac[1],
                 last_dst_mac[2],
