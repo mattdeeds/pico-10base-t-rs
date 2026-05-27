@@ -33,8 +33,17 @@ $ python3 harness.py
   bin 7 frame-bytes 1330-1513   ~82-89%
 ```
 
-Perfect for ~575 bytes, then a monotonic ramp = clock drift. **Phase 1 goal:**
-a clock-recovery decoder that drives all bins flat (~0%) and **FCS-ok to N/N.**
+Perfect for ~575 bytes, then a monotonic ramp = clock drift.
+
+## Phase 1 result — clock recovery (DONE)
+
+`decode_edge_track` re-anchors to each per-bit Manchester transition (recurs
+~6 samples apart at `F+5+6m`) and samples one sample before it (= `F+4+6m`), so
+drift can't accumulate. On the corpus it drives **every bin to 0% and FCS-ok to
+N/N** (robust across window W=1–3) — see `harness.py` output. This is the
+algorithm to take to firmware (Phase 2); the per-bit edge search makes a CPU
+port borderline vs the IRQ budget, so PIO-side recovery is the likely
+production path (see `docs/clock-recovery-decoder-plan.md`).
 
 ## Workflow
 

@@ -1,9 +1,26 @@
 # Clock-recovery decoder — design plan
 
-Status: **Phase 0 DONE** (2026-05-27); Phase 1 next. Unblocks full-MTU RX, the
-#1 router-foundation blocker found in A1. See RESUME.md "Router project — A1
-link characterization" and the `project-vision-router` memory. The offline
-bench lives in `tools/clock-recovery/` (corpus + `harness.py` + `capture.py`).
+Status: **Phase 0 + 1 algorithm DONE** (2026-05-27); Phase 2 next (production
+implementation — likely PIO). Unblocks full-MTU RX, the #1 router-foundation
+blocker found in A1. See RESUME.md "Router project — A1 link characterization"
+and the `project-vision-router` memory. The offline bench lives in
+`tools/clock-recovery/` (corpus + `harness.py` + `capture.py`).
+
+**Phase 1 result:** the **edge-relative re-anchoring** algorithm (track each
+per-bit Manchester transition, sample one sample before it) **fully cancels the
+drift** on the corpus — every position bin flat 0%, **FCS-ok N/N** (vs the
+open-loop baseline's ~0→89% tail, FCS 0/N), robust across search-window
+W = 1–3. Algorithm validated; see `harness.py::decode_edge_track`.
+
+**Phase 2 caveat (drives the CPU-vs-PIO decision):** edge-track does a small
+per-bit edge search (a few extra sample reads/bit). Rough estimate: ~2–4× the
+current per-bit decode cost → a full-MTU CPU decode (~12 k bits) lands around
+~1.6–3.3 ms, i.e. *borderline-to-over* the 2.18 ms IRQ half-fill budget. So the
+CPU port needs an on-device cost measurement, and this strongly favours
+**Candidate C (PIO-side recovery)** for production — the PIO does exactly this
+(`wait` for each transition, sample just before) in hardware at zero CPU cost,
+which *also* fixes A1 Finding 2 (single-core load collapse). The offline-
+validated algorithm maps directly onto a PIO `wait`-on-edge program.
 
 ## 1. Problem (from A1, confirmed)
 
