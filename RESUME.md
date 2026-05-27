@@ -159,6 +159,49 @@ curl -s --max-time 5 http://192.168.37.24/
 
 ## Future work
 
+### Router project — A1 link characterization (2026-05-27)
+
+**Context:** the end goal is for this NIC to be the WAN uplink of a low-power
+RP2350 wireless router (clients on a wireless module, NAT-routed out 10BASE-T —
+see the `project-vision-router` memory). **A1** = measure whether the link can
+actually carry real bidirectional/routed traffic. **Verdict: not yet — two
+blockers, one of them fundamental to the current decoder.**
+
+Method: device cumulative RX telemetry (decoded/ok/fail/drop/cap) exfil'd over
+the UDP broadcast; host floods of (a) broadcast→dead-port = pure RX with no
+TX-back, and (b) UDP-echo = RX-decode + TX-encode per packet (router proxy).
+
+**Finding 1 — full-MTU RX is broken; FCS-ok collapses with frame size, even at
+low rate.** At a non-saturating 150 pps: 64 B **98 %**, 256 B 93 %, 512 B 85 %,
+1024 B **38 %**, 1518 B **1.7 %**. The implied per-bit error rate *rises ~10×*
+with frame length (≈3.5e-5 → 3.3e-4) — NOT uniform noise (which is constant per
+bit and would predict ~34 % at 1518 B). That's the signature of **accumulated
+clock drift**: `decode_frame` locks phase once at the SFD and then samples at a
+fixed `F + 4 + 6k` stride with **no clock recovery**, so any TX/RX oscillator
+mismatch (±100 ppm 10BT tolerance + our 150 MHz fractional-divider jitter) walks
+the sample point off the bit centre over a long frame — drift can exceed a full
+bit over a 1.2 ms full-MTU frame. (AC-coupling baseline wander may compound it.)
+**Fundamental to the decoder — full-duplex hardware does NOT fix this.** ⇒ can't
+carry full-MTU TCP bulk traffic. Fix needs decoder **clock recovery** (re-sync
+phase on the Manchester mid-bit transition each bit) and/or PHY signal-integrity
+work. A per-byte error-position test would confirm the drift hypothesis.
+
+**Finding 2 — single core collapses under load.** Under a saturating flood the
+RX IRQ starves the main loop and the 4-slot inbox overflows, so bidirectional
+echo goodput falls to **0.02–0.13 Mbit/s at 0.6–2.2 % round-trip success** (vs
+~100 % at light rates). Pure RX decode ceiling: ~3370 pps @64 B (1.7 Mbit/s)
+down to ~400 pps @1518 B; small frames are decode-bound and the inbox drains at
+only ~250–500/s under load. ⇒ need **core separation** (NIC IRQ on one Hazard3
+core, stack/routing on the other) + a bigger inbox + flow control.
+
+**Revised priority order (A1 reshaped it — these now precede NAT/wireless):**
+1. **Decoder clock recovery** (full-MTU RX). Without it the link can't carry
+   real traffic at all. Biggest blocker; was hidden until A1.
+2. **Core separation + buffering** so decode-under-load doesn't starve routing.
+3. **Collisions / half-duplex** (full-duplex HW or PIO CSMA) — matters once 1+2
+   are fixed; secondary today.
+4. …then NAT/forwarding, the wireless interface, DHCP (the router proper).
+
 ### Performance: measured hot-path costs + plans (2026-05-27)
 
 On-device measurement (Hazard3 `mcycle` @ 150 MHz, 6.67 ns/cyc), worst case under a UDP blast + ping:
