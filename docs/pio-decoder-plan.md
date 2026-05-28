@@ -282,6 +282,39 @@ window offline and, if tight, on a 150 MHz capture.
    tick resolution looks tight.
 4. Then write the PIO program; bring up in parallel; measure against §11.
 
+### 12a. DPLL on-wire results (2026-05-27 / 2026-05-28)
+
+**v1 — sample-by-pin (7 instrs).** First on-wire PIO build: decoded valid
+Manchester (preamble visible, polarity inverted as expected), 56–141 payload
+bytes byte-perfect, then slipped. Loop tuned via `in pins, 1 [7]` (15 cyc/bit;
+`[8]` gave 16 cyc → drift → random output). Improvement over `[8]`: bit value
+comes from the pin (`in pins, 1`) instead of LOW/HIGH state, so a mis-tracked
+edge doesn't propagate to all subsequent bits — *but* the unconditional `wait`
+still catches every edge in the post-coast window, so single jittered/noise
+edges still slip. (Committed as 5148c8a.)
+
+**v2 — windowed (15 instrs, polling loop + coast path).** Replaced `wait` with
+`set x` + `jmp x--` polling that accepts edges within ±jitter of the expected
+mid-bit cycle, plus a `coast_miss` path for window timeouts. On wire: **decoded
+a full 512 B payload byte-perfect (FCS-OK)** in one captured window — the first
+time any PIO version did so. But on full-MTU, lock degrades after ~75 payload
+bytes into idle reads (`00 00 00 00 …` for the rest of the window). **Root
+cause:** cycle budget — pre-poll (10 cyc) + polling fall-through (7 cyc) +
+`jmp coast` (1) + `nop[4]` (5) + `jmp sample_path` (1) = **24 cycles on the
+no-edge path** vs the 15-cycle bit period ⇒ each missed window drifts the loop
+**+9 cycles**, desyncing the SM. v2 partially works on short frames where
+windows almost always find their edge, but can't sustain lock across full MTU.
+
+**Implication: 150 MHz × 15 cyc/bit is too tight a budget for a fully windowed
+DPLL in PIO.** The no-edge coast path must equal one bit period (15 cyc); with
+the polling + pre-poll overhead, that's already exceeded. Pragmatic options:
+(i) **overclock to 180 MHz** for 18 cyc/bit (3 cycles of headroom — see the
+`sysclk-integer-pio-dividers` memory for the flash-divider risk); (ii) **CPU
+DPLL on the 2nd Hazard3 core** (the validated edge-track from Phase 1, sidesteps
+PIO timing constraints, costs the second core but solves A1 Finding 2 separately
+via core separation); (iii) accept v2's partial behavior + parallel work on the
+TX path / other R-phases.
+
 **Model — first result (2026-05-27).** `decode_dpll_model` (harness.py, window-
 only, N=6/samp=4/win=1) on the clean 60 MHz corpus: **2/3 frames decode the
 ENTIRE 1518 B payload flat-perfect, FCS-OK** — the DPLL **holds full-MTU lock**,
