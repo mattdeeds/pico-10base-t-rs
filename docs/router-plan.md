@@ -289,3 +289,50 @@ links for `riscv32imac`.**
 - Verify on-wire: chip inits; a client sees the SSID. (R14 then adds AP +
   DHCP server + the smoltcp LAN `Interface`.)
 - Relocate the user LED off GP25 (= wireless CS on Pico 2 W).
+
+## 11. R13 on-board findings + the pivot (2026-05-28)
+
+Pico 2 W in hand. **Production 10BASE-T verified clean on the new board**
+(ping 100%, curl 200, UDP 10/10, core 1 + carrier-sense all working) — the WAN
+side fully survived the swap (GP13/14 unchanged).
+
+**Synchronous gSPI bit-bang probe result: chip not responding.** The probe
+(`wireless::probe_cyw43`) powers WL_ON and bit-bangs `read32_swapped(TEST_RO)`,
+expecting `0xFEEDBEAD`. It reads **varying** values (first `0x06060606`, last
+`0xfdda7d5b`, `stable=0`) → DATA is floating/undriven → the CYW43 isn't
+responding (power, or the command isn't reaching it), not a mere framing offset.
+- **Ruled out:** pin map (GP23=WL_ON, 24=DATA, 25=CS, 29=CLK — confirmed for
+  Pico 2 W) and SIO funcsel (`= 5` on RP2350, same as RP2040).
+- **Wall:** the CYW43 SPI lines are NOT exposed on the header, so they can't be
+  scoped — blind bit-bang timing/power iteration is inefficient and low-yield
+  (the bit-bang also can't replicate the PIO input-synchronizer timing the chip
+  expects).
+
+**Decision: pivot to the proven `cyw43` driver + a faithful PIO gSPI transport
+(known-good timing).** Its `init()` does the `while != FEEDBEAD` handshake and
+won't complete unless the chip truly responds — so **it doubles as the hardware
+test**: init succeeds ⇒ board + transport good; init hangs ⇒ likely a board
+issue (the board's wireless is currently *unverified*), at which point verify it
+independently with stock firmware (MicroPython WiFi / pico-examples) before more
+driver work.
+
+**Pivot build plan (next focused session):**
+1. **PIO gSPI transport on PIO1.** Port cyw43-pio's program to `rp235x-hal`.
+   Because `rp235x-hal`'s SM control is leaner than embassy-rp's (no easy
+   `set_x`/`set_y`/`exec_jmp` on a running SM), make it **self-contained +
+   FIFO-driven**: the program `pull`s the write-bit-count → X, the read-bit-count
+   → Y, then the cmd+data words, clocks them out (side-set CLK = GP29, out/set
+   pins = DATA = GP24), `set pindirs 0` for the turnaround, clocks the response
+   in, autopushes it. CS = GP25 driven as plain SIO GPIO around the transaction.
+   Implement `SpiBusCyw43::cmd_write/cmd_read` over it (FIFO push/pull; DMA later
+   if needed). Counts: write `len*32-1`; read `len*32+32-1` (incl. status word).
+2. **Async cyw43 bring-up.** Add `cyw43-firmware` (the 43439A0 + CLM blobs),
+   build `PioSpiCyw43` + the WL_ON pin, `cyw43::new(...)` → spawn `Runner::run()`
+   on the executor (the §10 `run_executor` foundation), `Control::init(clm)`,
+   then `Control::gpio_set(0, ..)` to blink the onboard LED.
+3. **Telemetry-in-async.** Set up usbd-serial (+ the pico_reset interface) polled
+   from an executor task draining a log ring buffer, so init progress / panics
+   are observable over CDC (we can't see the LED remotely). Enable cyw43's
+   `firmware-logs` feature for init tracing.
+4. **Observe:** `[Cyw43] init done` over CDC ⇒ transport + chip alive (R13 met).
+   Then R14: AP mode + DHCP server + the smoltcp LAN `Interface`.
