@@ -488,3 +488,58 @@ baseline-wander tolerance) or a 2nd-order DPLL with longer-window averaging
 Either path needs the algorithm we already have. The Rust port is on disk
 and validated; whichever route we take, the decoder body doesn't change —
 only its tuning/optimization (option 1) or its host-core (option 2).
+
+### 9e. Phase 3b productized — DPLL is the default decoder (2026-05-28)
+
+With §9d's escape hatch met, the `--features dpll` opt-in is retired. The
+edge-track DPLL in `src/eth_rx_dpll.rs` is now the only full-frame decoder;
+the open-loop `EthRx::decode_frame` (and the temporary `dpll` cargo feature)
+are gone. Cleanup pass:
+
+- **`Cargo.toml`**: removed the `dpll` feature flag.
+- **`src/eth_mac.rs`**: the `#[cfg(feature = "dpll")]` gates are gone; the
+  IRQ-side decoder call is unconditional. Removed `EthRxShared::diag_fail_*`
+  fields, the in-IRQ failed-frame capture, and `snapshot_diag_failed`.
+- **`src/eth_rx.rs`**: removed the open-loop `decode_frame` method plus the
+  `SFD_SEARCH_BITS` constant only it used. The open-loop sampling helpers
+  (`find_first_falling_edge` / `find_sfd_end` / `data_bit`) stay — they're
+  still used by `peek_dst_mac` (dst-MAC is 48 bits past the SFD, comfortably
+  inside the no-drift window, so no need to pay edge-track cost for the
+  MAC filter).
+- **`src/main.rs`**: removed the Phase 2b PIO chunk-dump scaffolding
+  (`eth_rx_pio` mod, PIO1 SM0, `dec_cap` capture/dump loop) and the
+  Phase 3b failed-frame diag-dump (`diag_endpoint`, `diag_buf`, dump loop).
+  Restored the Hello-World UDP broadcast every 200 ms.
+- **`src/eth_rx_pio.rs`**: deleted. The PIO investigation is preserved in
+  the commit history (`cc09e11`..`8845a38`) and the design retrospective at
+  `docs/pio-dpll-report.md`.
+- **`tools/clock-recovery/diag_dpll.py`**: deleted. Without its device-side
+  counterpart (the in-IRQ failed-frame capture + UDP dump, also removed),
+  the analyzer has no stream to listen to. Both halves are recoverable
+  from commits `ab72c89`..`f0253c8` if we ever need to re-run the
+  diagnosis.
+
+**On-device verification (productized build, default firmware):**
+
+- USB CDC: `[R2b] t=N nlps=63 udp_sent=5` — NLP cadence + Hello-World UDP
+  cadence both back to pre-Phase-2b shape.
+- `[Rx] dec=1 ok=1 fail=0 filt=0 dst=33:33:00:00:00:16` — IPv6 multicast
+  decoded successfully through the DPLL.
+- `ping -c 3 192.168.37.24`: 3/3, RTT 2.4–3.6 ms.
+- `curl http://192.168.37.24/`: HTTP/1.0 200, served `uptime=43s` payload.
+
+Binary size: 1.71 MB ELF (unchanged within margin — the open-loop
+`decode_frame` was already cold/inlined by LTO since `--features dpll`
+was set during recent measurement).
+
+What didn't change: the decoder *algorithm*. The Rust DPLL body in
+`eth_rx_dpll.rs` is untouched — productization was strictly a deletion
+exercise. The decoder behaviour is byte-identical to the §9c on-wire
+measurements (~50 % full-MTU, PHY-limited residual, no DMA buffer
+corruption, fits the 2.18 ms IRQ budget at 240 MHz).
+
+**What's left (the S2 piece):** the decoder is still on core 0's
+`DMA_IRQ_0`. The A1 Finding 2 benefit (no main-loop starvation under
+saturating load) would require Phase 3a (multicore launch) + Phase 3c
+(move IRQ to core 1). That's separate work; productizing the DPLL itself
+is done.

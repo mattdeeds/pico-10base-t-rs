@@ -13,9 +13,7 @@
 mod crc;
 mod eth_mac;
 mod eth_rx;
-mod eth_rx_pio; // TEMP (Phase 2b): experimental PIO clock-recovery decoder
-#[allow(dead_code)]
-mod eth_rx_dpll; // Phase 3b: CPU edge-track DPLL decoder (validated via tools/dpll-rust)
+mod eth_rx_dpll; // Edge-track DPLL Manchester decoder (productized — Phase 3b)
 mod eth_tx;
 mod manchester;
 mod pico_reset;
@@ -108,17 +106,12 @@ fn main() -> ! {
     let _tx_pin: hal::gpio::Pin<_, FunctionPio0, _> = pins.gpio14.into_function();
     let _rx_pin: hal::gpio::Pin<_, FunctionPio0, _> = pins.gpio13.into_function();
 
-    // PIO0 SM0 drives the Manchester TX; SM1 runs the RX sampler.
+    // PIO0 SM0 drives the Manchester TX; SM1 runs the RX sampler. The CPU
+    // edge-track DPLL (eth_rx_dpll) handles clock recovery in software off
+    // the same 60 MHz sample stream — PIO1 is free for future use.
     let (mut pio0, sm0, sm1, _sm2, _sm3) = pac.PIO0.split(&mut pac.RESETS);
     let sys_clk_hz = clocks.system_clock.freq().to_Hz();
     let eth_tx = eth_tx::EthTx::new(&mut pio0, sm0, HW_PIN_TXD, sys_clk_hz);
-
-    // TEMP (Phase 2b): experimental PIO clock-recovery decoder on PIO1 SM0,
-    // reading the same RXD input (GPIO input is visible to all PIO blocks).
-    // Runs in parallel with the working PIO0 RX so the device stays functional
-    // while we observe whether the decoder produces correct decoded bytes.
-    let (mut pio1, pio1_sm0, _p1s1, _p1s2, _p1s3) = pac.PIO1.split(&mut pac.RESETS);
-    let (_dec, mut dec_rx) = eth_rx_pio::EthRxPio::new(&mut pio1, pio1_sm0, HW_PIN_RXD);
 
     // DMA channels 0 and 1 ferry samples from the PIO RX FIFO into two
     // 16 KB half-buffers. EthRx::poll_with hands the just-filled half to
@@ -206,18 +199,6 @@ fn main() -> ! {
         src_port: 1234,
         dst_port: 1234,
     };
-    // Phase 3b diagnostic dump endpoint — failed RX frames go to host:1235
-    // so the analyzer can listen on a separate port from the PIO chunk dump.
-    #[cfg(feature = "dpll")]
-    let diag_endpoint = eth_tx::UdpEndpoint {
-        src_mac: our_mac_bytes,
-        dst_mac: [0xFF; 6],
-        src_ip: [192, 168, 37, 24],
-        dst_ip: [192, 168, 37, 19],
-        src_port: 1235,
-        dst_port: 1235,
-    };
-
     // USB CDC: appears on the host as /dev/ttyACM0.
     let usb_bus = UsbBusAllocator::new(hal::usb::UsbBus::new(
         pac.USB,
@@ -265,32 +246,14 @@ fn main() -> ! {
     // NLPs at 16 ms intervals; UDP broadcast at 200 ms; heartbeat log at 1 s.
     let now0 = timer.get_counter().ticks();
     let mut next_nlp = now0;
+    let mut next_udp = now0 + 200_000;
     let mut next_log = now0 + 1_000_000;
     let mut nlps_sent: u32 = 0;
     let mut udp_sent: u32 = 0;
     let mut log_tick: u32 = 0;
     let mut led_state = false;
-    // TEMP (Phase 2b): capture a window of the PIO decoder's decoded-byte
-    // output, dump it in chunks; host bit-scans for SFD + the known frame.
-    let mut dec_cap = [0u8; 2048];
-    let mut dec_cap_len: usize = 0;
-    let mut dec_id: u32 = 0;
-    let mut next_chunk = now0;
-    let mut chunk_seq: u32 = 0;
-    let mut chunk_buf = [0u8; 12 + 512];
 
-    // Phase 3b diagnostic — dump the most recent FCS-failed frame to UDP
-    // port 1235 every 50 ms so the host analyzer can compute per-byte error
-    // bins (vs known counter payload). Header: [magic_u32 | frame_id_u32 |
-    // orig_len_u16] = 10 bytes, then up to 1460 bytes of frame data. Only
-    // active under --features dpll.
-    #[cfg(feature = "dpll")]
-    let mut diag_buf = [0u8; 10 + 1460];
-    #[cfg(feature = "dpll")]
-    let mut diag_last_id: u32 = 0;
-    #[cfg(feature = "dpll")]
-    let mut diag_next_send: u64 = now0;
-
+    let mut payload_buf: String<64> = String::new();
     let mut line: String<160> = String::new();
 
     loop {
@@ -312,15 +275,6 @@ fn main() -> ! {
         let now_inst = Instant::from_micros(now as i64);
         iface.poll(now_inst, &mut mac, &mut sockets);
 
-        // TEMP (Phase 2b): drain the PIO decoder FIFO into the capture window
-        // (one-shot until full, then re-armed by the dump loop).
-        while let Some(w) = dec_rx.read() {
-            if dec_cap_len + 4 <= dec_cap.len() {
-                dec_cap[dec_cap_len..dec_cap_len + 4].copy_from_slice(&w.to_le_bytes());
-                dec_cap_len += 4;
-            }
-        }
-
         // R4.6: UDP echo on port 1234. R7: tiny HTTP server on port 80.
         serve_udp_echo(&mut sockets, udp_handle);
         serve_http(&mut sockets, tcp_handle, log_tick, nlps_sent, udp_sent);
@@ -332,47 +286,17 @@ fn main() -> ! {
             nlps_sent = nlps_sent.wrapping_add(1);
         }
 
-        // TEMP (Phase 2b): dump captured decoder output in 512-byte chunks
-        // once the capture window is full.
-        // Header: [dec_id:4][seq:4][cap_len:4], then 512 bytes of payload.
-        if dec_cap_len >= dec_cap.len() && now >= next_chunk {
-            let offset = (chunk_seq as usize) * 512;
-            if offset < dec_cap.len() {
-                chunk_buf[0..4].copy_from_slice(&dec_id.to_le_bytes());
-                chunk_buf[4..8].copy_from_slice(&chunk_seq.to_le_bytes());
-                chunk_buf[8..12].copy_from_slice(&(dec_cap.len() as u32).to_le_bytes());
-                chunk_buf[12..12 + 512].copy_from_slice(&dec_cap[offset..offset + 512]);
-                mac.send_udp_broadcast(&endpoint, &chunk_buf[..12 + 512]);
-                chunk_seq += 1;
-                udp_sent = udp_sent.wrapping_add(1);
-                next_chunk = now + 10_000;
-            } else {
-                dec_cap_len = 0;
-                dec_id = dec_id.wrapping_add(1);
-                chunk_seq = 0;
-            }
-        }
-
-        // Phase 3b diagnostic — when --features dpll, dump the most recent
-        // FCS-failed frame to host:1235 every 50 ms. Host analyzer scores
-        // per-byte error positions to distinguish PHY-limited (flat) from
-        // decoder-limited (ramp / cliff) residual.
-        #[cfg(feature = "dpll")]
-        if now >= diag_next_send {
-            diag_next_send = now + 50_000;
-            // Capture into the data region (offset 10 in the UDP payload).
-            let cap = &mut diag_buf[10..];
-            if let Some((id, len)) = eth_mac::snapshot_diag_failed(cap) {
-                if id != diag_last_id {
-                    diag_last_id = id;
-                    let magic: u32 = 0xDEFA_17ED;
-                    diag_buf[0..4].copy_from_slice(&magic.to_le_bytes());
-                    diag_buf[4..8].copy_from_slice(&id.to_le_bytes());
-                    diag_buf[8..10].copy_from_slice(&(len as u16).to_le_bytes());
-                    let payload_len = 10 + len.min(diag_buf.len() - 10);
-                    mac.send_udp_broadcast(&diag_endpoint, &diag_buf[..payload_len]);
-                }
-            }
+        // UDP broadcast every 200 ms — mirrors the C reference's payload.
+        if now >= next_udp {
+            next_udp = next_udp.wrapping_add(200_000);
+            payload_buf.clear();
+            let _ = write!(
+                payload_buf,
+                "Hello World!! Raspico 10BASE-T Rust !! n={}",
+                udp_sent
+            );
+            mac.send_udp_broadcast(&endpoint, payload_buf.as_bytes());
+            udp_sent = udp_sent.wrapping_add(1);
         }
 
         // Heartbeat + status print every 1 s.
