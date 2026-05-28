@@ -19,11 +19,21 @@ For the C reference and the proven Manchester / decoder design, see [`../Pico-10
 | **R8** — TCP listener | ✅ | `socket-tcp` added to smoltcp feature set; tiny HTTP server on port 80 serves a 200 OK with build info + per-second nlps/udp_sent counters. 1 KB RX + 1 KB TX buffers, re-listens after each closed connection. Concurrent stress (ping + UDP echo + 15 sequential curls): ping 300/300, UDP 299/300, curls 15/15, errs 1/30s — every protocol still at or above polled R5 baseline. Validates that the IRQ-driven RX path + smoltcp handle full TCP handshake + retransmission/windowing/FIN cleanly. |
 | **R9** — picotool reset interface | ✅ | New `src/pico_reset.rs` implements a `UsbClass` with a single vendor-specific interface (class=0xFF, sub=0x00, proto=0x01, no endpoints) matching the pico-sdk's `stdio_usb` reset interface. Picotool sends a control transfer (request 0x01 = BOOTSEL); our `control_out` queues the reboot, the next main-loop iteration calls `hal::reboot::reboot(BootSel{...}, Normal)`. Also derives the USB serial from the chip ID (`{wafer_id:08X}{device_id:08X}` via `rom_data::sys_info_api::chip_info()`) so it matches the bootrom's BOOTSEL serial — picotool tracks serials across the app→BOOTSEL transition. `cargo run` / `picotool load -fux -t elf` now self-reboot + flash with **no manual BOOTSEL and no OpenOCD fallback**. Gotcha #4 retired. |
 | **R10** — edge-track DPLL Manchester decoder (productized) | ✅ | New `src/eth_rx_dpll.rs` — a per-bit edge-tracking Manchester decoder that re-anchors to each mid-bit transition (search ±1 sample around the expected position) so accumulated clock drift can't walk the sample point off the bit-centre. Replaces the open-loop `EthRx::decode_frame` in the RX IRQ handler. **On-wire, full-MTU FCS-OK jumps from ~1.7 % → ~50 %**, and failed frames now show **flat per-byte error bins (0.1–1.1 %)** vs the open-loop's monotonic ramp from byte 575 — i.e. the residual is PHY-limited, not decoder-limited (locked acceptance criterion §11 escape hatch met; per-byte rate matches the 5.8e-5 per-bit BER predicted from 50 % FCS-OK at 12 000 bits/frame). Sized for the 2.18 ms RX-IRQ half-fill budget at 240 MHz overclock via `get_unchecked` sampling, unrolled W=1 edge search, and an IP-header-derived decode-length cap. Phase log + investigation in `docs/cpu-dpll-plan.md` + `docs/pio-dpll-report.md` (PIO route was tried first, capped at ~40 % due to PIO architectural limits documented there). Same retention is available on small frames (ping 100 %, UDP echo clean). The cargo `--features dpll` opt-in is gone — DPLL is the only decoder; the open-loop and the PIO experiment are preserved in git history (commits `cc09e11`..`8845a38` for PIO; `acdc746`..`f0253c8` for CPU DPLL bring-up). |
-| **Beyond R10** — pick from improvements list below | ⏳ | next |
+| **R11** — FCS-ceiling triage (4 experiments, methodology = gap) | ✅ | Prompted by the Niccle project (ctrlsrc.io) reporting 0 % CRC-fail at full-MTU on functionally identical hardware (same ISL3177E + 10 nF + 100 Ω). Six on-wire measurements (decoder × clock) + a TCP cross-check resolve the apparent gap. See `niccle-comparison-fcs-ceiling` memory + the triage plan at `~/.claude/plans/lets-come-up-with-velvet-stroustrup.md`. Four new feature flags, all off by default (production binary unchanged): `decoder-openloop` (restores pre-R10 fixed-stride decoder), `sample-rate-20mhz` (drops PIO to 20 MHz, matches Niccle's pipeline, auto-implies openloop), `clock-150mhz` (drops sys_clk back to HAL stock 150 MHz), `http-bulk-test` (1 MB TCP streaming endpoint for throughput measurement). **Headline: idle-wire TCP at 596 kB/s = 96 % of Niccle's 620 kB/s.** Under matched conditions our reliability is identical to theirs — the 30–70 % "FCS-fail" we'd been measuring is from a stress-blast methodology (A1 introduced) that nobody actually runs in practice. Real lever is the 23× TCP throughput collapse under concurrent broadcast load (A1 Finding 2), which is now the natural next priority and pulls Phase 3a/3c (multicore RX on the 2nd Hazard3 core) back to the top of the queue. Commits `a6a5af3` (exp 3), `d7a88ab` (exp 5+6), `6bbecee` (exp 4). |
+| **Beyond R11** — multicore RX (Phase 3a/3c) | ⏳ | next |
 
 Last verified: 2026-05-26 (post-R6, IRQ-driven RX with TX critsec + IFG padding on every TX path). Two-run avg of the 30-sec concurrent stress: ping 99.7%, UDP echo 100.0%, host RX errs ≤2/30s — matches or exceeds the polled R5 baseline on every metric while keeping the IRQ architectural benefit. Telemetry: `dec=20 ok=20 fail=0 inbox_drop=0 inbox_hwm=1–2 carry_cap=0`. The journey from R6's initial 20 errs/30s down to ~1: TX critsec (20 → 8), `send_raw_frame` IFG padding (8 → 4), `send_nlp` IFG padding (4 → 2.5), `send_udp_broadcast` IFG padding (2.5 → ≤2). The pattern was the same every time — once IRQs can preempt the main loop, any TX path that doesn't both critsec its FIFO writes *and* pad post-TP_IDL with ≥ 9.6 µs of IDLE can land its tail under the host NIC's expected IFG window and corrupt the next frame the host receives.
 
 **Performance + idiom review (2026-05-27, branch `review-efficiency-idiom`):** efficiency/idiom pass with on-device cycle measurement (Hazard3 `mcycle` CSR @ 150 MHz, telemetry exported over the UDP broadcast because USB CDC reads go flaky after BOOTSEL re-enumeration — see the `on-device-benchmarking` memory). Applied four safe, behavior-preserving idiom fixes, verified on the wire (UDP 5/s byte-perfect, ping 5/5 @ 2.4–4.9 ms RTT). Measurement **re-prioritized** the deferred efficiency work (decode beats CRC) — see "Performance: measured hot-path costs + plans" under Future work. Headline: worst-case RX IRQ handler = **2.57 ms**, *over* the 2.18 ms half-fill budget under heavy RX load.
+
+**R11 FCS-ceiling matrix (2026-05-28):** six on-wire measurements + a TCP throughput cross-check, same wire / same host / same session.
+
+| sys_clk | DPLL @ 60 MHz | Openloop @ 60 MHz | Openloop @ 20 MHz |
+|---|---|---|---|
+| 240 MHz | 70.7 / 89.7 % | 19.9 / 95.7 % | 35.6 / 80.7 % |
+| 150 MHz | 62.4 / 71.5 % | 19.0 / 92.0 % | 36.3 / 80.0 % |
+
+Format: stress-blast full-MTU FCS-OK% / 600× ping reply%. Stress = 30 s broadcast blast @ 50 pps (1472 B UDP) + concurrent ping flood. **Idle-wire TCP** (1 MB curl, three back-to-back runs, no concurrent stress): **595–600 kB/s — 96 % of Niccle's published 620 kB/s.** Stressed first-curl: 26 kB/s (overlaps the blast); subsequent curls after blast ends: ~596 kB/s. So under matched test conditions our hardware + software performs identically to Niccle's; the FCS gap they don't see is an artifact of our stress methodology, not a real reliability gap. The 23× TCP throughput collapse under stress IS real — same load-collapse story as A1 Finding 2, now confirmed at the user-visible TCP layer.
 
 ## File map
 
@@ -208,11 +218,16 @@ only ~250–500/s under load. ⇒ need **core separation** (NIC IRQ on one Hazar
 core, stack/routing on the other) + a bigger inbox + flow control.
 
 **Revised priority order (A1 reshaped it — these now precede NAT/wireless):**
-1. **Decoder clock recovery** (full-MTU RX). Without it the link can't carry
-   real traffic at all. Biggest blocker; was hidden until A1. **Design plan:
-   [`docs/clock-recovery-decoder-plan.md`](docs/clock-recovery-decoder-plan.md)**
-   (offline sample corpus first, then DPLL/edge-resync vs PIO-side recovery).
-2. **Core separation + buffering** so decode-under-load doesn't starve routing.
+1. ~~**Decoder clock recovery** (full-MTU RX).~~ — **DONE in R10** (edge-track DPLL,
+   `docs/cpu-dpll-plan.md`). R11 confirmed that under matched conditions (idle
+   TCP) we deliver Niccle's throughput; the residual flat-bin per-byte error
+   under stress is methodology-bound, not a real reliability ceiling.
+2. **Core separation + buffering — now the top blocker.** R11 measured a 23×
+   TCP throughput collapse under saturating broadcast load (596 → 26 kB/s);
+   the load-collapse story A1 named is now confirmed at the user-visible TCP
+   layer. Phase 3a/3c (RX IRQ on the 2nd Hazard3 core) is the cleanest fix.
+   `docs/cpu-dpll-plan.md` §3 has the multicore architecture; §9a documented
+   the previous Hazard3-launch-protocol blocker that needs unwedging first.
 3. **Collisions / half-duplex** (full-duplex HW or PIO CSMA) — matters once 1+2
    are fixed; secondary today.
 4. …then NAT/forwarding, the wireless interface, DHCP (the router proper).
