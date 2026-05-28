@@ -22,6 +22,10 @@ mod manchester;
 mod multicore_riscv;
 mod pico_reset;
 mod pio_util;
+// R13 — wireless router scaffolding (Pico 2 W / CYW43). Gated off by default;
+// `--features wireless` compile-checks the cyw43 + async-runtime integration.
+#[cfg(feature = "wireless")]
+mod wireless;
 
 use panic_halt as _;
 
@@ -121,6 +125,10 @@ extern "C" fn core1_entry() -> ! {
 }
 
 #[hal::entry]
+// Under `--features wireless` the early handoff to the async executor diverges,
+// making the 10BASE-T setup below unreachable — that's intentional (the
+// wireless build is an R13 experiment, not the production firmware).
+#[cfg_attr(feature = "wireless", allow(unreachable_code, unused_variables, unused_mut))]
 fn main() -> ! {
     let mut pac = hal::pac::Peripherals::take().unwrap();
 
@@ -159,6 +167,14 @@ fn main() -> ! {
     let mut led = pins.gpio25.into_push_pull_output();
 
     let timer = hal::Timer::new_timer0(pac.TIMER0, &mut pac.RESETS, &clocks);
+
+    // R13 wireless-experiment build: clocks + TIMER0 are up, so hand off to the
+    // async executor (cyw43 + the router will live there). Never returns — the
+    // 10BASE-T/USB setup below is skipped. Production (wireless off) is unchanged.
+    #[cfg(feature = "wireless")]
+    unsafe {
+        wireless::run_executor()
+    }
 
     // GP14 → ISL3177E DI, GP13 → ISL3177E RO. Reassign both to PIO0 function.
     let _tx_pin: hal::gpio::Pin<_, FunctionPio0, _> = pins.gpio14.into_function();

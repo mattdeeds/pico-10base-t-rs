@@ -245,3 +245,47 @@ build the router on top of it.
 - `SpiBusCyw43` / custom transport + the half-duplex SPI PIO:
   <https://github.com/embassy-rs/embassy/blob/main/cyw43-pio/src/lib.rs>,
   <https://github.com/raspberrypi/pico-sdk/blob/master/src/rp2_common/pico_cyw43_driver/cyw43_bus_pio_spi.c>
+
+## 10. R13 progress — board-independent scaffolding DONE (2026-05-28)
+
+Built on branch `r13-wireless-scaffold` (not merged). Gated behind a new
+`wireless` cargo feature, OFF by default — the production 10BASE-T build is
+byte-unchanged. **`cargo build --release --features wireless` compiles AND
+links for `riscv32imac`.**
+
+**De-risking results (the reason for the spike):**
+- **cyw43 0.7.0 + its ARM-named deps (`cortex-m` 0.7.7, `cortex-m-rt` 0.7.5)
+  compile for riscv32imac.** The fear that `cortex-m-rt` would `compile_error!`
+  on non-ARM was wrong — it target-gates to ~nothing. So Option A is viable.
+- **`embassy-executor` 0.10 `platform-riscv32` backend links on Hazard3** —
+  the #1 risk (async runtime on RISC-V, separate from the ARM-only
+  `embassy-rp`) is cleared at the link level.
+- Compatible version set pinned by cyw43 0.7.0: embassy-time 0.5.1 (with
+  `tick-hz-1_000_000` + `generic-queue-16`), embassy-time-driver 0.2.2,
+  embassy-time-queue-utils 0.3.2, embassy-sync 0.8.0, embassy-futures 0.1.2.
+  The executor feature is `platform-riscv32` (renamed from `arch-riscv32`).
+- embassy-executor 0.10's `#[task]` macro returns a `Result<SpawnToken,_>`
+  (arena slot) — spawn via `if let Ok(t) = task() { spawner.spawn(t) }`.
+
+**What's in `src/wireless.rs` (compiles + links, not yet run on hardware):**
+1. **embassy-time driver on TIMER0** — `now()` reads the µs counter (1 MHz tick
+   = no scaling); `schedule_wake()` uses ALARM0 + the `TIMER0_IRQ_0` handler +
+   the generic 16-slot timer queue. The RP2350 TIMER0 PAC accessors
+   (`timerawh/l`, `alarm0`, `inte.alarm_0`, `intr` write-1-to-clear) all
+   resolved correctly.
+2. **Async executor** — `run_executor()` enables the alarm IRQ, then runs the
+   `embassy-executor` thread executor with a heartbeat task that `await`s an
+   `embassy_time::Timer` (which link-exercises the whole time stack).
+3. **`SpiBusCyw43` transport skeleton** — `PioSpiCyw43` + the trait impl
+   (`cmd_write`/`cmd_read`) type-check against `cyw43::new`'s bounds. **Bodies
+   are stubs** — the real half-duplex gSPI PIO1 program is the on-board step.
+
+**Remaining for R13 (needs the Pico 2 W in hand):**
+- Port the gSPI PIO program to PIO1 + fill in `cmd_write`/`cmd_read` (FIFO/DMA).
+  Refs: pico-sdk `cyw43_bus_pio_spi.c`, embassy `cyw43-pio`.
+- Embed the CYW43 firmware + CLM blobs (`cyw43-firmware`).
+- Build `PioSpiCyw43` + the PWR (WL_ON) pin, call `cyw43::new(...)`, spawn
+  `Runner::run()`, `Control::init()` → toggle the onboard LED / beacon.
+- Verify on-wire: chip inits; a client sees the SSID. (R14 then adds AP +
+  DHCP server + the smoltcp LAN `Interface`.)
+- Relocate the user LED off GP25 (= wireless CS on Pico 2 W).
