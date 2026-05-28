@@ -344,3 +344,54 @@ solved separately, and the on-device integration is then "swap the decoder
 
 Revert state: `src/main.rs` is back to `HEAD` (`8845a38` — 240 MHz + bring-up
 scaffolding, no multicore). Device on-wire works normally.
+
+### 9b. Phase 3b results — algorithm validated, IRQ budget confirmed insufficient (2026-05-28)
+
+**First half — Rust port + offline validation: PASS** (committed `a6f6f1f`).
+`src/eth_rx_dpll.rs` is the Rust port of the Python `decode_edge_track` from
+`tools/clock-recovery/harness.py`. Validated against the corpus via the
+standalone host-side cargo bin at `tools/dpll-rust/` (Linux x86_64; uses a
+`#[path]` include + local `.cargo/config.toml` to override the parent's
+RISC-V target):
+
+- Python reference: FCS-OK **3/3**, all 8 bins **0.0 %**.
+- Rust port: FCS-OK **3/3**, all 8 bins **0.0 %** — bit-for-bit match.
+
+**Second half — on-core-0 stepping stone: confirms the IRQ-budget concern
+from §7 risk #1.** Added a `dpll` cargo feature; with `--features dpll` the
+`eth_mac::process_completed_half` IRQ handler swaps `EthRx::decode_frame`
+(open-loop) for `eth_rx_dpll::decode_frame_edge_track`. On-wire result:
+
+| Test | Open-loop (default) | DPLL (`--features dpll`) |
+|---|---|---|
+| Ping (small frames) | 100 % | 80 % (4/5) |
+| UDP echo 512 B | OK | 8/10 |
+| UDP echo 1472 B | n/a (works) | **0 / 100** |
+| Device `[Rx] dec/ok/fail` log | runs normally | **dec=0, ok=0, fail=0** — IRQ never produces decoded frames |
+
+The `dec=0` is the smoking gun: the IRQ handler isn't completing decodes
+within the 2.18 ms DMA half-fill budget, so the DMA double-buffer is
+overwritten before active runs can be processed. **No decode → no FCS → no
+inbox push → no smoltcp delivery → no echo replies.**
+
+Estimated cost: edge-track is ~3-9 ms per full-MTU frame in my unoptimized
+Rust port (∼12 000 bits × ∼60 cyc/bit at 240 MHz), vs the 2.18 ms budget. The
+plan's §7 risk #1 anticipated this exact case.
+
+**Two paths forward:**
+
+1. **Optimize `decode_frame_edge_track` on core 0** to fit the IRQ budget.
+   The open-loop went from ~250 µs to ~155 µs via the same playbook
+   (single-pass packing, `get_unchecked` after bounds proof, stride the
+   sample offset, hoist availability bounds out of the loop, decode-length
+   cap). Edge-track at ~2-3× the open-loop cost ≈ ~400–500 µs/frame would
+   comfortably fit. Substantial but bounded work — and it lets us measure
+   on-wire FCS-OK now without solving multicore.
+
+2. **Move to core 1 (Phase 3a/3c)** where the per-frame budget is the full
+   bit-clock interval (no IRQ-budget constraint). Cleaner architectural
+   answer but blocked on the Hazard3 multicore launch protocol (§9a).
+
+Either path needs the algorithm we already have. The Rust port is on disk
+and validated; whichever route we take, the decoder body doesn't change —
+only its tuning/optimization (option 1) or its host-core (option 2).

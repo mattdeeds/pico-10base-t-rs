@@ -13,6 +13,12 @@ description = "10BASE-T Ethernet TX+RX on Pico 2 (RP2350 Hazard3) using ISL3177E
 # heartbeat + [Rx] decode summary always print.
 diag = []
 
+# Phase 3b — use the edge-track DPLL decoder (src/eth_rx_dpll.rs) in the RX
+# IRQ handler instead of the open-loop sampler (eth_rx::decode_frame). Off
+# by default to preserve the open-loop baseline; enable with `--features dpll`
+# to A/B compare on-wire. (3c later moves the IRQ to core 1.)
+dpll = []
+
 [dependencies]
 critical-section = "1.2.0"
 embedded-hal = "1.0.0"

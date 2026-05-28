@@ -47,6 +47,7 @@ pub const STITCH_BUF_BYTES: usize = BUF_BYTES + MAX_CARRY_BYTES;
 /// 1600-bit extraction cap. The SFD normally appears within the first ~64 data
 /// bits (7-byte preamble + SFD); this only bounds the pathological no-SFD case
 /// so a noise run can't spin the search unboundedly.
+#[cfg_attr(feature = "dpll", allow(dead_code))]
 const SFD_SEARCH_BITS: usize = 1600;
 
 type RxFifo = Rx<(PIO0, SM1)>;
@@ -320,6 +321,7 @@ impl EthRx {
     ///    not truncate frames past ~199 bytes — but it *is* bounded by the
     ///    header-declared frame length (see inline) so an over-long active
     ///    run can't force a full-buffer decode.
+    #[cfg_attr(feature = "dpll", allow(dead_code))]
     pub fn decode_frame(
         bytes: &[u8],
         base: usize,

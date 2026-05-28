@@ -163,7 +163,15 @@ impl EthRxShared {
                     stats.frames_filtered = stats.frames_filtered.wrapping_add(1);
                     continue;
                 }
+                // Phase 3b: edge-track DPLL when `--features dpll`, open-loop otherwise.
+                #[cfg(not(feature = "dpll"))]
                 let Some(mut frame) = EthRx::decode_frame(bytes, off, len) else {
+                    continue;
+                };
+                #[cfg(feature = "dpll")]
+                let Some(mut frame) = crate::eth_rx_dpll::decode_frame_edge_track(
+                    &bytes[off..off + len],
+                ) else {
                     continue;
                 };
                 let flen = EthRx::derive_frame_len(&frame);
