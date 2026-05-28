@@ -17,6 +17,9 @@ a long frame; full-MTU RX is ~1.7% FCS-ok).
   count (the acceptance metric). Ships with `decode_current`, a faithful model
   of the on-device open-loop decoder.
 - `capture.py` — host side of corpus collection (needs the capture firmware).
+- `pio_dump.py` — host side of the **Phase 2b live PIO-decoder bring-up** (see
+  below). Validates the real PIO decoder's decoded-byte output off the wire, and
+  has an offline `--selftest` that needs no hardware.
 
 ## Baseline (current open-loop decoder)
 
@@ -51,6 +54,42 @@ production path (see `docs/clock-recovery-decoder-plan.md`).
    set `DECODER = decode_X`, run `python3 harness.py`, iterate to flat/N-of-N.
 2. Port the validated algorithm into `src/eth_rx.rs` (Phase 2) and re-run the
    on-device acceptance tests (Phase 3).
+
+## Phase 2b — live PIO decoder bring-up (`pio_dump.py`)
+
+`src/eth_rx_pio.rs` is the production decoder: a PIO program (PIO1 SM0) that
+re-syncs to every Manchester edge in hardware (the `decode_pio_model` algorithm,
+SM @ 150 MHz, `[8]`-cycle boundary-skip). The TEMP scaffolding in `main.rs`
+(Phase 2b) runs it **in parallel** with the working RX so the device stays
+functional, drains its decoded-byte FIFO into a 2048-byte window, and dumps that
+window over UDP broadcast `:1234` in 512-byte chunks
+(`dec_id|seq|cap_len | data[512]`).
+
+The decoded bytes ARE the decoded bitstream, LSB-first per byte (PIO `in`
+shift-right + autopush(32) + `to_le_bytes`) — the exact bit order
+`harness.sample_bit` uses — so `pio_dump.py` reassembles a window, finds the SFD,
+extracts the frame, checks FCS, and scores the same per-byte error bins.
+
+```
+# Offline first — proves the host pipeline (model -> pack -> reassemble -> FCS)
+# end-to-end without flashing. Expect FCS-ok N/N, flat bins, "self-test PASS".
+$ python3 pio_dump.py --selftest
+
+# On-wire (after flashing the Phase 2b firmware; SWD-flash the first time per
+# docs/pio-decoder-plan.md §8). Blasts known-pattern full-MTU frames at the
+# device and validates the dumped windows.
+$ python3 pio_dump.py
+#   dec_id 0: frame 1518B  sfd@bit 61  inv=False  FCS OK
+#   ... FCS-ok N/N, flat bins  => PIO decoder works, D=8 is in the window.
+```
+
+Reading the result: **flat bins + FCS-ok** = the PIO decoder produces correct
+full-MTU bytes and the `[8]` skip delay lands in the working window. A **drift
+ramp** (like the open-loop baseline) = the skip delay is slightly off (resample
+straying toward a bit boundary) — nudge the `[8]` in `eth_rx_pio.rs`. **No SFD /
+garbage** = polarity or gross timing wrong. The valid `[n]` range is ~6–12
+cycles (resample at `n+2`, between the boundary edge ~7.5 and the next mid-bit
+~15); `8` targets the centre.
 
 ## Re-collecting / expanding the corpus
 

@@ -22,7 +22,7 @@ For the C reference and the proven Manchester / decoder design, see [`../Pico-10
 
 Last verified: 2026-05-26 (post-R6, IRQ-driven RX with TX critsec + IFG padding on every TX path). Two-run avg of the 30-sec concurrent stress: ping 99.7%, UDP echo 100.0%, host RX errs ≤2/30s — matches or exceeds the polled R5 baseline on every metric while keeping the IRQ architectural benefit. Telemetry: `dec=20 ok=20 fail=0 inbox_drop=0 inbox_hwm=1–2 carry_cap=0`. The journey from R6's initial 20 errs/30s down to ~1: TX critsec (20 → 8), `send_raw_frame` IFG padding (8 → 4), `send_nlp` IFG padding (4 → 2.5), `send_udp_broadcast` IFG padding (2.5 → ≤2). The pattern was the same every time — once IRQs can preempt the main loop, any TX path that doesn't both critsec its FIFO writes *and* pad post-TP_IDL with ≥ 9.6 µs of IDLE can land its tail under the host NIC's expected IFG window and corrupt the next frame the host receives.
 
-**Performance + idiom review (2026-05-27, branch `review-efficiency-idiom`):** efficiency/idiom pass with on-device cycle measurement (Hazard3 `mcycle` CSR @ 150 MHz, telemetry exfiltrated over the UDP broadcast because USB CDC reads go flaky after BOOTSEL re-enumeration — see the `on-device-benchmarking` memory). Applied four safe, behavior-preserving idiom fixes, verified on the wire (UDP 5/s byte-perfect, ping 5/5 @ 2.4–4.9 ms RTT). Measurement **re-prioritized** the deferred efficiency work (decode beats CRC) — see "Performance: measured hot-path costs + plans" under Future work. Headline: worst-case RX IRQ handler = **2.57 ms**, *over* the 2.18 ms half-fill budget under heavy RX load.
+**Performance + idiom review (2026-05-27, branch `review-efficiency-idiom`):** efficiency/idiom pass with on-device cycle measurement (Hazard3 `mcycle` CSR @ 150 MHz, telemetry exported over the UDP broadcast because USB CDC reads go flaky after BOOTSEL re-enumeration — see the `on-device-benchmarking` memory). Applied four safe, behavior-preserving idiom fixes, verified on the wire (UDP 5/s byte-perfect, ping 5/5 @ 2.4–4.9 ms RTT). Measurement **re-prioritized** the deferred efficiency work (decode beats CRC) — see "Performance: measured hot-path costs + plans" under Future work. Headline: worst-case RX IRQ handler = **2.57 ms**, *over* the 2.18 ms half-fill budget under heavy RX load.
 
 ## File map
 
@@ -167,7 +167,7 @@ see the `project-vision-router` memory). **A1** = measure whether the link can
 actually carry real bidirectional/routed traffic. **Verdict: not yet — two
 blockers, one of them fundamental to the current decoder.**
 
-Method: device cumulative RX telemetry (decoded/ok/fail/drop/cap) exfil'd over
+Method: device cumulative RX telemetry (decoded/ok/fail/drop/cap) dumped over
 the UDP broadcast; host floods of (a) broadcast→dead-port = pure RX with no
 TX-back, and (b) UDP-echo = RX-decode + TX-encode per packet (router proxy).
 

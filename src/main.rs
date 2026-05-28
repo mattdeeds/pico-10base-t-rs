@@ -13,6 +13,7 @@
 mod crc;
 mod eth_mac;
 mod eth_rx;
+mod eth_rx_pio; // TEMP (Phase 2b): experimental PIO clock-recovery decoder
 mod eth_tx;
 mod manchester;
 mod pico_reset;
@@ -82,6 +83,13 @@ fn main() -> ! {
     let (mut pio0, sm0, sm1, _sm2, _sm3) = pac.PIO0.split(&mut pac.RESETS);
     let sys_clk_hz = clocks.system_clock.freq().to_Hz();
     let eth_tx = eth_tx::EthTx::new(&mut pio0, sm0, HW_PIN_TXD, sys_clk_hz);
+
+    // TEMP (Phase 2b): experimental PIO clock-recovery decoder on PIO1 SM0,
+    // reading the same RXD input (GPIO input is visible to all PIO blocks).
+    // Runs in parallel with the working PIO0 RX so the device stays functional
+    // while we observe whether the decoder produces correct decoded bytes.
+    let (mut pio1, pio1_sm0, _p1s1, _p1s2, _p1s3) = pac.PIO1.split(&mut pac.RESETS);
+    let (_dec, mut dec_rx) = eth_rx_pio::EthRxPio::new(&mut pio1, pio1_sm0, HW_PIN_RXD);
 
     // DMA channels 0 and 1 ferry samples from the PIO RX FIFO into two
     // 16 KB half-buffers. EthRx::poll_with hands the just-filled half to
@@ -217,13 +225,19 @@ fn main() -> ! {
     // NLPs at 16 ms intervals; UDP broadcast at 200 ms; heartbeat log at 1 s.
     let now0 = timer.get_counter().ticks();
     let mut next_nlp = now0;
-    let mut next_udp = now0 + 200_000;
     let mut next_log = now0 + 1_000_000;
     let mut nlps_sent: u32 = 0;
     let mut udp_sent: u32 = 0;
     let mut log_tick: u32 = 0;
     let mut led_state = false;
-    let mut payload_buf: String<64> = String::new();
+    // TEMP (Phase 2b): capture a window of the PIO decoder's decoded-byte
+    // output, dump it in chunks; host bit-scans for SFD + the known frame.
+    let mut dec_cap = [0u8; 2048];
+    let mut dec_cap_len: usize = 0;
+    let mut dec_id: u32 = 0;
+    let mut next_chunk = now0;
+    let mut chunk_seq: u32 = 0;
+    let mut chunk_buf = [0u8; 12 + 512];
 
     let mut line: String<160> = String::new();
 
@@ -246,6 +260,15 @@ fn main() -> ! {
         let now_inst = Instant::from_micros(now as i64);
         iface.poll(now_inst, &mut mac, &mut sockets);
 
+        // TEMP (Phase 2b): drain the PIO decoder FIFO into the capture window
+        // (one-shot until full, then re-armed by the dump loop).
+        while let Some(w) = dec_rx.read() {
+            if dec_cap_len + 4 <= dec_cap.len() {
+                dec_cap[dec_cap_len..dec_cap_len + 4].copy_from_slice(&w.to_le_bytes());
+                dec_cap_len += 4;
+            }
+        }
+
         // R4.6: UDP echo on port 1234. R7: tiny HTTP server on port 80.
         serve_udp_echo(&mut sockets, udp_handle);
         serve_http(&mut sockets, tcp_handle, log_tick, nlps_sent, udp_sent);
@@ -257,17 +280,25 @@ fn main() -> ! {
             nlps_sent = nlps_sent.wrapping_add(1);
         }
 
-        // UDP broadcast every 200 ms — mirrors the C reference's payload.
-        if now >= next_udp {
-            next_udp = next_udp.wrapping_add(200_000);
-            payload_buf.clear();
-            let _ = write!(
-                payload_buf,
-                "Hello World!! Raspico 10BASE-T Rust !! n={}",
-                udp_sent
-            );
-            mac.send_udp_broadcast(&endpoint, payload_buf.as_bytes());
-            udp_sent = udp_sent.wrapping_add(1);
+        // TEMP (Phase 2b): dump captured decoder output in 512-byte chunks
+        // once the capture window is full.
+        // Header: [dec_id:4][seq:4][cap_len:4], then 512 bytes of payload.
+        if dec_cap_len >= dec_cap.len() && now >= next_chunk {
+            let offset = (chunk_seq as usize) * 512;
+            if offset < dec_cap.len() {
+                chunk_buf[0..4].copy_from_slice(&dec_id.to_le_bytes());
+                chunk_buf[4..8].copy_from_slice(&chunk_seq.to_le_bytes());
+                chunk_buf[8..12].copy_from_slice(&(dec_cap.len() as u32).to_le_bytes());
+                chunk_buf[12..12 + 512].copy_from_slice(&dec_cap[offset..offset + 512]);
+                mac.send_udp_broadcast(&endpoint, &chunk_buf[..12 + 512]);
+                chunk_seq += 1;
+                udp_sent = udp_sent.wrapping_add(1);
+                next_chunk = now + 10_000;
+            } else {
+                dec_cap_len = 0;
+                dec_id = dec_id.wrapping_add(1);
+                chunk_seq = 0;
+            }
         }
 
         // Heartbeat + status print every 1 s.

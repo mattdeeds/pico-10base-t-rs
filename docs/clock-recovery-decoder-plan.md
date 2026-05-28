@@ -79,7 +79,7 @@ Clock recovery tracks **mid-bit** edges and must ignore/handle boundary edges.
 ## 4. Phase 0 — Offline bench & sample corpus  ✅ DONE (2026-05-27)
 
 Built and committed in `tools/clock-recovery/`: temporary capture firmware
-exfiltrated full-MTU run samples over UDP; collected a corpus of full-MTU
+dumped full-MTU run samples over UDP; collected a corpus of full-MTU
 captures (`corpus/*.bin`, payload `i&0xFF`); `harness.py` runs a candidate
 decoder and scores per-byte error-position bins + FCS-ok. The current open-loop
 decoder reproduces offline exactly: **0% for ~575 B, ramp to ~82–89%, FCS-ok
@@ -92,7 +92,7 @@ iterating offline makes it deterministic and fast — this is the key enabler.
 
 - **Capture mode (temp firmware):** when a full-MTU known-pattern test frame is
   detected, copy its raw active-run samples (~9 KB) into a static buffer and
-  exfiltrate over UDP in sequenced ≤512-B chunks (device→host TX of small frames
+  dump over UDP in sequenced ≤512-B chunks (device→host TX of small frames
   is reliable — verify during capture). Host reassembles and saves with the
   known transmitted payload.
 - **Corpus:** many full-MTU frames plus a few mid/small sizes, ideally across a
@@ -176,7 +176,7 @@ Hazard3 core to the NIC. The corpus + offline harness carry over.
   PHY noise is small, but a secondary baseline component could remain at full
   MTU; the corpus residual (after clock recovery) will reveal it. If present,
   that part is hardware (AC-coupling / transceiver), not firmware.
-- **TX large frames** — we rely on device→host TX of ~512-B exfil frames being
+- **TX large frames** — we rely on device→host TX of ~512-B dump frames being
   reliable (host PHY recovers our stable TX clock); confirm during capture.
 - **Corpus coverage** — must span enough ppm/jitter (reboots, warm-up) so the
   tuned loop generalizes rather than overfitting one capture.

@@ -3,7 +3,7 @@
 # device (requires the temporary capture firmware — see README).
 #
 # Sends full-MTU known-pattern frames (payload[i] = i & 0xFF) continuously so
-# the device keeps capturing, reassembles the device's exfil chunks per
+# the device keeps capturing, reassembles the device's dump chunks per
 # cap_id, and writes each complete capture's raw run samples to corpus/.
 #
 # Chunk wire format (UDP broadcast to host:1234):

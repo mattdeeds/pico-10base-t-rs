@@ -217,7 +217,7 @@ impl EthRx {
 
     /// Check + clear the active channel's DMA_IRQ_0 pending bit. Returns
     /// true if the just-completed half generated the interrupt we're in
-    /// (false → spurious or someone else's DMA channel sharing the line).
+    /// (false → stale or someone else's DMA channel sharing the line).
     /// Called from the DMA_IRQ_0 handler before `poll_with`.
     pub fn dma_irq_pending(&mut self) -> bool {
         self.xfer

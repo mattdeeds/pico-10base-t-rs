@@ -1,8 +1,48 @@
 # PIO clock-recovery decoder — design plan (Phase 2)
 
-Status: **Phase 2a DONE** (2026-05-27); 2b (PIO program) next. Production
-implementation of the clock recovery validated offline in Phase 1. Parent:
-`docs/clock-recovery-decoder-plan.md`.
+Status: **Phase 2b brought up on hardware — works to ~554 B, full-MTU slips**
+(2026-05-27). The decoder runs on PIO1 SM0 at zero CPU cost and **cancels the A1
+clock drift**, but a residual jitter-limited slip caps reliable frames below
+full MTU. Next: a more robust PIO edge classifier (see §2b results) before 2c
+integration. Parent: `docs/clock-recovery-decoder-plan.md`.
+
+### Phase 2b on-wire results (2026-05-27)
+
+Brought up `src/eth_rx_pio.rs` + the `main.rs` TEMP dump scaffolding on hardware
+(flashed via picotool — no SWD probe attached; the change is additive so the
+device stays live). Validated with `tools/clock-recovery/pio_dump.py` (blasts
+known-pattern frames `--size N`, reassembles the device's decoded-byte UDP dumps,
+SFD + FCS + per-byte bins) and `analyze.py` (post-mortems saved `dumps/win_*.bin`).
+
+| payload | frame | FCS-OK |
+|---|---|---|
+| 256 B | ~298 B | 8/8 |
+| 512 B | ~554 B | 8/8 |
+| 768 B | ~810 B | 6/8 |
+| 1472 B | ~1518 B | ~0 (slips at byte ~1000–1346) |
+
+**The decode is flat-perfect (no drift ramp) up to an abrupt loss-of-lock**, after
+which the decoder free-runs emitting a steady `0xaa`/`0x55` (it starts catching
+*every* Manchester edge — mid-bit and boundary). So clock recovery **works** — it
+cancels the gradual A1 drift (open-loop capped at ~575 B with a 50% ramp; this is
+flat to ≥554 B then a cliff). The residual is a *different* problem: jitter margin
+in the fixed-delay boundary skip.
+
+**`[8]` (SKIP_DELAY) is optimal — do not raise it.** Both the resample (`jmp pin`,
+~T+D+2) and the wait re-arm (~T+D+4) must fall between the boundary edge (~T+7.5)
+and the next mid-bit (~T+15); centring the pair ⇒ D+3 = 11.25 ⇒ D≈8. On wire,
+`[8]` slips at *varying* bytes (jitter-limited = well-centred); `[9]` was *worse*
+— a *deterministic* slip at byte 960 (wait re-arm at T+13 misses early-jittered
+mid-bit edges). So the fixed-delay scheme is at its margin limit.
+
+**To reach full-MTU ≥95% FCS-OK** (the §10 acceptance gate), the likely next step
+is a **more robust edge classifier** — e.g. time the inter-edge interval to
+distinguish a mid-bit edge (~1 bit since the last) from a boundary edge (~0.5 bit)
+rather than a blind fixed delay — not more `[D]` tuning. Sub-~600 B frames already
+decode clean today.
+
+Production implementation of the clock recovery validated offline in Phase 1.
+Parent: `docs/clock-recovery-decoder-plan.md`.
 
 **Phase 2a result:** the streaming PIO decoder *logic* — poll for a level
 change, emit the pre-edge level as the bit, skip `D` samples past the boundary

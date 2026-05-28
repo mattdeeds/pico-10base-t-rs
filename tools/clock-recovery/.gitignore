@@ -1,0 +1,3 @@
+# Scratch from live PIO-decoder bring-up (pio_dump.py --save / analyze.py)
+dumps/
+__pycache__/
