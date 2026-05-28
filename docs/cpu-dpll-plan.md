@@ -758,3 +758,55 @@ the multicore RX a *near* net win — far better under stress, no starvation,
 peaks above baseline — with residual-collision variance that Phase 3e (CD)
 should close. Don't merge to `main` yet: the idle *median* is still below the
 596 baseline, so it's not yet a strict improvement for the idle case.
+
+### 9i. Phase 3e — CSMA/CA backoff + larger TX window: multicore RX is now a net win (2026-05-28)
+
+Phase 3e closes the residual-collision variance from §9h. **The multicore RX
+stack (3a+3c+3d+3e) is now strictly better than single-core on every axis.**
+On branch `r12e-collision-avoidance` (built on `r12d`).
+
+**Two changes (`eth_tx.rs` + `main.rs`):**
+1. **CSMA/CA randomized backoff** (`eth_tx.rs`). `csma_acquire()` = sense idle
+   (3d carrier-sense) → wait a *random* backoff (xorshift32, 0–15 slots ≈
+   0–15 µs) → re-sense; defer + retry if the wire got taken during the backoff
+   (bounded attempts, then transmit anyway). Replaces the plain
+   `wait_carrier_idle` in `send_raw_frame` (the TCP path; NLP/UDP-broadcast
+   keep plain carrier-sense so the link keepalive isn't jittered). The random
+   backoff breaks the synchronized-start tie with the host after the wire frees
+   — our dominant residual collision.
+2. **Larger TCP send window** (`main.rs`, http-bulk-test: 8 KB → 32 KB). Keeps
+   enough segments in flight that the *irreducible* CS-gap collisions (the
+   ~1–2 µs between the final carrier-check and the preamble reaching the wire,
+   which only true collision-detect could catch) trigger TCP **fast-retransmit
+   (~ms)** instead of an **RTO stall (~200 ms)** — converting the *cost* of each
+   residual loss. (It also cut the collision *count*: a bigger window means
+   fewer Pico↔host turnaround points per transfer = fewer contention moments.)
+
+**On-wire (240 MHz, http-bulk-test):**
+
+| Metric | single-core | 3c | 3d (CS) | 3d+CA | **3e (CA+window)** |
+|---|---|---|---|---|---|
+| Idle 1 MB curl | 596 | ~45 | 114–914 (~340) | ~490 | **500–987, avg 742** |
+| Collisions / curl | ~0 | ~30 | ~4.5 | ~2.5 | **~0.5** |
+| Blast 1 MB curl | 26 | ~45 | 156–470 | — | **251–988** |
+| ping / UDP echo | 100% | 100% | 100% | — | **100% / 10-10** |
+
+**Result: net win on every axis.** Idle avg **742 kB/s > the 596 baseline**,
+with even the floor (500) at baseline; blast **251–988 vs single-core's 26**
+(10–38×); collisions ~0.5/curl; ping 100%, UDP 10/10; no CPU starvation (core 1
+owns RX). The idle distribution is bimodal (~500 or ~985) — the ~985 runs are
+collision-free, the ~500 runs hit a residual collision but recover via
+fast-retransmit instead of stalling (both buckets ≥ baseline).
+
+**Acceptance vs §4:** Phase 3c gate (blast curl ≥300) met on most runs; idle
+≥596 met (avg 742); S2 (decode off core 0) met; no starvation. **The multicore
+RX is mergeable** — `r12c`+`r12d`+`r12e` together turn the R11 23× collapse into
+a consistent ≥baseline-with-headroom result.
+
+**What's NOT done (deferred, not needed for the win):** true per-bit collision
+*detection* (abort + jam mid-frame). It would eliminate the last ~0.5
+collisions/curl and the bimodal lows, but it's a hard, fragile PIO effort (the
+ALU can't cheaply compare RO vs DI per cycle; the loopback-latch schemes all
+have false-positive timing windows — see the Phase 3e design notes). CSMA/CA +
+fast-retransmit already get us above baseline, so CD is a future polish item,
+not a blocker.

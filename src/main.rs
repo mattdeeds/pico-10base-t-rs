@@ -265,8 +265,13 @@ fn main() -> ! {
     let mut tcp_rx_storage = [0u8; 1024];
     #[cfg(not(feature = "http-bulk-test"))]
     let mut tcp_tx_storage = [0u8; 1024];
+    // Phase 3e: a larger send window keeps enough segments in flight that the
+    // residual CS-gap collisions (which carrier-sense + backoff can't fully
+    // eliminate without true collision-detect) trigger TCP fast-retransmit
+    // (~ms) instead of an RTO stall (~200 ms) — converting the *cost* of each
+    // residual loss, which is what drives the throughput variance.
     #[cfg(feature = "http-bulk-test")]
-    let mut tcp_tx_storage = [0u8; 8 * 1024];
+    let mut tcp_tx_storage = [0u8; 32 * 1024];
     let tcp_rx_buffer = tcp::SocketBuffer::new(&mut tcp_rx_storage[..]);
     let tcp_tx_buffer = tcp::SocketBuffer::new(&mut tcp_tx_storage[..]);
     let tcp_socket = tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer);

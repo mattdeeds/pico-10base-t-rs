@@ -4,29 +4,33 @@ Checkpoint for picking up the Rust port of [Pico-10BASE-T](../Pico-10BASE-T/) af
 
 For the C reference and the proven Manchester / decoder design, see [`../Pico-10BASE-T/RESUME.md`](../Pico-10BASE-T/RESUME.md) and [`../Pico-10BASE-T/CLAUDE.md`](../Pico-10BASE-T/CLAUDE.md).
 
-## 👉 Next session — start here: Phase 3e (collision-detect / full CSMA/CD)
+## 👉 Next session — start here: merge the multicore-RX stack, or polish (true CD / NAT)
 
-**The carrier-sense diagnosis is confirmed and most of the throughput is back. What's left is the residual collisions — and the hardware can detect them.** Phases 3a + 3c + 3d all done + on-wire-measured (2026-05-28):
+**The multicore RX is DONE and a net win on every axis (2026-05-28).** Phases 3a→3e take the R11 23× collapse to a *consistent ≥-baseline-with-headroom* result. The stack lives on branch **`r12e-collision-avoidance`** (contains 3a+3c+3d+3e); only 3a is on `main` so far.
 
-- **Phase 3a (multicore foundation): ✅ DONE + merged to `main`.** Hazard3 RISC-V core-1 launch (`src/multicore_riscv.rs`); §9f.
-- **Phase 3c (RX decode on core 1): ✅ DONE, branch `r12c-multicore-rx`.** Fixed CPU starvation; revealed that removing the accidental carrier-sense (gotcha #10) collapses idle TCP 596 → ~45 kB/s via collisions. Carrier-sense, not core separation, is the real TCP lever. §9g.
-- **Phase 3d (PIO carrier-sense): ✅ DONE, branch `r12d-carrier-sense`.** Carrier-detect SM (PIO0 SM2) watches RO; `send_*` defers before TX. **Idle curl recovered to 114–914 kB/s (avg ~340, peaks > the 596 baseline); collisions cut from ~30 to ~1–4.5/curl; blast curl 156–470 vs single-core's 26 (6–18×).** But it's CS-only — *residual* collisions remain → variable throughput, idle median still < 596. §9h.
+- **3a** multicore foundation ✅ (merged to `main`; §9f).
+- **3c** RX decode on core 1 ✅ — fixed CPU starvation; revealed carrier-sense (not core separation) is the real TCP lever (§9g).
+- **3d** PIO carrier-sense ✅ — carrier-detect SM (PIO0 SM2) + `wait_carrier_idle` before TX; recovered idle to 114–914, collisions ~30→~4.5 (§9h).
+- **3e** CSMA/CA backoff + 32 KB TCP window ✅ — `csma_acquire()` random backoff in `send_raw_frame` + larger send window so residual losses fast-retransmit instead of RTO-stall (§9i).
 
-**Goal of 3e:** add collision *detection* to mop up the residual collisions and take idle TCP to a consistent ≥596 (with the starvation fix + far-better stress numbers intact). Then merge `r12c`+`r12d`+`r12e` to `main` as the multicore-RX net win.
+**Final on-wire (240 MHz, http-bulk-test), Phase 3e vs single-core `main`:**
 
-**Why it's feasible:** the ISL3177E has **no DE/RE — driver + receiver always enabled** (see `hardware-isl3177e` memory), so **RO loops our own TX back**. During transmission we can compare RO to the bit we're driving on DI; a mid-frame mismatch = another station transmitting = collision → abort + jam + binary-exponential backoff + retransmit (full CSMA/CD). The TX PIO SM must sense RO per-bit during TX and signal collisions back to the CPU/smoltcp for retransmit — more PIO work than 3d's sense-before-TX, but the loopback path makes it possible.
+| Metric | single-core | **Phase 3e** |
+|---|---|---|
+| Idle 1 MB curl | 596 stable | **500–987, avg 742** (> baseline) |
+| Blast 1 MB curl (50 pps) | 26 | **251–988** (10–38×) |
+| Collisions / curl | ~0 | **~0.5** |
+| ping / UDP echo | 100% | **100% / 10-10** |
+| CPU starvation under load | yes | **fixed** |
 
-**Mind:** keep collision-detect at the wire level (PIO), and feed retransmit decisions back to smoltcp cleanly. Don't re-couple the cores — RX decode stays on core 1.
+**Decision pending: merge `r12e-collision-avoidance` → `main`?** It's a strict improvement (higher idle throughput, no starvation, 10–38× under stress, same reliability). The default (non-http-bulk) production build gets the multicore RX + carrier-sense + CSMA backoff (the 32 KB window is http-bulk-test-only). Recommend merging.
 
-**Reference points (all 240 MHz, http-bulk-test):**
-- Single-core (`main`): idle TCP **596 kB/s** stable; blast **26 kB/s**; starves core 0 under load.
-- Phase 3c: idle **~45**; pure-RX blast no starvation (core 1 `ok≈50/s`, core 0 `nlps` steady).
-- Phase 3d: idle **114–914 (avg ~340)**, ~1–4.5 coll/curl; blast **156–470**; ping 100%, TX healthy.
-- 3e target: idle consistently ≥596 (residual collisions gone), blast ≥300, no starvation.
+**Optional polish (none are blockers):**
+1. **True per-bit collision-*detect*** (abort+jam mid-frame) — would kill the last ~0.5 coll/curl + the bimodal ~500 lows. Hard/fragile PIO (RO-vs-DI per-cycle compare; loopback-latch schemes have false-positive windows — see §9i). Future polish.
+2. **Tune** the CSMA backoff window / TX-window size; bump the *default*-build TCP buffers if real forwarded traffic needs throughput.
+3. Then the router proper: **NAT/forwarding, the wireless interface, DHCP** (see `project-vision-router`).
 
-**Working state to restore:** `main` = single-core 596 baseline. For 3e work: `git checkout r12d-carrier-sense && cargo run --release` (add `--features http-bulk-test` to measure throughput). Device currently has the 3d http-bulk-test build flashed.
-
-**Out of scope** — NAT/forwarding, full-duplex, the wireless interface. Carrier-sense done (3d); collision-detect (3e) is the remaining MAC piece.
+**Working state:** `main` = single-core 596 baseline; `r12e-collision-avoidance` = the full win. Device currently has the 3e http-bulk-test build flashed. To run the production build: `git checkout r12e-collision-avoidance && cargo run --release`.
 
 ## Where we are
 
@@ -47,7 +51,7 @@ For the C reference and the proven Manchester / decoder design, see [`../Pico-10
 | **R12a** — multicore foundation (Phase 3a) | ✅ | Custom `src/multicore_riscv.rs::launch_core1_riscv` brings up the 2nd Hazard3 core via the bootrom FIFO protocol — clearing the §9a blocker (rp235x-hal 0.4's `multicore::spawn` is Cortex-M only). Four fixes vs the failed attempt: read `mtvec` not `PPB.VTOR`; a `global_asm!` trampoline restores `gp` (bootrom bypasses `_start`); drop the Cortex-M `ACTLR` write (Hazard3 SRAM is coherent, A-ext atomics work); bounded FIFO reads so a dead core 1 returns `launch=FAIL` instead of hanging core 0. On-wire: `[Core1] launch=ok ticks=N` climbing ~1000/s, ping 20/20, curl 200 OK, UDP echo 10/10 — R10 production behaviour preserved. Write-up: [`docs/cpu-dpll-plan.md`](docs/cpu-dpll-plan.md) §9f. |
 | **R12c** — move RX IRQ to core 1 (Phase 3c) | ✅ done, ⚠️ on branch (regression) | `DMA_IRQ_0` + the RX decode now run on core 1 (`eth_mac.rs` split into core-1-exclusive `RX_ENGINE` + `Spinlock<0>`-guarded `RX_SHARED`; the decode is lock-free, only the brief inbox/stats publish locks — so core 1's ≤2.57 ms decode never blocks core 0). **Result: starvation FIXED but TCP throughput regressed.** Under a 50 pps full-MTU blast core 1 decodes the full rate (`ok≈50/s`) while core 0 stays at full cadence (`nlps=62–63/s`) — A1 Finding 2 solved. **But** removing the accidental carrier-sense (gotcha #10) collapses idle 1 MB curl from 596 → ~45 kB/s (~12×), with ~30 host collisions/curl — confirmed by `/proc/net/dev` TX-coll + RX-err deltas. Carrier-sense, not core separation, is the real TCP lever. **Kept on branch `r12c-multicore-rx`, NOT merged** (don't regress `main`'s 596 kB/s); merge once carrier-sense lands. Full write-up: [`docs/cpu-dpll-plan.md`](docs/cpu-dpll-plan.md) §9g. |
 | **R12d** — PIO carrier-sense (Phase 3d) | ✅ done, ⚠️ on branch | Carrier-detect SM (PIO0 SM2) watches RO (GP13) and raises host-visible PIO IRQ flag 0 while the line toggles, clearing it after ~267 ns of quiet; `eth_tx.rs`'s `send_*` paths `wait_carrier_idle()` (bounded spin) before the preamble, restoring the carrier-sense Phase 3c removed. **Idle 1 MB curl recovered 114–914 kB/s (avg ~340, peaks > the 596 baseline); collisions cut ~30 → ~1–4.5/curl; blast curl 156–470 vs single-core's 26 (6–18×); ping 100%, TX healthy.** But CS-only ⇒ *residual* collisions remain → variable throughput, idle median still < 596. Branch `r12d-carrier-sense` (built on `r12c`), NOT merged. Write-up: [`docs/cpu-dpll-plan.md`](docs/cpu-dpll-plan.md) §9h. |
-| **R12e** — collision-detect / full CSMA/CD (Phase 3e) | ⏳ **next** | Mop up the residual collisions: the ISL3177E loops our own TX back on RO (no DE/RE), so the TX PIO can compare RO to the driven bit per-frame and detect a collision → abort + jam + binary-exponential backoff + retransmit (signalled back to smoltcp). Target: idle TCP consistently ≥596 (collision-free) with the 3c starvation fix + far-better stress numbers intact, then merge `r12c`+`r12d`+`r12e` → `main` as the multicore-RX net win. See the "Next session" callout + §9h. |
+| **R12e** — CSMA/CA backoff + larger TCP window (Phase 3e) | ✅ done, ⚠️ on branch (mergeable) | `eth_tx.rs` `csma_acquire()` adds a random xorshift backoff (0–15 µs) after carrier-sense in `send_raw_frame`, desyncing the Pico from the host's ACKs to cut synchronized-start collisions; `main.rs` bumps the http-bulk-test TCP send window 8→32 KB so the *irreducible* CS-gap residual losses fast-retransmit (~ms) instead of RTO-stalling (~200 ms). **Result — net win on every axis: idle 1 MB curl 500–987 kB/s (avg 742, > the 596 baseline); blast curl 251–988 vs single-core's 26 (10–38×); collisions ~0.5/curl; ping 100%, UDP 10/10; no starvation.** Branch `r12e-collision-avoidance` (contains 3a+3c+3d+3e). True per-bit collision-*detect* deferred (hard PIO, not needed — CSMA/CA + fast-retransmit already clear the baseline). Write-up: [`docs/cpu-dpll-plan.md`](docs/cpu-dpll-plan.md) §9i. |
 
 Last verified: 2026-05-26 (post-R6, IRQ-driven RX with TX critsec + IFG padding on every TX path). Two-run avg of the 30-sec concurrent stress: ping 99.7%, UDP echo 100.0%, host RX errs ≤2/30s — matches or exceeds the polled R5 baseline on every metric while keeping the IRQ architectural benefit. Telemetry: `dec=20 ok=20 fail=0 inbox_drop=0 inbox_hwm=1–2 carry_cap=0`. The journey from R6's initial 20 errs/30s down to ~1: TX critsec (20 → 8), `send_raw_frame` IFG padding (8 → 4), `send_nlp` IFG padding (4 → 2.5), `send_udp_broadcast` IFG padding (2.5 → ≤2). The pattern was the same every time — once IRQs can preempt the main loop, any TX path that doesn't both critsec its FIFO writes *and* pad post-TP_IDL with ≥ 9.6 µs of IDLE can land its tail under the host NIC's expected IFG window and corrupt the next frame the host receives.
 

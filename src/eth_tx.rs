@@ -46,6 +46,23 @@ const CARRIER_IRQ_FLAG: u8 = 0;
 /// iterations of the PIO IRQ register, not wall-clock — rough by design.
 const CARRIER_WAIT_SPINS: u32 = 200_000;
 
+/// Phase 3e — CSMA/CA randomized backoff (collision *avoidance*).
+///
+/// Carrier-sense (3d) stops us starting *during* a host frame, but two
+/// stations that both have traffic queued while the wire is busy will both
+/// jump in the instant it frees → collision. That's our dominant residual:
+/// the Pico finishes a data segment, the wire frees, and both the Pico (next
+/// segment) and the host (ACK) start together. A small *random* backoff before
+/// each TCP frame desyncs us from the host so one clearly wins the wire.
+///
+/// One backoff "slot" in CPU spin cycles (~1 µs @ 240 MHz / ~1.6 µs @ 150).
+const CSMA_SLOT_CYCLES: u32 = 240;
+/// Backoff window mask: random 0..=15 slots (~0–15 µs) per attempt.
+const CSMA_BACKOFF_MASK: u32 = 0x0F;
+/// Bounded CSMA attempts before transmitting anyway (so a persistently busy
+/// wire can't wedge TX — same safety stance as `CARRIER_WAIT_SPINS`).
+const CSMA_MAX_ATTEMPTS: u32 = 10;
+
 /// PIO TX state machine handle. We hold onto the running StateMachine so that
 /// Rust's type-state ownership doesn't drop it (which would be a footgun).
 pub struct EthTx {
@@ -55,6 +72,10 @@ pub struct EthTx {
     _cs_sm: StateMachine<(PIO0, SM2), Running>,
     tx: Tx<(PIO0, SM0)>,
     ip_identifier: u16,
+    /// xorshift32 state for the Phase-3e CSMA/CA random backoff. Seeded to a
+    /// fixed nonzero constant — the absolute sequence doesn't matter, only
+    /// that our backoffs vary independently of the host's frame timing.
+    lfsr: u32,
     /// Scratch buffer the UDP broadcast builder assembles into before the
     /// per-byte Manchester FIFO writes. Owned here (was a `static mut`) so
     /// there's no aliasing footgun and no Rust-2024 hard error.
@@ -163,7 +184,38 @@ impl EthTx {
             _cs_sm: cs_sm,
             tx,
             ip_identifier: 0,
+            lfsr: 0x2545_F491, // fixed nonzero xorshift seed
             raw_frame: [0; MAX_TX_FRAME],
+        }
+    }
+
+    /// Step the xorshift32 PRNG (Phase 3e backoff entropy).
+    #[inline]
+    fn next_rand(&mut self) -> u32 {
+        let mut x = self.lfsr;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.lfsr = x;
+        x
+    }
+
+    /// CSMA/CA acquire (Phase 3e): sense the wire idle, wait a *random* backoff,
+    /// then re-sense; if someone grabbed the wire during the backoff, defer and
+    /// retry. Bounded attempts so a persistently busy wire can't wedge TX (we
+    /// transmit anyway after `CSMA_MAX_ATTEMPTS`). The random backoff is what
+    /// breaks the synchronized-start tie with the host after the wire frees.
+    fn csma_acquire(&mut self) {
+        for _ in 0..CSMA_MAX_ATTEMPTS {
+            Self::wait_carrier_idle();
+            let slots = self.next_rand() & CSMA_BACKOFF_MASK;
+            if slots != 0 {
+                hal::arch::delay(slots * CSMA_SLOT_CYCLES);
+            }
+            if !Self::carrier_present() {
+                return; // wire still idle after our backoff → take it
+            }
+            // Someone started during our backoff — loop, re-sense, back off again.
         }
     }
 
@@ -248,13 +300,12 @@ impl EthTx {
         };
         let crc_bytes = crc.to_le_bytes();
 
-        // Carrier-sense before grabbing the wire (Phase 3d). Done outside the
-        // critical section so we defer with interrupts enabled; the small
-        // window between this and the preamble write is acceptable for
-        // carrier-sense-only (no collision detect). This is the main path the
-        // curl's TCP segments take, so it's where the gotcha-#10 collisions
-        // were happening once RX moved to core 1.
-        Self::wait_carrier_idle();
+        // CSMA/CA before grabbing the wire (Phase 3d carrier-sense + Phase 3e
+        // random backoff). Done outside the critical section so we defer with
+        // interrupts enabled. This is the path the curl's TCP segments take, so
+        // it's where the gotcha-#10 collisions concentrate; the random backoff
+        // desyncs us from the host's ACKs after the wire frees.
+        self.csma_acquire();
 
         critical_section::with(|_| {
             // 7 × preamble byte (0x55) + 1 × SFD byte (0xD5).
