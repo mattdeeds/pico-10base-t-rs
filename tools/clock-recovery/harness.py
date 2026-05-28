@@ -91,6 +91,106 @@ def decode_edge_track(buf, W=1):
         tr = nxt if nxt is not None else tr + P  # coast through a missed edge
     return F, _pack(bits)
 
+def decode_pio_interval_model(buf, thresh=5):
+    # Phase 2c: inter-edge-INTERVAL classifier (more robust than the fixed-delay
+    # decode_pio_model). Instead of blindly skipping ~0.67 bit past every edge,
+    # MEASURE the samples between edges. After a mid-bit edge, the next edge is
+    # either a boundary edge at ~T/2 (3 samples @60MHz) or the next mid-bit at
+    # ~T (6 samples). Classify with a threshold between them; emit a data bit
+    # (= the post-mid-bit level) at each mid-bit edge. Drift-immune (re-anchors
+    # to every edge) AND jitter-robust (discriminates two well-separated interval
+    # classes instead of threading a blind delay). T=6, T/2=3 @60MHz; thresh~4-5.
+    # NB: on-wire (2026-05-27) this did NOT beat the fixed-delay [8] decoder —
+    # slips persist inside runs of identical bits (uniform-T/2 square wave, where
+    # interval gives no discrimination). Next direction is a DPLL (loop-filtered
+    # phase tracking); see the pio-decoder-phase2b-onwire memory.
+    ns = len(buf) * 8
+
+    def edge_after(p, lvl):
+        # first sample index > p whose level differs from lvl (the next edge),
+        # or None past end.
+        q = p + 1
+        while q < ns and sample_bit(buf, q) == lvl:
+            q += 1
+        return q if q < ns else None
+
+    # State: at_mid = True means the last edge crossed was a mid-bit edge, so
+    # the NEXT edge is classified (mid-bit at ~T, or boundary at ~T/2). When the
+    # last edge was a boundary, the next edge is unconditionally the mid-bit.
+    # Emit the PRE-edge level (the level before crossing the mid-bit), matching
+    # decode_pio_model / the on-wire PIO. Treat the first edge as a mid-bit.
+    pos = 0
+    y = sample_bit(buf, 0)
+    bits = []
+    at_mid = True
+    while True:
+        q = edge_after(pos, y)
+        if q is None:
+            break
+        if at_mid:
+            if q - pos >= thresh:        # ~T -> this edge is the next mid-bit
+                bits.append(y)           # emit pre-edge level
+            else:                        # ~T/2 -> boundary edge; don't emit
+                at_mid = False
+        else:                            # boundary just crossed -> this is mid-bit
+            bits.append(y)
+            at_mid = True
+        y = sample_bit(buf, q)
+        pos = q
+    # SFD-find + byte extract, identical to decode_pio_model.
+    sfd = None
+    for k in range(1, len(bits)):
+        if bits[k] == 1 and bits[k - 1] == 1: sfd = k; break
+    if sfd is None: return None, None
+    start = sfd + 1
+    frame = bytearray(); i = 0
+    while start + i * 8 + 8 <= len(bits):
+        b = 0
+        for j in range(8): b |= bits[start + i * 8 + j] << j
+        frame.append(b); i += 1
+    return None, bytes(frame)
+
+def decode_dpll_model(buf, N=6, samp=4, win=1, invert=False):
+    # Phase 2d: windowed absolute-phase DPLL (the route after the interval
+    # classifier's run-internal slips). A free-running bit-clock PHASE (NCO,
+    # period N samples) samples the data at a fixed 2nd-half phase `samp`, and
+    # RESYNCS to Manchester mid-bit edges that fall within +/-win of the mid-bit
+    # phase (N//2) — edges outside the window (boundary edges, noise) are
+    # IGNORED. No per-edge alternation state ⇒ a single bad edge can't cascade
+    # (bounded phase bump or ignored); the boundary/mid-bit split is by PHASE,
+    # not interval (which failed inside identical-bit runs). 60MHz corpus: N=6,
+    # mid=3, samp~4-5, win=1. Maps to N=15 @150MHz PIO.
+    ns = len(buf) * 8
+    mid = N // 2
+    bits = []
+    prev = sample_bit(buf, 0)
+    phase = 0
+    sampled = False
+    for t in range(1, ns):
+        phase += 1
+        s = sample_bit(buf, t)
+        edge = (s != prev); prev = s
+        if edge and abs(phase - mid) <= win:   # a mid-bit edge -> resync phase
+            phase = mid
+        if phase == samp and not sampled:        # sample data (2nd-half level)
+            bits.append(s ^ (1 if invert else 0))
+            sampled = True
+        if phase >= N:                           # bit boundary -> wrap
+            phase -= N
+            sampled = False
+    # SFD-find + byte extract, identical to decode_pio_model.
+    sfd = None
+    for k in range(1, len(bits)):
+        if bits[k] == 1 and bits[k - 1] == 1: sfd = k; break
+    if sfd is None: return None, None
+    start = sfd + 1
+    frame = bytearray(); i = 0
+    while start + i * 8 + 8 <= len(bits):
+        b = 0
+        for j in range(8): b |= bits[start + i * 8 + j] << j
+        frame.append(b); i += 1
+    return None, bytes(frame)
+
 def decode_pio_model(buf, D=4):
     # Phase 2a: software model of the PIO decoder (streaming, no F/SFD
     # pre-align). Poll sample-by-sample for a level change (edge); emit the
@@ -157,3 +257,8 @@ if __name__ == "__main__":
     score("current (open-loop) — baseline", decode_current)
     score("edge-track (clock recovery)", decode_edge_track)
     score("pio-model (streaming, D=4)", decode_pio_model)
+    for t in (4, 5):
+        score("pio-interval (classifier, thresh={})".format(t),
+               lambda buf, t=t: decode_pio_interval_model(buf, thresh=t))
+    score("dpll (windowed phase, N=6 samp=4 win=1)",
+          lambda buf: decode_dpll_model(buf, N=6, samp=4, win=1))
