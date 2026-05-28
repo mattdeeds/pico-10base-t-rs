@@ -23,9 +23,17 @@ For the C reference and the proven Manchester / decoder design, see [`../Pico-10
 | ping / UDP echo | 100% | **100% / 10-10** |
 | CPU starvation under load | yes | **fixed** |
 
-The merged feature branches (`r12c`/`r12d`/`r12e`) can be deleted now that `main` has the squash-free fast-forward history. The `project-vision-router` goal is now unblocked on the throughput/starvation front — **next is the router proper: NAT/forwarding, the wireless interface, DHCP.**
+The merged feature branches (`r12c`/`r12d`/`r12e`) can be deleted now that `main` has the squash-free fast-forward history. The `project-vision-router` goal is now unblocked on the throughput/starvation front.
 
-**Optional MAC polish (none are blockers — already above baseline):**
+### ➡️ The router is now scoped — see [`docs/router-plan.md`](docs/router-plan.md)
+
+Full scoping + architecture + phased roadmap (R13→R19) is in `docs/router-plan.md`. Headlines:
+- **Architecture fork DECIDED = Option A: keep RISC-V, port the cyw43 transport.** The CYW43 driver ecosystem is embassy/ARM-centric and **embassy supports RP2350 only on the Cortex-M33 cores** — but `cyw43`'s core is transport-agnostic (`SpiBusCyw43` trait) and `embassy-executor` has an `arch-riscv32` backend, so we keep the whole Hazard3 stack and write our own `SpiBusCyw43` on free **PIO1** + an async-runtime shim. (Option B = switch to ARM+embassy, rewrite the NIC — rejected.)
+- **smoltcp stays** as the control-plane stack on *both* interfaces (DHCP client, DNS, mgmt HTTP, + cyw43's `NetDriver` glue); the **forwarding + NAPT data path is new custom code** beside it (smoltcp doesn't forward/NAT).
+- **First concrete step = R13 wireless de-risk spike** (custom PIO1 SPI + `embassy-executor`(riscv32) + time-driver shim + CYW43 firmware → chip inits/beacons). The async-runtime adoption is the #1 risk — prove it before building the router on it. **Needs the Pico 2 W board swapped in.**
+- **Hardware note:** on Pico 2 W the CYW43 takes GP23/24/25/29 and the LED moves to the CYW43 GPIO — our 10BT (GP13/14) coexists, but **GP25 (today's `led` pin) becomes the wireless CS**, so the LED code must relocate.
+
+**Optional MAC polish (orthogonal to the router; none are blockers — already above baseline):**
 1. **True per-bit collision-*detect*** (abort+jam mid-frame) — would kill the last ~0.5 coll/curl + the bimodal ~500 lows. Hard/fragile PIO (RO-vs-DI per-cycle compare; loopback-latch schemes have false-positive windows — see §9i). Future polish.
 2. **Tune** the CSMA backoff window / TX-window size; bump the *default*-build TCP buffers if real forwarded traffic needs throughput.
 
