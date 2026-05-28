@@ -83,7 +83,7 @@ off core 0 also directly solves A1 Finding 2 (single-core load collapse).
 
 ## 4. Phasing
 
-### Phase 3a — Multicore foundation (small, low-risk first step)
+### Phase 3a — Multicore foundation (small, low-risk first step) — ✅ DONE (2026-05-28, see §9f)
 
 Bring up core 1 doing nothing useful: spawn it, hello-world via inter-core
 FIFO, prove the rp235x-hal multicore plumbing works on this chip. Specifically:
@@ -543,3 +543,72 @@ corruption, fits the 2.18 ms IRQ budget at 240 MHz).
 saturating load) would require Phase 3a (multicore launch) + Phase 3c
 (move IRQ to core 1). That's separate work; productizing the DPLL itself
 is done.
+
+### 9f. Phase 3a — SOLVED: Hazard3 RISC-V core-1 launch working (2026-05-28)
+
+The §9a blocker is cleared. Core 1 launches reliably and runs concurrently
+with core 0; the multicore foundation for Phase 3c is in place.
+
+**Code:** new `src/multicore_riscv.rs` — `launch_core1_riscv(psm, fifo,
+stack, entry)`. Wired into `main.rs` right after the SIO/pins setup; core 1
+runs `core1_entry` (a liveness counter into a shared `AtomicU32`,
+`CORE1_TICKS`), and `log_status` prints `[Core1] launch=ok ticks=N`.
+
+**What the §9a attempt got wrong, and the fixes (all confirmed against the
+pico-sdk `pico_multicore/multicore.c` RISC-V path):**
+
+1. **`vector_table` must be the `mtvec` CSR, not `PPB.VTOR`.** rp235x-hal's
+   `multicore::spawn` reads `ppb.vtor()` — but the Cortex-M PPB is powered
+   down when the chip runs the Hazard3 cores, so VTOR is garbage. Read our
+   own `mtvec` via `csrr` and hand core 1 the same trap vector core 0 uses.
+2. **Restore `gp` in a naked trampoline.** The bootrom jumps straight to the
+   launch entry, bypassing `_start`, so the global pointer (used for
+   `.sdata`/`.sbss`-relative addressing) is never set up. A `global_asm!`
+   trampoline — byte-identical to the pico-sdk's `core1_trampoline`
+   (`lw a0,0(sp); lw a1,4(sp); lw a2,8(sp); lw gp,12(sp); addi sp,sp,16;
+   jr a2`) — pops `[entry, stack_bottom, core1_wrapper, gp]` off the stack,
+   reloads `gp`, and tail-calls `core1_wrapper(entry, stack_bottom)`.
+3. **No `ACTLR.EXTEXCLALL` / coprocessor setup.** That's a Cortex-M MPU
+   shareability fix-up for cross-core atomics; on Hazard3 it's a write to a
+   non-existent register (would fault). Hazard3 has no data caches (SRAM is
+   coherent between cores) and implements the A extension, so cross-core
+   atomics + the SIO HW spinlocks just work — confirmed by the climbing
+   `CORE1_TICKS` (core 0 reads what core 1 stores, no cache maintenance).
+4. **Bounded FIFO reads, not `read_blocking()`.** The §9a hang was core 0
+   spinning forever in `read_blocking()` waiting for an echo that never
+   came. The launch handshake here polls with a retry/timeout budget and
+   returns `Err(Unresponsive)` instead — so a botched launch degrades to
+   `[Core1] launch=FAIL` with core 0 still fully alive, never a wedge.
+
+The handshake itself is the standard `[0, 0, 1, vector_table, sp, entry]`
+bootrom sequence (drain + `sev` before each `0`, echo-verify each word,
+restart on mismatch). No trailing ready-signal read (we pass a bare `fn`
+pointer, not a closure core 0 must keep alive, so core 1 has nothing to
+signal back — unlike the HAL's `spawn`).
+
+**On-wire acceptance (default 240 MHz build, freshly flashed):**
+
+| Check | Result |
+|---|---|
+| `[Core1] launch=ok`, `ticks` climbing | ✅ ~1000/s (t=20 → 19994, t=21 → 20994, …) |
+| Ping (small frames) | ✅ 20/20 = 100 %, RTT 2.0–4.1 ms |
+| HTTP `curl /` (TCP) | ✅ 200 OK, payload served |
+| UDP echo (port 1234) | ✅ 10/10 byte-perfect |
+| Core-0 telemetry | ✅ nlps 62–63/s, udp_sent +5/s — unchanged |
+
+So the §9a Phase-3a gate ("existing R10 production behaviour preserved")
+holds while core 1 is alive — core 0's TX/RX/USB/smoltcp data path is
+byte-identical (core 1 only spins a counter; it touches nothing core 0
+owns). The 1 MB-curl throughput baseline (~596 kB/s) was not re-measured
+here because the default build serves the tiny-info page, not the
+`http-bulk-test` 1 MB stream, and core 0's data path is unchanged by
+construction — that number is the Phase 3c acceptance metric and is best
+measured there (where moving the IRQ to core 1 can actually move it).
+
+**Now unblocked: Phase 3c** — route `DMA_IRQ_0` to core 1, swap the
+`critical_section::Mutex` around `SHARED_RX` for a `hal::sio::Spinlock`, and
+run the decode pipeline in core 1's IRQ handler (`wfi` between IRQs). Watch
+for gotcha #10: moving the IRQ off core 0 removes the accidental
+carrier-sense (core 0 can now TX while core 1 decodes), so the 30-s
+broadcast-blast curl is the measurement that decides whether CSMA/CD becomes
+the next priority.

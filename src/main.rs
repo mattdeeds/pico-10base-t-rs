@@ -19,12 +19,14 @@ mod eth_rx;
 mod eth_rx_dpll;
 mod eth_tx;
 mod manchester;
+mod multicore_riscv;
 mod pico_reset;
 mod pio_util;
 
 use panic_halt as _;
 
 use core::fmt::Write;
+use core::sync::atomic::{AtomicU32, Ordering};
 use embedded_hal::digital::OutputPin;
 use heapless::String;
 use rp235x_hal as hal;
@@ -79,6 +81,34 @@ const PLL_SYS_SELECTED: PLLConfig = PLL_SYS_240MHZ;
 #[cfg(feature = "clock-150mhz")]
 const PLL_SYS_SELECTED: PLLConfig = PLL_SYS_150MHZ;
 
+/// Phase 3a — core-1 liveness counter. Core 1 stores a monotonically
+/// increasing value here; core 0 reads it once per second to prove the second
+/// Hazard3 core launched and that cross-core shared SRAM is coherent (RP2350
+/// has no data caches, so no cache maintenance is needed). Plain atomic
+/// store/load only (compiles to `sw`/`lw`) — no lr/sc reservation across cores.
+static CORE1_TICKS: AtomicU32 = AtomicU32::new(0);
+
+/// Core 1's stack (4 KB). `#[repr(align(16))]` keeps the launch trampoline's
+/// `sp` RV32-ABI aligned. Owned exclusively by core 1 once launched.
+#[repr(align(16))]
+struct Core1Stack([usize; 1024]);
+static mut CORE1_STACK: Core1Stack = Core1Stack([0; 1024]);
+
+/// Phase 3a core-1 entry point: do nothing useful yet — just bump the shared
+/// liveness counter at a steady cadence so core 0's 1 Hz log shows it climbing.
+/// Phase 3c replaces this body with the `DMA_IRQ_0` RX decode loop (`wfi`
+/// between interrupts).
+extern "C" fn core1_entry() -> ! {
+    let mut n: u32 = 0;
+    loop {
+        n = n.wrapping_add(1);
+        CORE1_TICKS.store(n, Ordering::Relaxed);
+        // ~1 ms/tick at 240 MHz → core 0 sees ticks climb by ~1000/s. The
+        // exact value isn't load-bearing; it just has to keep moving.
+        hal::arch::delay(240_000);
+    }
+}
+
 #[hal::entry]
 fn main() -> ! {
     let mut pac = hal::pac::Peripherals::take().unwrap();
@@ -108,7 +138,7 @@ fn main() -> ! {
     .unwrap();
     clocks.init_default(&xosc, &pll_sys, &pll_usb).unwrap();
 
-    let sio = hal::Sio::new(pac.SIO);
+    let mut sio = hal::Sio::new(pac.SIO);
     let pins = hal::gpio::Pins::new(
         pac.IO_BANK0,
         pac.PADS_BANK0,
@@ -116,6 +146,18 @@ fn main() -> ! {
         &mut pac.RESETS,
     );
     let mut led = pins.gpio25.into_push_pull_output();
+
+    // Phase 3a — bring up the 2nd Hazard3 core. It runs `core1_entry` (a
+    // liveness counter for now); core 0 keeps owning TX/USB/smoltcp/RX exactly
+    // as before. Custom RISC-V launch because `rp235x-hal`'s `multicore::spawn`
+    // is Cortex-M only — see `src/multicore_riscv.rs` / `cpu-dpll-plan.md` §9a.
+    // The launch is bounded, so a non-responsive core 1 returns an error here
+    // rather than hanging core 0; we surface the outcome in the 1 Hz log.
+    let core1_stack = unsafe { &mut (*core::ptr::addr_of_mut!(CORE1_STACK)).0 };
+    let core1_launch_ok = unsafe {
+        multicore_riscv::launch_core1_riscv(&mut pac.PSM, &mut sio.fifo, core1_stack, core1_entry)
+            .is_ok()
+    };
 
     let timer = hal::Timer::new_timer0(pac.TIMER0, &mut pac.RESETS, &clocks);
 
@@ -339,7 +381,9 @@ fn main() -> ! {
             } else {
                 led.set_low().unwrap();
             }
-            log_status(&mut serial, &mut line, &mut mac, log_tick, nlps_sent, udp_sent);
+            log_status(
+                &mut serial, &mut line, &mut mac, log_tick, nlps_sent, udp_sent, core1_launch_ok,
+            );
             nlps_sent = 0; // [R2b] reports nlps as a per-second rate
         }
     }
@@ -487,9 +531,21 @@ fn log_status<B: UsbBus>(
     log_tick: u32,
     nlps_sent: u32,
     udp_sent: u32,
+    core1_launch_ok: bool,
 ) {
     line.clear();
     let _ = writeln!(line, "[R2b] t={} nlps={} udp_sent={}", log_tick, nlps_sent, udp_sent);
+    let _ = serial.write(line.as_bytes());
+
+    // Phase 3a — core-1 liveness. `launch=ok` + a climbing `ticks` proves the
+    // 2nd Hazard3 core came up and shares SRAM coherently with core 0.
+    line.clear();
+    let _ = writeln!(
+        line,
+        "[Core1] launch={} ticks={}",
+        if core1_launch_ok { "ok" } else { "FAIL" },
+        CORE1_TICKS.load(Ordering::Relaxed),
+    );
     let _ = serial.write(line.as_bytes());
 
     // Snapshot the IRQ-managed RX stats (also resets the window-scoped fields).
