@@ -206,6 +206,17 @@ fn main() -> ! {
         src_port: 1234,
         dst_port: 1234,
     };
+    // Phase 3b diagnostic dump endpoint — failed RX frames go to host:1235
+    // so the analyzer can listen on a separate port from the PIO chunk dump.
+    #[cfg(feature = "dpll")]
+    let diag_endpoint = eth_tx::UdpEndpoint {
+        src_mac: our_mac_bytes,
+        dst_mac: [0xFF; 6],
+        src_ip: [192, 168, 37, 24],
+        dst_ip: [192, 168, 37, 19],
+        src_port: 1235,
+        dst_port: 1235,
+    };
 
     // USB CDC: appears on the host as /dev/ttyACM0.
     let usb_bus = UsbBusAllocator::new(hal::usb::UsbBus::new(
@@ -268,6 +279,18 @@ fn main() -> ! {
     let mut chunk_seq: u32 = 0;
     let mut chunk_buf = [0u8; 12 + 512];
 
+    // Phase 3b diagnostic — dump the most recent FCS-failed frame to UDP
+    // port 1235 every 50 ms so the host analyzer can compute per-byte error
+    // bins (vs known counter payload). Header: [magic_u32 | frame_id_u32 |
+    // orig_len_u16] = 10 bytes, then up to 1460 bytes of frame data. Only
+    // active under --features dpll.
+    #[cfg(feature = "dpll")]
+    let mut diag_buf = [0u8; 10 + 1460];
+    #[cfg(feature = "dpll")]
+    let mut diag_last_id: u32 = 0;
+    #[cfg(feature = "dpll")]
+    let mut diag_next_send: u64 = now0;
+
     let mut line: String<160> = String::new();
 
     loop {
@@ -327,6 +350,28 @@ fn main() -> ! {
                 dec_cap_len = 0;
                 dec_id = dec_id.wrapping_add(1);
                 chunk_seq = 0;
+            }
+        }
+
+        // Phase 3b diagnostic — when --features dpll, dump the most recent
+        // FCS-failed frame to host:1235 every 50 ms. Host analyzer scores
+        // per-byte error positions to distinguish PHY-limited (flat) from
+        // decoder-limited (ramp / cliff) residual.
+        #[cfg(feature = "dpll")]
+        if now >= diag_next_send {
+            diag_next_send = now + 50_000;
+            // Capture into the data region (offset 10 in the UDP payload).
+            let cap = &mut diag_buf[10..];
+            if let Some((id, len)) = eth_mac::snapshot_diag_failed(cap) {
+                if id != diag_last_id {
+                    diag_last_id = id;
+                    let magic: u32 = 0xDEFA_17ED;
+                    diag_buf[0..4].copy_from_slice(&magic.to_le_bytes());
+                    diag_buf[4..8].copy_from_slice(&id.to_le_bytes());
+                    diag_buf[8..10].copy_from_slice(&(len as u16).to_le_bytes());
+                    let payload_len = 10 + len.min(diag_buf.len() - 10);
+                    mac.send_udp_broadcast(&diag_endpoint, &diag_buf[..payload_len]);
+                }
             }
         }
 

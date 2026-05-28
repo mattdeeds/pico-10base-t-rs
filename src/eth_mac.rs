@@ -47,6 +47,15 @@ pub struct EthRxShared {
     /// addressed to us before paying for the full decode + CRC + push.
     our_mac: [u8; 6],
     pub stats: EthRxStats,
+
+    /// Phase 3b diagnostic — most recent FCS-failed frame, for off-device
+    /// per-byte error analysis. Updated in the IRQ; copy-out via
+    /// `snapshot_diag_failed`. Always present (small RAM cost vs the
+    /// existing 4-slot inbox); only meaningfully consumed under
+    /// `--features dpll`.
+    diag_fail_data: [u8; MAX_FRAME_BYTES],
+    diag_fail_len: usize,
+    diag_fail_id: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -109,6 +118,9 @@ pub fn install_rx(rx: EthRx, our_mac: [u8; 6]) -> bool {
             inbox: Deque::new(),
             our_mac,
             stats: EthRxStats::default(),
+            diag_fail_data: [0; MAX_FRAME_BYTES],
+            diag_fail_len: 0,
+            diag_fail_id: 0,
         });
         true
     })
@@ -122,6 +134,24 @@ pub fn install_rx(rx: EthRx, our_mac: [u8; 6]) -> bool {
 #[inline]
 fn mac_accept(dst: &[u8; 6], our: &[u8; 6]) -> bool {
     dst == our || (dst[0] & 0x01) != 0
+}
+
+/// Phase 3b diagnostic — copy the most recent FCS-failed frame into `out`.
+/// Returns `Some((frame_id, len))` if there's a failed frame to dump
+/// (frame_id is a monotonically increasing counter — callers track the
+/// last-dumped id to avoid duplicate dumps). `None` if no failure has
+/// occurred yet, or if the shared RX isn't installed.
+pub fn snapshot_diag_failed(out: &mut [u8]) -> Option<(u32, usize)> {
+    critical_section::with(|cs| {
+        let slot = SHARED_RX.borrow_ref(cs);
+        let shared = slot.as_ref()?;
+        if shared.diag_fail_len == 0 {
+            return None;
+        }
+        let n = shared.diag_fail_len.min(out.len());
+        out[..n].copy_from_slice(&shared.diag_fail_data[..n]);
+        Some((shared.diag_fail_id, n))
+    })
 }
 
 /// Snapshot + reset the IRQ-managed RX stats. Called by the main loop
@@ -149,6 +179,9 @@ impl EthRxShared {
         let inbox = &mut self.inbox;
         let stats = &mut self.stats;
         let our_mac = self.our_mac;
+        let diag_fail_data = &mut self.diag_fail_data;
+        let diag_fail_len = &mut self.diag_fail_len;
+        let diag_fail_id = &mut self.diag_fail_id;
         self.rx.poll_with(|bytes| {
             let mut cursor = 0;
             while let Some((off, len)) = EthRx::find_active_run_from(bytes, cursor, 100) {
@@ -191,6 +224,14 @@ impl EthRxShared {
                 stats.last_frame_was_ok = ok;
 
                 if !ok {
+                    // Phase 3b diagnostic: capture full failed-frame bytes
+                    // (up to MAX_FRAME_BYTES) for off-device per-byte error
+                    // analysis. Main loop polls this via snapshot_diag_failed
+                    // and dumps over UDP when --features dpll is on.
+                    let n_diag = frame.len().min(diag_fail_data.len());
+                    diag_fail_data[..n_diag].copy_from_slice(&frame[..n_diag]);
+                    *diag_fail_len = n_diag;
+                    *diag_fail_id = (*diag_fail_id).wrapping_add(1);
                     continue;
                 }
                 frame.truncate(n);
