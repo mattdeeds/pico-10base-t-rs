@@ -378,6 +378,50 @@ Estimated cost: edge-track is ~3-9 ms per full-MTU frame in my unoptimized
 Rust port (∼12 000 bits × ∼60 cyc/bit at 240 MHz), vs the 2.18 ms budget. The
 plan's §7 risk #1 anticipated this exact case.
 
+### 9c. Phase 3b optimization — fits the budget, ~50 % full-MTU FCS-OK on-wire (2026-05-28)
+
+Optimized `decode_frame_edge_track` per the open-loop playbook:
+- `sample_bit_unchecked` via `get_unchecked` after proving the upper-bound is
+  in-range (drops the bounds-check load per sample).
+- `find_edge_w1` inlined + unrolled (4-sample slide-window). 4 unchecked reads,
+  3 compares with d=0 wins / lower-i tie-break (matches Python `find_edge`).
+- IP-header-derived decode-length cap so an over-long active run can't force a
+  full-`MAX_FRAME_BYTES` decode.
+
+**Corpus validation: still 3/3 FCS-OK, flat 0 % bins** (no regression from the
+naive port).
+
+**On-wire result (`--features dpll`, 240 MHz, full-MTU UDP blast at 20 fps):**
+
+| Window | Per-second `[Rx] dec / ok / fail` |
+|---|---|
+| W=1 | ~27–31 dec, **~12–14 ok** (≈ 45–50 %), ~13–17 fail |
+| W=2 | ~25–31 dec, **~12–14 ok**, ~12–18 fail |
+| W=3 | ~26–32 dec, **~12–15 ok**, ~13–18 fail |
+
+**Two clear results:**
+
+1. **The cycle budget is solved.** `dec ≈ 27/s` means the IRQ is keeping up
+   with the blast (no DMA buffer corruption, no `dec=0` like before
+   optimization). The decoder fits within the 2.18 ms half-fill budget.
+2. **~50 % full-MTU is a 25–30× improvement over open-loop's ~1.7 %** at
+   the same load — significant, real progress. But P1 (≥ 95 %) is not met.
+
+**Widening the edge-search window (W=1 → W=2 → W=3) doesn't help** — same
+~50 % rate. The failures aren't jitter within ±3 samples; they're something
+else. Hypotheses:
+- F or SFD acquisition lands at the wrong sample for some frames (open-loop
+  pre-DPLL stage, where the algorithm is the same as the open-loop decoder's
+  ramp-from-575 B failure starting point).
+- Random PHY noise / true bit errors in the analog signal (the "PHY-limited"
+  escape hatch the goal condition allows).
+
+To distinguish PHY-limited from decoder-limited, we need the **per-byte
+error-position bins on failed frames**, not just the FCS pass/fail count.
+The current device code only counts; would need a one-off bring-up
+scaffolding to dump failed-frame contents over UDP (like the PIO `pio_dump.py`
+scaffolding, but for the legacy RX path).
+
 **Two paths forward:**
 
 1. **Optimize `decode_frame_edge_track` on core 0** to fit the IRQ budget.
