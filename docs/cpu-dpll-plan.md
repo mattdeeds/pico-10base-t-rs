@@ -612,3 +612,88 @@ for gotcha #10: moving the IRQ off core 0 removes the accidental
 carrier-sense (core 0 can now TX while core 1 decodes), so the 30-s
 broadcast-blast curl is the measurement that decides whether CSMA/CD becomes
 the next priority.
+
+### 9g. Phase 3c — DONE, but reveals carrier-sense as the real TCP blocker (2026-05-28)
+
+Phase 3c is implemented and **functionally correct**, but the on-wire
+measurement is decisive: **moving RX to core 1 fixes CPU starvation yet
+*regresses* TCP throughput**, because it destroys the accidental
+carrier-sense the single-core design got for free (gotcha #10). The
+measurement the plan set up has answered: **CSMA/CD is now required.**
+
+**Implementation** (branch `r12c-multicore-rx`, not merged to `main` — it's a
+throughput regression as-is):
+- `eth_mac.rs`: split the old single `EthRxShared`-behind-`critical_section`
+  into **`RX_ENGINE`** (core-1-exclusive `EthRx` + MAC, no lock — only core 1's
+  handler touches it after `install_rx`) and **`RX_SHARED`** (inbox + stats,
+  guarded by `Spinlock<0>`). The decode runs lock-free; `Spinlock<0>` is held
+  only to push each frame + merge stat deltas. **This is the crucial part** —
+  the HAL's `critical_section` is already cross-core safe (it claims
+  `Spinlock<31>`), but the old handler held it across the *entire* ≤2.57 ms
+  decode, which on core 1 would block core 0's `receive` for that whole time
+  (relocating the starvation, not fixing it). Decoupling exclusive decode from
+  the brief shared publish is what makes core separation actually pay off.
+- `main.rs`: `core1_entry` unmasks `DMA_IRQ_0` on core 1's own xh3irq +
+  enables machine-external interrupts, then `wfi`-loops; core 0 unmasks
+  nothing. Core 1's stack bumped to 16 KB (it now builds a 1600-byte frame
+  `Vec` on-stack per decode). Launch moved to after `install_rx`.
+
+**Why it works mechanically:** xh3irq enables are per-hart CSRs (`meiea`), so
+unmasking `DMA_IRQ_0` only on core 1 routes it there; core 0 never sees it.
+The `MachineExternal` trap → `meinext` dispatch → `#[no_mangle] DMA_IRQ_0`
+handler works on core 1 with just `mtvec` + stack + `gp` set up by the launch
+(no `_start` needed). Confirmed: `[Core1] ticks` now climbs by ~458/s = the
+DMA half-fill rate (core 1 wakes per DMA IRQ), and `[Rx] dec/ok` stats
+decoded on core 1 are visible to core 0 via `Spinlock<0>`.
+
+**On-wire results (240 MHz, `http-bulk-test` build):**
+
+| Scenario | Result | vs single-core baseline |
+|---|---|---|
+| Idle ping (low-rate bidir) | 20/20, RTT 2.3 ms | ✅ ≥ baseline (slightly better — core 0 not preempted) |
+| UDP echo (low-rate bidir) | 10/10 byte-perfect | ✅ = baseline |
+| **Idle 1 MB curl (sustained bidir TCP)** | **~40–69 kB/s** | ❌ **~12× WORSE** (R11: 596 kB/s) |
+| Broadcast blast, pure RX (50 pps full-MTU) | core 1 `ok≈50/s` (full rate), core 0 `nlps=62–63/s` steady | ✅ **starvation FIXED** (A1 Finding 2) |
+
+**Root cause of the curl regression — gotcha #10, confirmed by host counters.**
+A single idle 1 MB curl logged **+~30 host TX collisions and +~30 host
+RX/frame errors** (`/proc/net/dev`). In single-core, core 0 physically
+couldn't TX while it was decoding the host's just-received ACK (same core), so
+it never transmitted on top of in-flight host frames — a *free* carrier-sense
+that kept idle TCP collision-free at 596 kB/s. Phase 3c decouples TX (core 0)
+from decode (core 1): core 0 now transmits data segments whenever smoltcp
+wants, colliding with the host's ACKs on the half-duplex wire (the Pico has no
+CSMA/CD). Each collision → lost segment → TCP RTO stall → throughput collapse.
+The collision *rate* is modest (~2 %), but the *penalty* per loss (RTO) is
+huge, so TCP craters.
+
+**Key reframing:** the R11 "23× collapse under stress" was attributed to CPU
+starvation. Phase 3c proves starvation is fixable (core 0 stays at full
+cadence under blast) — but reveals a **second, more fundamental TCP limiter
+that the starvation was masking**: collisions. While core 0 was starved it
+transmitted little, so few collisions; now that it transmits freely, collisions
+dominate. **Carrier-sense — not core separation — is the real lever for
+bidirectional TCP throughput.** Core separation is necessary (it unblocks
+load without starvation) but not sufficient.
+
+**Status of the §4 Phase 3c acceptance gate:** NOT met. Target was 1 MB curl
+under broadcast blast ≥ 300 kB/s; idle curl is already ~45 kB/s (below the
+target before any blast), so the gate fails on the carrier-sense issue, not on
+starvation. The broadcast-blast curl was not separately run — idle is already
+below target and is the best case.
+
+**Decision / next step: add carrier-sense.** Phase 3c stays on its branch
+until then (don't merge a 12× TCP regression to `main`; `main` keeps the
+596 kB/s single-core baseline). Options, in rough order of fidelity:
+
+1. **Real PIO carrier-sense in the TX path (the right fix).** Before the TX SM
+   starts a frame, sense the RX line (RO / GP13) for carrier and defer if
+   busy; ideally also detect collisions for CSMA/CD backoff. Substantial PIO
+   work but it's the proper 10BASE-T half-duplex MAC behaviour and makes
+   Phase 3c a clear net win.
+2. **Software carrier-sense interim.** Have core 0 check a cheap "wire busy"
+   signal before TX (e.g. derived from recent RX-sampler activity). Imperfect
+   proxy — the DMA-half granularity (~2.18 ms) lags real wire state — but may
+   recover much of the throughput as a stop-gap to validate the diagnosis.
+3. **smoltcp tuning band-aid** (larger TX window so losses trigger fast
+   retransmit instead of RTO). Treats the symptom; fragile; not recommended.

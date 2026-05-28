@@ -1,17 +1,26 @@
 //! EthMac — bridge between {EthTx, EthRx} and smoltcp's `phy::Device`.
 //!
-//! After R6 (IRQ-driven RX), responsibilities are split:
+//! After R6 (IRQ-driven RX) and R12c (RX decode on core 1), responsibilities
+//! are split across two axes — TX vs RX, and core 0 vs core 1:
 //!
 //! - **EthMac** owns just `EthTx` + the TX scratch buffer + TX stats. It
-//!   implements `smoltcp::phy::Device`; `transmit` hands out a `TxToken`
-//!   that uses the local TX state directly, and `receive` reaches into
-//!   the shared RX inbox (below) via a critical section.
+//!   implements `smoltcp::phy::Device` on **core 0**; `transmit` hands out a
+//!   `TxToken` that uses the local TX state directly, and `receive` pops the
+//!   shared RX inbox (below).
 //!
-//! - **`SHARED_RX`** is a module-level `Mutex<RefCell<Option<EthRxShared>>>`
-//!   holding the `EthRx` state machine + the inbox deque + RX-side stats.
-//!   The `DMA_IRQ_0` handler (defined here) enters the critical section,
-//!   runs the stitch + decode + verify pipeline, and pushes FCS-OK frames
-//!   to the inbox. Main loop reads + resets stats via `snapshot_rx_stats`.
+//! - **`RX_ENGINE`** (core-1-exclusive) holds the `EthRx` state machine + our
+//!   MAC. After `install_rx` populates it on core 0 (once, before core 1
+//!   enables `DMA_IRQ_0`), it is touched **only by core 1's `DMA_IRQ_0`
+//!   handler** — so the long stitch + decode + verify pipeline runs with no
+//!   lock at all.
+//!
+//! - **`RX_SHARED`** (cross-core, guarded by `Spinlock<0>`) holds just the
+//!   decoded-frame inbox + RX stats. Core 1 publishes FCS-OK frames + stat
+//!   deltas under *brief* locks; core 0 pops the inbox in `receive` and reads
+//!   stats in `snapshot_rx_stats` under the same lock. The lock is never held
+//!   across the decode, so core 1's ≤2.57 ms decode can't starve core 0
+//!   (R12c — the whole point of moving RX off core 0). `Spinlock<0>` is
+//!   distinct from `critical_section`'s reserved `Spinlock<31>`.
 //!
 //! Pass-through TX (`send_nlp`, `send_udp_broadcast`) on `EthMac` still
 //! works alongside smoltcp for the NLP keepalive + smoke-test UDP loop.
@@ -19,9 +28,10 @@
 use crate::eth_rx::EthRx;
 use crate::eth_tx::{EthTx, UdpEndpoint};
 
-use core::cell::RefCell;
-use critical_section::Mutex;
+use core::cell::UnsafeCell;
+use core::sync::atomic::{compiler_fence, Ordering};
 use heapless::{Deque, Vec};
+use rp235x_hal::sio::Spinlock;
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 
@@ -37,16 +47,23 @@ pub const INBOX_SLOTS: usize = 4;
 /// few payload bytes — matches the existing main.rs hex-dump width.
 pub const FRAME_SNAP_BYTES: usize = 128;
 
-/// RX state owned by the DMA_IRQ_0 handler. Mutated only inside a
-/// critical section; main loop touches it through `snapshot_rx_stats`
-/// (for the 1 Hz log) and `Device::receive` (to pop from the inbox).
-pub struct EthRxShared {
+/// Core-1-exclusive RX engine: the `EthRx` state machine + our MAC for the
+/// IRQ-side filter. Written once by core 0 in [`install_rx`] (before core 1
+/// enables `DMA_IRQ_0`), then touched **only** by core 1's `DMA_IRQ_0`
+/// handler — so the decode pipeline needs no lock.
+struct RxEngine {
     rx: EthRx,
-    inbox: Deque<Vec<u8, MAX_FRAME_BYTES>, INBOX_SLOTS>,
     /// Our 6-byte MAC. Used by the IRQ-side filter to skip frames not
     /// addressed to us before paying for the full decode + CRC + push.
     our_mac: [u8; 6],
-    pub stats: EthRxStats,
+}
+
+/// Cross-core shared RX state: the decoded-frame inbox + stats. Guarded by
+/// `Spinlock<0>` (see [`with_rx_shared`]). Core 1 publishes here under brief
+/// locks; core 0 pops the inbox + snapshots stats under the same lock.
+struct RxShared {
+    inbox: Deque<Vec<u8, MAX_FRAME_BYTES>, INBOX_SLOTS>,
+    stats: EthRxStats,
 }
 
 #[derive(Clone, Copy)]
@@ -71,8 +88,9 @@ pub struct EthRxStats {
     pub last_frame_snapshot_len: usize,
 }
 
-impl Default for EthRxStats {
-    fn default() -> Self {
+impl EthRxStats {
+    /// `const` constructor so `RX_SHARED` can be a zero-initialized static.
+    pub const fn new() -> Self {
         Self {
             frames_decoded: 0,
             fcs_ok: 0,
@@ -89,29 +107,60 @@ impl Default for EthRxStats {
     }
 }
 
-/// The shared RX state. Initially `None` — main installs an `EthRxShared`
-/// via [`install_rx`] after constructing `EthRx`, before unmasking the
-/// DMA IRQ. The IRQ handler refuses to run if this is still `None`.
-static SHARED_RX: Mutex<RefCell<Option<EthRxShared>>> = Mutex::new(RefCell::new(None));
+impl Default for EthRxStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-/// Move an `EthRx` into the shared static, along with our MAC for the
-/// IRQ-side MAC filter. Call once, after constructing `EthRx` and before
-/// unmasking `DMA_IRQ_0`. Returns `false` if `SHARED_RX` was already
-/// populated (shouldn't happen — programmer error).
+/// Core-1-exclusive RX engine. `None` until [`install_rx`]. Wrapped in an
+/// `UnsafeCell` because access is single-owner-after-init (core 0 writes once
+/// before core 1's IRQ is live; core 1's handler reads thereafter), so no lock
+/// is needed — the `Sync` impl asserts that contract.
+struct EngineCell(UnsafeCell<Option<RxEngine>>);
+// Safety: see `RxEngine` / `install_rx` — access is serialized by boot order,
+// never genuinely concurrent.
+unsafe impl Sync for EngineCell {}
+static RX_ENGINE: EngineCell = EngineCell(UnsafeCell::new(None));
+
+/// Cross-core shared inbox + stats, guarded by `Spinlock<0>`. Const-init so it
+/// needs no run-time setup.
+struct SharedCell(UnsafeCell<RxShared>);
+// Safety: every access goes through `with_rx_shared`, which holds `Spinlock<0>`.
+unsafe impl Sync for SharedCell {}
+static RX_SHARED: SharedCell = SharedCell(UnsafeCell::new(RxShared {
+    inbox: Deque::new(),
+    stats: EthRxStats::new(),
+}));
+
+/// Run `f` with exclusive cross-core access to `RX_SHARED`, holding
+/// `Spinlock<0>` for the (brief) duration. Both cores funnel inbox + stats
+/// access through here. Never call it while already holding `Spinlock<0>`
+/// (the spinlock is not re-entrant) and never hold it across the decode.
+#[inline]
+fn with_rx_shared<R>(f: impl FnOnce(&mut RxShared) -> R) -> R {
+    let _lock = Spinlock::<0>::claim();
+    // Safety: `Spinlock<0>` guards all access to RX_SHARED on both cores.
+    let shared = unsafe { &mut *RX_SHARED.0.get() };
+    f(shared)
+}
+
+/// Move an `EthRx` into the core-1-exclusive engine, along with our MAC for
+/// the IRQ-side MAC filter. Call once on core 0, after constructing `EthRx`
+/// and **before launching core 1** (which enables `DMA_IRQ_0`). Returns
+/// `false` if already populated (programmer error).
 pub fn install_rx(rx: EthRx, our_mac: [u8; 6]) -> bool {
-    critical_section::with(|cs| {
-        let mut slot = SHARED_RX.borrow_ref_mut(cs);
-        if slot.is_some() {
-            return false;
-        }
-        slot.replace(EthRxShared {
-            rx,
-            inbox: Deque::new(),
-            our_mac,
-            stats: EthRxStats::default(),
-        });
-        true
-    })
+    // Single-owner write: this runs on core 0 before core 1's handler can
+    // touch RX_ENGINE, so no lock is needed. A Release fence makes the write
+    // visible to core 1 (RP2350 has no caches, so a compiler fence suffices).
+    // Safety: no concurrent access at install time (see `RxEngine`).
+    let slot = unsafe { &mut *RX_ENGINE.0.get() };
+    if slot.is_some() {
+        return false;
+    }
+    *slot = Some(RxEngine { rx, our_mac });
+    compiler_fence(Ordering::Release);
+    true
 }
 
 /// Should the IRQ-side MAC filter accept a frame with this destination?
@@ -128,113 +177,164 @@ fn mac_accept(dst: &[u8; 6], our: &[u8; 6]) -> bool {
 /// every second for the log line. Enters a critical section briefly —
 /// fine because the operation is just struct copy + scalar zero-out.
 pub fn snapshot_rx_stats() -> EthRxStats {
-    critical_section::with(|cs| {
-        let mut slot = SHARED_RX.borrow_ref_mut(cs);
-        let Some(shared) = slot.as_mut() else {
-            return EthRxStats::default();
-        };
+    with_rx_shared(|shared| {
         let out = shared.stats;
         shared.stats = EthRxStats::default();
         out
     })
 }
 
-impl EthRxShared {
-    /// Body of what `EthMac::poll` used to do, but now driven from the
-    /// DMA_IRQ_0 handler instead of the main loop. Stitches the just-
-    /// finished half, walks every active run, decodes + verifies + pushes
-    /// FCS-OK frames to the inbox. Stats live in `self.stats` and are
-    /// drained by the main loop via `snapshot_rx_stats`.
-    fn process_completed_half(&mut self) {
-        let inbox = &mut self.inbox;
-        let stats = &mut self.stats;
-        let our_mac = self.our_mac;
-        self.rx.poll_with(|bytes| {
-            let mut cursor = 0;
-            while let Some((off, len)) = EthRx::find_active_run_from(bytes, cursor, 100) {
-                cursor = off + len;
-                // MAC filter first — cheap peek (~1–2 µs) that skips the
-                // full decode + CRC + push for frames not addressed to
-                // us. We accept unicast-to-us + all multicast/broadcast.
-                let Some(dst) = EthRx::peek_dst_mac(bytes, off, len) else {
-                    continue;
-                };
-                if !mac_accept(&dst, &our_mac) {
-                    stats.frames_filtered = stats.frames_filtered.wrapping_add(1);
-                    continue;
-                }
-                // Manchester decoder: by default the edge-track DPLL
-                // (productized in R10 — re-anchors to each per-bit mid-bit
-                // transition so accumulated clock drift can't walk the
-                // sample point off). With `--features decoder-openloop`
-                // the pre-R10 fixed-stride open-loop decoder is used
-                // instead, for FCS-ceiling A/B vs Niccle's 0% CRC-fail
-                // result on similar hardware. See triage plan.
-                #[cfg(feature = "decoder-openloop")]
-                let decoded = EthRx::decode_frame(bytes, off, len);
-                #[cfg(not(feature = "decoder-openloop"))]
-                let decoded = crate::eth_rx_dpll::decode_frame_edge_track(
-                    &bytes[off..off + len],
-                );
-                let Some(mut frame) = decoded else {
-                    continue;
-                };
-                let flen = EthRx::derive_frame_len(&frame);
-                let ok = EthRx::verify_fcs(&frame, flen);
-                let n = flen.min(frame.len());
+/// Stat deltas accumulated locally (lock-free) while decoding a half, then
+/// merged into the shared stats once at the end under a single brief lock.
+/// Keeping these off the shared struct during the decode is what lets the
+/// ≤2.57 ms decode run without holding `Spinlock<0>`.
+struct StatsDelta {
+    decoded: u32,
+    ok: u32,
+    fail: u32,
+    filtered: u32,
+    carry: u32,
+    /// Most-recently decoded frame snapshot (for the 1 Hz log line).
+    last_snap: [u8; FRAME_SNAP_BYTES],
+    last_snap_len: usize,
+    last_len: usize,
+    last_ok: bool,
+    have_last: bool,
+}
 
-                stats.frames_decoded = stats.frames_decoded.wrapping_add(1);
-                if ok {
-                    stats.fcs_ok = stats.fcs_ok.wrapping_add(1);
-                } else {
-                    stats.fcs_fail = stats.fcs_fail.wrapping_add(1);
-                }
-                let snap_n = n.min(stats.last_frame_snapshot.len());
-                stats.last_frame_snapshot[..snap_n].copy_from_slice(&frame[..snap_n]);
-                stats.last_frame_snapshot_len = snap_n;
-                stats.last_frame_len = n;
-                stats.last_frame_was_ok = ok;
-
-                if !ok {
-                    continue;
-                }
-                frame.truncate(n);
-                if inbox.is_full() {
-                    let _ = inbox.pop_front();
-                    stats.inbox_dropped = stats.inbox_dropped.wrapping_add(1);
-                }
-                let _ = inbox.push_back(frame);
-                let depth = inbox.len() as u8;
-                if depth > stats.inbox_high_water {
-                    stats.inbox_high_water = depth;
-                }
-            }
-        });
-        // Fold the EthRx-local carry-cap counter into our window stats.
-        stats.carry_capped = stats.carry_capped.wrapping_add(self.rx.take_carry_capped());
+impl StatsDelta {
+    fn new() -> Self {
+        Self {
+            decoded: 0,
+            ok: 0,
+            fail: 0,
+            filtered: 0,
+            carry: 0,
+            last_snap: [0; FRAME_SNAP_BYTES],
+            last_snap_len: 0,
+            last_len: 0,
+            last_ok: false,
+            have_last: false,
+        }
     }
 }
 
+/// Stitch the just-finished half, walk every active run, decode + verify, and
+/// publish FCS-OK frames to the shared inbox. Runs on **core 1** in the
+/// `DMA_IRQ_0` handler. The decode itself touches only the core-1-exclusive
+/// `engine` (no lock); `Spinlock<0>` is taken only to push each frame and to
+/// merge the stat deltas at the end — never across the decode.
+fn process_completed_half(engine: &mut RxEngine) {
+    let our_mac = engine.our_mac;
+    let mut acc = StatsDelta::new();
+
+    engine.rx.poll_with(|bytes| {
+        let mut cursor = 0;
+        while let Some((off, len)) = EthRx::find_active_run_from(bytes, cursor, 100) {
+            cursor = off + len;
+            // MAC filter first — cheap peek (~1–2 µs) that skips the full
+            // decode + CRC + push for frames not addressed to us. We accept
+            // unicast-to-us + all multicast/broadcast.
+            let Some(dst) = EthRx::peek_dst_mac(bytes, off, len) else {
+                continue;
+            };
+            if !mac_accept(&dst, &our_mac) {
+                acc.filtered = acc.filtered.wrapping_add(1);
+                continue;
+            }
+            // Manchester decoder: by default the edge-track DPLL (productized
+            // in R10 — re-anchors to each per-bit mid-bit transition so
+            // accumulated clock drift can't walk the sample point off). With
+            // `--features decoder-openloop` the pre-R10 fixed-stride open-loop
+            // decoder is used instead, for FCS-ceiling A/B vs Niccle. See
+            // triage plan.
+            #[cfg(feature = "decoder-openloop")]
+            let decoded = EthRx::decode_frame(bytes, off, len);
+            #[cfg(not(feature = "decoder-openloop"))]
+            let decoded = crate::eth_rx_dpll::decode_frame_edge_track(&bytes[off..off + len]);
+            let Some(mut frame) = decoded else {
+                continue;
+            };
+            let flen = EthRx::derive_frame_len(&frame);
+            let ok = EthRx::verify_fcs(&frame, flen);
+            let n = flen.min(frame.len());
+
+            acc.decoded = acc.decoded.wrapping_add(1);
+            if ok {
+                acc.ok = acc.ok.wrapping_add(1);
+            } else {
+                acc.fail = acc.fail.wrapping_add(1);
+            }
+            let snap_n = n.min(acc.last_snap.len());
+            acc.last_snap[..snap_n].copy_from_slice(&frame[..snap_n]);
+            acc.last_snap_len = snap_n;
+            acc.last_len = n;
+            acc.last_ok = ok;
+            acc.have_last = true;
+
+            if !ok {
+                continue;
+            }
+            frame.truncate(n);
+            // Brief cross-core lock: publish this frame + inbox-side stats.
+            with_rx_shared(|shared| {
+                if shared.inbox.is_full() {
+                    let _ = shared.inbox.pop_front();
+                    shared.stats.inbox_dropped = shared.stats.inbox_dropped.wrapping_add(1);
+                }
+                let _ = shared.inbox.push_back(frame);
+                let depth = shared.inbox.len() as u8;
+                if depth > shared.stats.inbox_high_water {
+                    shared.stats.inbox_high_water = depth;
+                }
+            });
+        }
+    });
+    acc.carry = engine.rx.take_carry_capped();
+
+    // Brief cross-core lock: merge the decode-side stat deltas + last-frame
+    // snapshot in one shot.
+    with_rx_shared(|shared| {
+        let s = &mut shared.stats;
+        s.frames_decoded = s.frames_decoded.wrapping_add(acc.decoded);
+        s.fcs_ok = s.fcs_ok.wrapping_add(acc.ok);
+        s.fcs_fail = s.fcs_fail.wrapping_add(acc.fail);
+        s.frames_filtered = s.frames_filtered.wrapping_add(acc.filtered);
+        s.carry_capped = s.carry_capped.wrapping_add(acc.carry);
+        if acc.have_last {
+            s.last_frame_snapshot[..acc.last_snap_len]
+                .copy_from_slice(&acc.last_snap[..acc.last_snap_len]);
+            s.last_frame_snapshot_len = acc.last_snap_len;
+            s.last_frame_len = acc.last_len;
+            s.last_frame_was_ok = acc.last_ok;
+        }
+    });
+}
+
 /// DMA channel-completion IRQ. Linker-resolved via `extern "Rust"` in
-/// `rp235x-hal::arch`; needs `#[unsafe(no_mangle)]` for the symbol name
-/// to match. Both RX DMA channels were `enable_irq0()`'d in `EthRx::new`,
-/// so this fires once per half-buffer fill.
+/// `rp235x-hal::arch`; needs `#[unsafe(no_mangle)]` for the symbol name to
+/// match. Both RX DMA channels were `enable_irq0()`'d in `EthRx::new`, so this
+/// fires once per half-buffer fill.
+///
+/// **Runs on core 1 (R12c).** Only core 1 unmasks `DMA_IRQ_0` in its xh3irq;
+/// core 0 never sees it. The handler touches the core-1-exclusive `RX_ENGINE`
+/// directly (no lock) and publishes into `RX_SHARED` under `Spinlock<0>`.
 #[unsafe(no_mangle)]
 #[allow(non_snake_case)]
 fn DMA_IRQ_0() {
-    critical_section::with(|cs| {
-        let mut slot = SHARED_RX.borrow_ref_mut(cs);
-        let Some(shared) = slot.as_mut() else {
-            return;
-        };
-        // `dma_irq_pending` clears the per-channel pending bit. Return
-        // early if it's not actually ours (shouldn't happen — we own
-        // both channels — but cheap defensive check).
-        if !shared.rx.dma_irq_pending() {
-            return;
-        }
-        shared.process_completed_half();
-    });
+    // Safety: RX_ENGINE is touched only by this handler after `install_rx`
+    // (which completes on core 0 before core 1 enables the IRQ), so this
+    // `&mut` is exclusive.
+    let Some(engine) = (unsafe { (*RX_ENGINE.0.get()).as_mut() }) else {
+        return;
+    };
+    // `dma_irq_pending` clears the per-channel pending bit. Return early if
+    // it's not actually ours (shouldn't happen — we own both channels — but
+    // cheap defensive check).
+    if !engine.rx.dma_irq_pending() {
+        return;
+    }
+    process_completed_half(engine);
 }
 
 pub struct EthMac {
@@ -306,14 +406,9 @@ impl phy::Device for EthMac {
         Self: 'a;
 
     fn receive(&mut self, _ts: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        // Pop one frame from the IRQ-populated inbox. Critical section is
-        // microseconds — only the inbox::pop_front happens inside it.
-        let buf = critical_section::with(|cs| {
-            SHARED_RX
-                .borrow_ref_mut(cs)
-                .as_mut()
-                .and_then(|s| s.inbox.pop_front())
-        })?;
+        // Pop one frame from the core-1-populated inbox. The `Spinlock<0>`
+        // hold is microseconds — only the inbox `pop_front` happens inside it.
+        let buf = with_rx_shared(|shared| shared.inbox.pop_front())?;
         self.stats.rx_handed_out = self.stats.rx_handed_out.wrapping_add(1);
         Some((
             EthRxToken { buf },

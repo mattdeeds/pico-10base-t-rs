@@ -88,24 +88,35 @@ const PLL_SYS_SELECTED: PLLConfig = PLL_SYS_150MHZ;
 /// store/load only (compiles to `sw`/`lw`) — no lr/sc reservation across cores.
 static CORE1_TICKS: AtomicU32 = AtomicU32::new(0);
 
-/// Core 1's stack (4 KB). `#[repr(align(16))]` keeps the launch trampoline's
-/// `sp` RV32-ABI aligned. Owned exclusively by core 1 once launched.
+/// Core 1's stack (16 KB). `#[repr(align(16))]` keeps the launch trampoline's
+/// `sp` RV32-ABI aligned. Owned exclusively by core 1 once launched. Sized
+/// generously because core 1's `DMA_IRQ_0` handler runs the full decode
+/// pipeline (a 1600-byte frame `Vec` is built on this stack per frame, plus
+/// the trap frame + nested call frames).
 #[repr(align(16))]
-struct Core1Stack([usize; 1024]);
-static mut CORE1_STACK: Core1Stack = Core1Stack([0; 1024]);
+struct Core1Stack([usize; 4096]);
+static mut CORE1_STACK: Core1Stack = Core1Stack([0; 4096]);
 
-/// Phase 3a core-1 entry point: do nothing useful yet — just bump the shared
-/// liveness counter at a steady cadence so core 0's 1 Hz log shows it climbing.
-/// Phase 3c replaces this body with the `DMA_IRQ_0` RX decode loop (`wfi`
-/// between interrupts).
+/// Phase 3c core-1 entry point: own the RX decode. Route `DMA_IRQ_0` to this
+/// core's interrupt controller (per-hart xh3irq CSR) + enable machine-external
+/// interrupts, then sleep between IRQs. The `DMA_IRQ_0` handler (in
+/// `eth_mac.rs`) runs the stitch + decode + verify pipeline here — off core 0,
+/// so the main loop + smoltcp can't be starved by decode work under load.
 extern "C" fn core1_entry() -> ! {
+    // Safety: enabling this core's own interrupts. The handler + shared RX
+    // state were installed by core 0 (`install_rx`) before this core launched.
+    unsafe {
+        hal::arch::interrupt_unmask(hal::pac::Interrupt::DMA_IRQ_0);
+        hal::arch::interrupt_enable();
+    }
     let mut n: u32 = 0;
     loop {
+        hal::arch::wfi();
+        // Woke to service a DMA-half IRQ (handled via the trap before we
+        // resume here). Bump the liveness counter so core 0's 1 Hz log shows
+        // core 1 processing halves; ticks climbing == core 1 alive + working.
         n = n.wrapping_add(1);
         CORE1_TICKS.store(n, Ordering::Relaxed);
-        // ~1 ms/tick at 240 MHz → core 0 sees ticks climb by ~1000/s. The
-        // exact value isn't load-bearing; it just has to keep moving.
-        hal::arch::delay(240_000);
     }
 }
 
@@ -147,18 +158,6 @@ fn main() -> ! {
     );
     let mut led = pins.gpio25.into_push_pull_output();
 
-    // Phase 3a — bring up the 2nd Hazard3 core. It runs `core1_entry` (a
-    // liveness counter for now); core 0 keeps owning TX/USB/smoltcp/RX exactly
-    // as before. Custom RISC-V launch because `rp235x-hal`'s `multicore::spawn`
-    // is Cortex-M only — see `src/multicore_riscv.rs` / `cpu-dpll-plan.md` §9a.
-    // The launch is bounded, so a non-responsive core 1 returns an error here
-    // rather than hanging core 0; we surface the outcome in the 1 Hz log.
-    let core1_stack = unsafe { &mut (*core::ptr::addr_of_mut!(CORE1_STACK)).0 };
-    let core1_launch_ok = unsafe {
-        multicore_riscv::launch_core1_riscv(&mut pac.PSM, &mut sio.fifo, core1_stack, core1_entry)
-            .is_ok()
-    };
-
     let timer = hal::Timer::new_timer0(pac.TIMER0, &mut pac.RESETS, &clocks);
 
     // GP14 → ISL3177E DI, GP13 → ISL3177E RO. Reassign both to PIO0 function.
@@ -198,16 +197,32 @@ fn main() -> ! {
     );
 
     // Install EthRx + our MAC (for the IRQ-side MAC filter) into the
-    // shared static the DMA_IRQ_0 handler reads, then unmask the IRQ +
-    // enable Hazard3 machine-external interrupts. From this point on,
-    // decoding is interrupt-driven — the main loop never polls EthRx;
-    // smoltcp drains the inbox via EthMac::Device::receive instead.
+    // core-1-exclusive RX engine the DMA_IRQ_0 handler reads. Must happen
+    // before core 1 is launched (below), so RX_ENGINE is populated before
+    // core 1's first IRQ.
     let our_mac_bytes: [u8; 6] = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC];
     let _ = eth_mac::install_rx(eth_rx, our_mac_bytes);
-    unsafe {
-        hal::arch::interrupt_unmask(hal::pac::Interrupt::DMA_IRQ_0);
-        hal::arch::interrupt_enable();
-    }
+
+    // Phase 3c — launch core 1 to OWN RX decode. core1_entry unmasks
+    // DMA_IRQ_0 on core 1's own interrupt controller + enables machine-external
+    // interrupts, then wfi-loops; the handler runs the stitch + decode + verify
+    // pipeline there. Core 0 unmasks nothing — it takes no DMA IRQ at all, so
+    // the main loop + smoltcp can't be starved by decode work under broadcast
+    // load (R12c; fixes the 23× TCP collapse from R11). Custom RISC-V launch
+    // because rp235x-hal's multicore::spawn is Cortex-M only (see
+    // src/multicore_riscv.rs / cpu-dpll-plan.md §9f). Bounded launch → a
+    // non-responsive core 1 returns an error rather than hanging core 0; the
+    // outcome is surfaced in the 1 Hz log.
+    //
+    // Ordering: after EthRx::new (PIO sampler + DMA already running, so the
+    // first DMA-half pending bit just latches until core 1 enables the IRQ)
+    // and after install_rx (RX_ENGINE populated). The decode never runs on
+    // core 0, so the main loop's iteration budget stays free.
+    let core1_stack = unsafe { &mut (*core::ptr::addr_of_mut!(CORE1_STACK)).0 };
+    let core1_launch_ok = unsafe {
+        multicore_riscv::launch_core1_riscv(&mut pac.PSM, &mut sio.fifo, core1_stack, core1_entry)
+            .is_ok()
+    };
 
     // EthMac now owns just the TX side + a scratch buffer; RX state lives
     // in the shared static. smoltcp's Interface still sees a single
