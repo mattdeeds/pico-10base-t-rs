@@ -52,15 +52,15 @@ pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 /// Pico 2 board has a 12 MHz crystal.
 const XTAL_FREQ_HZ: u32 = 12_000_000u32;
 
-/// Phase 2d v3 — 180 MHz overclock. Buys 3 SM cycles/bit of PIO budget for the
-/// windowed DPLL (15 → 18 cyc/bit), AND gives integer PIO dividers (TX÷9 RX÷3,
+/// Phase 2d v3 — 240 MHz overclock. Buys 3 SM cycles/bit of PIO budget for the
+/// windowed DPLL (18 → 24 cyc/bit), AND gives integer PIO dividers (TX÷9 RX÷3,
 /// no fractional jitter). VCO 1080 MHz / (6 × 1) = 180 MHz. Recovery via SWD
 /// if flash gets corrupted at the higher QMI SCK (the DAPLink probe is
 /// attached; see the `sysclk-integer-pio-dividers` memory).
-const PLL_SYS_180MHZ: PLLConfig = PLLConfig {
-    vco_freq: HertzU32::MHz(1080),
+const PLL_SYS_240MHZ: PLLConfig = PLLConfig {
+    vco_freq: HertzU32::MHz(1200),
     refdiv: 1,
-    post_div1: 6,
+    post_div1: 5,
     post_div2: 1,
 };
 
@@ -76,7 +76,7 @@ fn main() -> ! {
     let pll_sys = setup_pll_blocking(
         pac.PLL_SYS,
         xosc.operating_frequency(),
-        PLL_SYS_180MHZ,
+        PLL_SYS_240MHZ,
         &mut clocks,
         &mut pac.RESETS,
     )
