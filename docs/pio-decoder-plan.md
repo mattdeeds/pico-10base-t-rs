@@ -372,3 +372,132 @@ events are jitter-limited; finer resolution pushes the slip threshold from
 (may benefit from tuning to e.g. `[10]`); redesign v2's polling cycle math for
 18 cyc/bit; or pivot to the CPU DPLL on the 2nd Hazard3 core (Phase-1 edge-track,
 sidesteps PIO timing).
+
+### 12c. Three corrections after GPT-5.5 design review (2026-05-28)
+
+External design review surfaced three things this doc previously had wrong:
+
+1. **P2 (no loss-of-lock cascade) is NOT met by v1 / v1+180 MHz.** §12b claimed
+   "P2 met — flat bins on successful decodes." That's the wrong metric. P2 is
+   about what happens on **failure**: a single bit/edge error must stay LOCAL.
+   Our failure mode is exactly the `0xaa`/`0x55` cascade to end-of-frame (= the
+   SM locked onto the boundary edges at half-bit phase and free-runs). Successful
+   frames having flat bins is good but doesn't establish P2 — it just means
+   "when it works it works." **P2 is currently not satisfied for failure paths.**
+
+2. **Synchronizer bypass does NOT save the cycle budget** for a self-clocked
+   PIO loop. The two-cycle synchronizer is a constant offset between real-edge
+   time and PIO-visible-edge time — it does not change the relative cycle math
+   inside a loop whose anchor IS the synchronized edge. Bypass also adds real
+   metastability risk on phase decisions made from single-cycle pin observations
+   (irreversible decisions from a possibly metastable bit). Bypass is at the
+   PIO block's `INPUT_SYNC_BYPASS` register, NOT a PADS setting. Earlier notes
+   suggested bypass might unlock the windowed v2 — that was wrong.
+
+3. **Statistics: ≥100 full-MTU frames per measurement point.** Our N-sweep
+   used 3–5 windows per point, and back-to-back identical-code runs of N=7
+   went 40 % → 0 %. The run-to-run variance was larger than the between-N
+   variance, so most of the "N=8 fails / N=7 works" signal was just statistical
+   noise. Treat any future N or design sweep below ≥100 frames/point as
+   inconclusive.
+
+### 12d. v3 — unrolled hard-window DPLL (2026-05-28, in progress)
+
+v2's polling didn't fit because `set x` + `jmp x--, poll` cost 2 cycles per
+window position (the counter loop overhead). At 18 SM cyc/bit we have
+**instruction space** (32 slots, using 7) but **no cycle space**. The fix:
+**unroll the polling window** into explicit `jmp pin, edge` instructions —
+trade unused instruction slots for the cycles the counter was eating.
+
+Design (per the GPT-5.5 review):
+
+```pio
+sample_path:
+    nop          [2]
+    in pins, 1   [9]        ; sample at +5, delay to level-decision at +13
+    jmp pin, want_low       ; current high → next mid-bit goes low
+want_high:                  ; line low: accept a high transition
+    nop                     ; (cycle-matching trampoline)
+    jmp pin, edge           ; poll 1
+    jmp pin, edge           ; poll 2
+    jmp sample_path         ; miss: coast one bit
+want_low:                   ; line high: accept a low transition (asymmetric:
+    nop                     ; jmp pin only tests HIGH; the LOW case is the
+    jmp pin, low2           ; fall-through, which needs an extra explicit jmp)
+    jmp sample_path         ; poll 1 fall-through (edge detected)
+low2:
+    jmp pin, miss_low
+    jmp sample_path         ; poll 2 fall-through (edge detected)
+miss_low:
+    jmp sample_path         ; miss
+edge:
+    jmp sample_path
+```
+
+**The asymmetric want_high vs want_low paths are deliberate.** `jmp pin, label`
+only branches on HIGH — the LOW case is fall-through. Want_high (need rising)
+maps naturally to `jmp pin, edge`; want_low (need falling) needs `jmp pin,
+no_edge` + explicit `jmp sample_path` for the edge case. Per the review:
+"every accepted-edge path and every miss path must have intentional latency.
+A direct branch to sample_path on one polarity and a trampoline through edge
+on the other polarity can introduce a hidden one-cycle phase step."
+
+**Steady-state behavior** is a soft DPLL: when the anchor is well-phased and
+edges arrive at PIO cyc 18 (one bit period later), the polls at cyc 15/16
+*miss* on the first attempt and the miss-coast path returns at cyc 18 ⇒ loop
+period = 18 cyc, anchor stays locked. When the anchor drifts, edges land
+inside the poll window and one of the polls catches → loop shortens by 1 cyc,
+pulling the anchor back into lock. So the polls act as an acquisition + jitter
+correction mechanism while steady-state operation is open-loop coast.
+
+**Acceptance protocol (≥100 full-MTU windows per point):**
+1. `pio_dump.py --size 1472` collecting ≥100 windows.
+2. Score FCS-OK rate, per-byte bin pattern, slip-point distribution.
+3. Sweep `in pins, 1 [N]` for N ∈ {8, 9, 10, 11} (the window placement).
+4. Compare to v1@180 (~40 % FCS-OK baseline).
+
+### 12e. v3 implementation result: doesn't work (2026-05-28)
+
+**v3 produces mostly idle reads (1608 of 2048 bytes = 0xff per window), longest
+alternating run only 15 bits — no preamble visible, no acquisition.**
+
+Root cause: the cycle math for "polls land on the expected edge" is mutually
+exclusive with "miss-coast = bit period" given the 2-cycle PIO input
+synchronizer. Concretely:
+
+- Anchor at PIO cyc 0; next real mid-bit edge at real cyc 16; **PIO-visible at
+  cyc 18** (after synchronizer).
+- For polls to *catch* that edge, polls must be at PIO cyc 18+.
+- Pre-poll (`nop[2] + in[D2] + jmp_pin + (maybe trampoline)`) consumes ≥ 14 cyc.
+- 2-poll window + miss-return-via-wrap consumes 2 + 0 cyc minimum.
+- **Pre-poll for polls at cyc 18 alone needs D2=13 ⇒ pre-poll = 17 cyc, leaving
+  only 1 cyc for polls before loop budget is exhausted at 18.** No room for a
+  2-poll window AND miss-coast at bit period.
+- Alternative: keep `in [9]` (polls at cyc 15-16) so miss-coast = 18 ⇒ polls
+  land **before** the expected edge → never catch real mid-bit edges → no
+  acquisition → SM samples at arbitrary phase → mostly idle 0xff reads.
+
+The GPT-5.5 sketch had the right structural idea (unrolled hard window trades
+instruction slots for cycles vs `set x` + `jmp x--`), but the cycle budget
+**still doesn't accommodate a poll window placed at the synchronizer-delayed
+expected edge** in a single-SM 18-cyc-per-bit loop. The "trade instruction
+space for cycles" only saves cycles that the *counter* consumed (2 cyc per
+window position) — it doesn't change the structural pre-poll requirement.
+
+Verified on wire: v3 flashed and ran but produced 78 % idle bytes per dump
+window with no recognisable Manchester structure (longest alt-bit run 15
+bits — preamble would be ~56). Reverted `src/eth_rx_pio.rs` to v1.
+
+**Remaining viable PIO paths (all non-trivial):**
+- 2-SM split (clock SM + data SM with IRQ coordination) — more total cycle
+  budget by partitioning roles.
+- Even higher overclock (240 MHz ⇒ 24 cyc/bit) — buys structural room. Bigger
+  flash/QMI risk.
+- Synchronizer bypass via `PIO1.INPUT_SYNC_BYPASS` — saves 2 cyc absolute, but
+  cycle math shows it doesn't actually unlock the windowed structure (still
+  exclusive between "polls on edge" and "loop = bit period"). Plus metastability.
+- Decoder diversity (multiple SMs each at different phase, pick best with FCS).
+- Accept v1+180 MHz baseline (~40 % full-MTU, P2 partial).
+
+**Recommendation: park the single-SM PIO route at v1+180 MHz.** The CPU DPLL on
+the 2nd Hazard3 core (Phase-1 edge-track) is the cleaner path to ≥95 % full-MTU.
