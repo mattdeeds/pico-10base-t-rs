@@ -4,9 +4,20 @@ Checkpoint for picking up the Rust port of [Pico-10BASE-T](../Pico-10BASE-T/) af
 
 For the C reference and the proven Manchester / decoder design, see [`../Pico-10BASE-T/RESUME.md`](../Pico-10BASE-T/RESUME.md) and [`../Pico-10BASE-T/CLAUDE.md`](../Pico-10BASE-T/CLAUDE.md).
 
-## 👉 Next session — start here: the router proper (NAT / wireless / DHCP), or optional MAC polish
+## 👉 Next session — start here: (1) verify the Pico 2 W radio, then (2) pivot to the proven cyw43 driver
 
-**The multicore RX is DONE, a net win on every axis, and MERGED to `main` (2026-05-28, `8883e05`).** Phases 3a→3e turned the R11 23× collapse into a *consistent ≥-baseline-with-headroom* result. `main` now runs the multicore RX + carrier-sense + CSMA/CA backoff in production.
+**⚠️ You are on branch `r13-wireless-scaffold`** (R13 wireless work; `main` = the merged R12e production baseline, untouched). **R13 status (2026-05-28):**
+- Pico 2 W swapped in. **Production 10BASE-T verified clean on it** (ping/curl/UDP 100%, core 1 + carrier-sense all working) — the WAN side survived the swap.
+- cyw43 + async runtime (embassy-executor `platform-riscv32` + a custom embassy-time driver) **foundation compiles + links** for riscv32imac (`src/wireless.rs`; `docs/router-plan.md` §10).
+- A synchronous gSPI **bit-bang probe** of the CYW43 bus test register (`wireless::probe_cyw43`) reads varying/floating data → **chip not responding** (pin map GP23=WL_ON/24=DATA/25=CS/29=CLK + funcsel=5 both ruled out; the SPI lines are off-header so they can't be scoped). **The board's wireless is UNVERIFIED.** (`docs/router-plan.md` §11)
+
+**▶ FIRST ACTION — verify the board with stock firmware** (independent of our code): flash MicroPython for **`RPI_PICO2_W`** (micropython.org/download/RPI_PICO2_W/, drag the UF2 in BOOTSEL), then over the REPL: `from machine import Pin; Pin("LED", Pin.OUT).on()` (proves the cyw43 chip + gSPI) and `import network; w=network.WLAN(network.STA_IF); w.active(True); print(w.scan())` (proves radio + firmware). **Board good ⇒ the bug is our code → proceed to the pivot.** Restore our firmware after: `picotool load -x -t elf target/riscv32imac-unknown-none-elf/release/pico-10base-t-rs` (or `cargo run --release`). *(Claude can run the scan test remotely — it's textual.)*
+
+**▶ THEN — pivot to the proven cyw43 driver + a faithful, self-contained FIFO-driven PIO gSPI transport on PIO1** (known-good timing; its `init()` doubles as the board test). Don't keep iterating the bit-bang blindly (unscoppable pins). Full build plan: `docs/router-plan.md` §11 (PIO transport → async `cyw43::new` + firmware blobs → CDC-in-async telemetry → onboard-LED-blink acceptance).
+
+---
+
+**Background — the multicore RX win (R12, on `main`):** DONE, a net win on every axis, MERGED to `main` (2026-05-28, `8883e05`). Phases 3a→3e turned the R11 23× collapse into a *consistent ≥-baseline-with-headroom* result. `main` now runs the multicore RX + carrier-sense + CSMA/CA backoff in production.
 
 - **3a** multicore foundation ✅ — Hazard3 RISC-V core-1 launch (`src/multicore_riscv.rs`; §9f).
 - **3c** RX decode on core 1 ✅ — fixed CPU starvation; revealed carrier-sense (not core separation) is the real TCP lever (§9g).
