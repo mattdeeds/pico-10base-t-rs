@@ -297,3 +297,50 @@ SIO FIFO + spinlock plumbing works on this chip + this rp235x-hal version,
 without touching any RX/TX code. If 3a is clean, 3b is the algorithm port
 (which can be validated entirely offline + on-core-0), and 3c is the
 multicore integration where the real value lands.
+
+### 9a. Phase 3a attempt — blocked (2026-05-28)
+
+First attempt at 3a **hung core 0**. Root cause discovery:
+
+- **`rp235x-hal` v0.4's `multicore::Multicore::spawn` is gated to
+  `target_arch = "arm"`** — uses Cortex-M-specific VTOR, MSPLIM, ICB.ACTLR
+  registers. Doesn't work for our Hazard3 RISC-V build.
+- **Wrote a custom `launch_core1_riscv` using the FIFO bootstrap protocol
+  (`[0, 0, 1, vector_table, sp, entry]`).** Hangs the calling core 0 in
+  `fifo.read_blocking()` — core 1 is presumably not echoing the protocol
+  the way we expect.
+- **What's actually needed (from a fetch of the pico-sdk source):**
+  1. `multicore_reset_core1` does the PSM reset cycle *and* **blocks
+     waiting for core 1 to push its own 0 ready-signal** via the FIFO
+     before returning. (rp235x-hal's ARM `spawn` doesn't do this — possibly
+     because the ARM boot ROM doesn't emit the ready-signal, or it's
+     swallowed somewhere; needs verification.)
+  2. The RISC-V launch path **prepares a stack with 4 specific values**
+     (entry, stack_bottom, core1_wrapper, current_gp) and sends a
+     **trampoline assembly stub** as the protocol's "entry_point". The
+     trampoline pops the values into a0/a1/a2/gp and `jr a2`-jumps to the
+     wrapper. So passing a raw Rust `fn` directly as the entry is
+     insufficient — at minimum we'd need a small naked asm trampoline that
+     either sets `gp` to a sensible value or jumps to our entry while
+     accepting that gp is uninitialised.
+  3. The protocol disables `SIO_IRQ_FIFO` on the calling core for the
+     duration of the handshake.
+
+None of these are deep blockers individually — they're just missing pieces
+that need writing carefully and tested against the actual RP2350 datasheet
+(§5.5.5 or so) or a known-working pico-sdk RISC-V build for cross-reference.
+For Phase 3a, the right move is to spend dedicated time on the launch
+protocol when we have either (a) the RP2350 datasheet to verify against,
+(b) an OpenOCD `halt` + register inspect after launch to see exactly where
+core 1 is stuck, or (c) a known-good rp-hal community fork that supports
+Hazard3 multicore.
+
+**Decision: defer 3a, do 3b offline first.** Phase 3b's algorithm port +
+offline validation against the corpus doesn't depend on multicore — it can
+be tested entirely on the host. Once 3b lands, we have a validated
+Rust `decode_edge_track` ready to wire in. The multicore launch can be
+solved separately, and the on-device integration is then "swap the decoder
++ move the IRQ" rather than "swap the decoder *and* figure out multicore."
+
+Revert state: `src/main.rs` is back to `HEAD` (`8845a38` — 240 MHz + bring-up
+scaffolding, no multicore). Device on-wire works normally.
