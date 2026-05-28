@@ -37,6 +37,15 @@ sample-rate-20mhz = ["decoder-openloop"]
 # matrix (DPLL vs openloop vs 20 MHz openloop, each at 240 and 150 MHz).
 clock-150mhz = []
 
+# Methodology cross-check (FCS-ceiling triage, experiment 4): swap the R8
+# tiny-info HTTP response for a 1 MB streaming payload on port 80. With
+# this enabled, `curl http://192.168.37.24/` downloads 1 MB so we can
+# measure achieved kB/s vs Niccle's 620 kB/s (which they reported at
+# "0 invalid CRC"). If our throughput is in their ballpark while our FCS
+# counter still reads 30-70 % fail, hypothesis #4 (their counter masks
+# silent SFD-lock failures) is confirmed and the gap is paper-only.
+http-bulk-test = []
+
 [dependencies]
 critical-section = "1.2.0"
 embedded-hal = "1.0.0"

@@ -199,8 +199,15 @@ fn main() -> ! {
     // R7: a tiny HTTP server on port 80. 1 KB each direction is enough
     // for a 1-shot GET / response and validates retransmission/windowing
     // through our RX path under a more demanding protocol than UDP.
+    //
+    // With `--features http-bulk-test` the response becomes a 1 MB stream
+    // for the experiment-4 methodology cross-check, so we bump the TX
+    // buffer to keep the pipe full between poll cycles.
     let mut tcp_rx_storage = [0u8; 1024];
+    #[cfg(not(feature = "http-bulk-test"))]
     let mut tcp_tx_storage = [0u8; 1024];
+    #[cfg(feature = "http-bulk-test")]
+    let mut tcp_tx_storage = [0u8; 8 * 1024];
     let tcp_rx_buffer = tcp::SocketBuffer::new(&mut tcp_rx_storage[..]);
     let tcp_tx_buffer = tcp::SocketBuffer::new(&mut tcp_tx_storage[..]);
     let tcp_socket = tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer);
@@ -273,6 +280,9 @@ fn main() -> ! {
     let mut payload_buf: String<64> = String::new();
     let mut line: String<160> = String::new();
 
+    #[cfg(feature = "http-bulk-test")]
+    let mut http_bulk_state = HttpBulkState::Idle;
+
     loop {
         usb_dev.poll(&mut [&mut serial, &mut reset_iface]);
         // If a USB control transfer requested a reboot (e.g. picotool -f),
@@ -294,7 +304,10 @@ fn main() -> ! {
 
         // R4.6: UDP echo on port 1234. R7: tiny HTTP server on port 80.
         serve_udp_echo(&mut sockets, udp_handle);
+        #[cfg(not(feature = "http-bulk-test"))]
         serve_http(&mut sockets, tcp_handle, log_tick, nlps_sent, udp_sent);
+        #[cfg(feature = "http-bulk-test")]
+        serve_http_bulk(&mut sockets, tcp_handle, &mut http_bulk_state);
 
         // NLP every 16 ms — IEEE 802.3 link-integrity keepalive.
         if now >= next_nlp {
@@ -356,6 +369,7 @@ fn serve_udp_echo(sockets: &mut SocketSet, handle: SocketHandle) {
 /// connection, drains the request best-effort (we don't parse it), and writes
 /// a fixed-shape 200 OK with build info + uptime, then closes. Exercises TCP
 /// handshake / retransmission / windowing through the RX path.
+#[cfg(not(feature = "http-bulk-test"))]
 fn serve_http(
     sockets: &mut SocketSet,
     handle: SocketHandle,
@@ -388,6 +402,76 @@ fn serve_http(
         let _ = socket.send_slice(head.as_bytes());
         let _ = socket.send_slice(body.as_bytes());
         socket.close();
+    }
+}
+
+/// Experiment 4 — bulk HTTP variant. Streams a fixed 1 MB body so a host
+/// `curl` measures sustained TCP throughput across our RX path. State
+/// machine is driven across many smoltcp poll cycles because the 8 KB TX
+/// buffer would otherwise saturate; we keep the pipe full by refilling
+/// whenever `socket.can_send` reports headroom. The dummy body is the
+/// 0x55 toggling pattern matching `/tmp/blast_udp_full_mtu.py` so any
+/// future per-byte-error scan would tie back to the same payload basis.
+#[cfg(feature = "http-bulk-test")]
+const HTTP_BULK_BYTES: usize = 1024 * 1024;
+
+#[cfg(feature = "http-bulk-test")]
+enum HttpBulkState {
+    /// Waiting for a fresh connection to open + reach the may-send state.
+    Idle,
+    /// Header has been queued; body sender writes up to `remaining` bytes.
+    Sending { remaining: usize },
+}
+
+#[cfg(feature = "http-bulk-test")]
+fn serve_http_bulk(
+    sockets: &mut SocketSet,
+    handle: SocketHandle,
+    state: &mut HttpBulkState,
+) {
+    use core::fmt::Write as _;
+    // Refill chunk: 1 KB of 0x55. Matches the UDP-blast payload pattern.
+    const CHUNK: [u8; 1024] = [0x55; 1024];
+
+    let socket = sockets.get_mut::<tcp::Socket>(handle);
+
+    if !socket.is_open() {
+        *state = HttpBulkState::Idle;
+        let _ = socket.listen(80);
+        return;
+    }
+    if socket.may_recv() {
+        let _ = socket.recv(|buf| (buf.len(), ()));
+    }
+
+    match state {
+        HttpBulkState::Idle => {
+            if socket.can_send() {
+                let mut head: String<128> = String::new();
+                let _ = write!(
+                    head,
+                    "HTTP/1.0 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    HTTP_BULK_BYTES
+                );
+                let _ = socket.send_slice(head.as_bytes());
+                *state = HttpBulkState::Sending { remaining: HTTP_BULK_BYTES };
+            }
+        }
+        HttpBulkState::Sending { remaining } => {
+            while *remaining > 0 && socket.can_send() {
+                let n = (*remaining).min(CHUNK.len());
+                let sent = socket.send_slice(&CHUNK[..n]).unwrap_or(0);
+                if sent == 0 {
+                    break;
+                }
+                *remaining -= sent;
+            }
+            if *remaining == 0 {
+                socket.close();
+                *state = HttpBulkState::Idle;
+            }
+        }
     }
 }
 
