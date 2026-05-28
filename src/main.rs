@@ -13,7 +13,10 @@
 mod crc;
 mod eth_mac;
 mod eth_rx;
-mod eth_rx_dpll; // Edge-track DPLL Manchester decoder (productized — Phase 3b)
+// Edge-track DPLL Manchester decoder (productized — Phase 3b). Excluded
+// from the openloop A/B build so the dead-code warnings don't fire.
+#[cfg(not(feature = "decoder-openloop"))]
+mod eth_rx_dpll;
 mod eth_tx;
 mod manchester;
 mod pico_reset;

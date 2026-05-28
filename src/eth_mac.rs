@@ -163,13 +163,20 @@ impl EthRxShared {
                     stats.frames_filtered = stats.frames_filtered.wrapping_add(1);
                     continue;
                 }
-                // Edge-track DPLL Manchester decoder (productized — Phase 3b).
-                // Re-anchors to each per-bit mid-bit transition so accumulated
-                // clock drift can't walk the sample point off; replaced the
-                // original open-loop sampler after the 50 %→~PHY-limit jump.
-                let Some(mut frame) = crate::eth_rx_dpll::decode_frame_edge_track(
+                // Manchester decoder: by default the edge-track DPLL
+                // (productized in R10 — re-anchors to each per-bit mid-bit
+                // transition so accumulated clock drift can't walk the
+                // sample point off). With `--features decoder-openloop`
+                // the pre-R10 fixed-stride open-loop decoder is used
+                // instead, for FCS-ceiling A/B vs Niccle's 0% CRC-fail
+                // result on similar hardware. See triage plan.
+                #[cfg(feature = "decoder-openloop")]
+                let decoded = EthRx::decode_frame(bytes, off, len);
+                #[cfg(not(feature = "decoder-openloop"))]
+                let decoded = crate::eth_rx_dpll::decode_frame_edge_track(
                     &bytes[off..off + len],
-                ) else {
+                );
+                let Some(mut frame) = decoded else {
                     continue;
                 };
                 let flen = EthRx::derive_frame_len(&frame);

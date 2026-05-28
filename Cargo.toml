@@ -13,6 +13,14 @@ description = "10BASE-T Ethernet TX+RX on Pico 2 (RP2350 Hazard3) using ISL3177E
 # heartbeat + [Rx] decode summary always print.
 diag = []
 
+# A/B experiment knob (FCS-ceiling triage, post-R10): swap the productized
+# edge-track DPLL decoder for the pre-R10 open-loop locked-once decoder.
+# Same call site, same downstream pipeline; only the per-bit sampling
+# strategy changes. Default off → DPLL (today's behaviour, byte-identical
+# binary). Enable for on-wire comparison against Niccle-style fixed-stride.
+# See `niccle-comparison-fcs-ceiling` memory + the triage plan.
+decoder-openloop = []
+
 [dependencies]
 critical-section = "1.2.0"
 embedded-hal = "1.0.0"
