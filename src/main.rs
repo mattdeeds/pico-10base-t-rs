@@ -26,10 +26,14 @@ use embedded_hal::digital::OutputPin;
 use heapless::String;
 use rp235x_hal as hal;
 use hal::dma::DMAExt;
+use hal::fugit::{HertzU32, RateExtU32};
 use hal::gpio::FunctionPio0;
 use hal::pio::PIOExt;
 use hal::singleton;
 use hal::Clock; // brings .freq() into scope
+use hal::pll::{setup_pll_blocking, common_configs::PLL_USB_48MHZ, PLLConfig};
+use hal::xosc::setup_xosc_blocking;
+use hal::clocks::ClocksManager;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant;
@@ -48,21 +52,44 @@ pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 /// Pico 2 board has a 12 MHz crystal.
 const XTAL_FREQ_HZ: u32 = 12_000_000u32;
 
+/// Phase 2d v3 — 180 MHz overclock. Buys 3 SM cycles/bit of PIO budget for the
+/// windowed DPLL (15 → 18 cyc/bit), AND gives integer PIO dividers (TX÷9 RX÷3,
+/// no fractional jitter). VCO 1080 MHz / (6 × 1) = 180 MHz. Recovery via SWD
+/// if flash gets corrupted at the higher QMI SCK (the DAPLink probe is
+/// attached; see the `sysclk-integer-pio-dividers` memory).
+const PLL_SYS_180MHZ: PLLConfig = PLLConfig {
+    vco_freq: HertzU32::MHz(1080),
+    refdiv: 1,
+    post_div1: 6,
+    post_div2: 1,
+};
+
 #[hal::entry]
 fn main() -> ! {
     let mut pac = hal::pac::Peripherals::take().unwrap();
 
     let mut watchdog = hal::Watchdog::new(pac.WATCHDOG);
-    let clocks = hal::clocks::init_clocks_and_plls(
-        XTAL_FREQ_HZ,
-        pac.XOSC,
-        pac.CLOCKS,
+    // Manual clock setup so PLL_SYS goes to 180 MHz (vs the hal default 150 MHz).
+    let xosc = setup_xosc_blocking(pac.XOSC, XTAL_FREQ_HZ.Hz()).unwrap();
+    watchdog.enable_tick_generation((XTAL_FREQ_HZ / 1_000_000) as u16);
+    let mut clocks = ClocksManager::new(pac.CLOCKS);
+    let pll_sys = setup_pll_blocking(
         pac.PLL_SYS,
-        pac.PLL_USB,
+        xosc.operating_frequency(),
+        PLL_SYS_180MHZ,
+        &mut clocks,
         &mut pac.RESETS,
-        &mut watchdog,
     )
     .unwrap();
+    let pll_usb = setup_pll_blocking(
+        pac.PLL_USB,
+        xosc.operating_frequency(),
+        PLL_USB_48MHZ,
+        &mut clocks,
+        &mut pac.RESETS,
+    )
+    .unwrap();
+    clocks.init_default(&xosc, &pll_sys, &pll_usb).unwrap();
 
     let sio = hal::Sio::new(pac.SIO);
     let pins = hal::gpio::Pins::new(

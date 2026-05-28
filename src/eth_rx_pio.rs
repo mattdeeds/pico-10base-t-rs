@@ -1,33 +1,38 @@
-//! PIO-side clock-recovery Manchester decoder (Phase 2d v2 — windowed DPLL).
+//! PIO-side clock-recovery Manchester decoder (Phase 2d — DPLL, experimental).
 //!
-//! v1 (sample-by-pin, see git history) decoded valid Manchester (preamble +
-//! 56–141 payload bytes byte-perfect on wire) but slipped on a single
-//! jittered/noise edge because the `wait` had no phase window — it caught the
-//! first edge after a fixed coast. v2 ADDS the windowing half of the design:
-//! the wait is replaced by an explicit poll loop with a phase counter (`set x`
-//! + `jmp x--`). The loop polls for the expected mid-bit edge only in a small
-//! cycle window around its predicted arrival time; if no edge is found, the
-//! program COASTS one bit period (free-runs, preserving the bit clock from the
-//! prior edge) instead of resync-ing to whatever stray edge appeared next.
+//! Replaces the open-loop CPU decoder's drift problem (A1) AND the per-edge
+//! decoders' single-edge-slip problem (fixed-delay `[8]` and interval-
+//! classifier, both ~554 B clean ceiling; Phase 2b/2c, see git history).
 //!
-//! No per-edge alternation state to flip — combined with `in pins, 1` sampling
-//! it gives the offline-validated `decode_dpll_model` behavior: a single bad
-//! edge can shift phase by at most a window-width's worth, but the next bit's
-//! sample still reads the actual line level, so a bit slip stays local instead
-//! of cascading.
+//! **Sample-by-pin DPLL.** The crucial mechanism: the emitted bit value comes
+//! from a direct pin sample (`in pins, 1`) taken at a fixed phase in the bit
+//! period — NOT from an alternation/level state that previous decoders flipped
+//! on a single bad edge. After detecting a mid-bit edge:
+//!   - Cycles 1-4: delay (skip near-edge instability).
+//!   - Cycle 5: `in pins, 1` reads the line level → emit bit (in the bit's 2nd
+//!     half-bit; whatever the line level is, that's the data bit per IEEE 802.3
+//!     Manchester — or its complement on this inverted-pin polarity; the host
+//!     SFD-finder is bi-polarity, so emit polarity is don't-care).
+//!   - Cycles 5-13: delay through the rest of the 2nd half and past the
+//!     potential boundary edge at ~+7.5 cycles.
+//!   - Cycle 14: `jmp pin` reads the *current* line level and branches into
+//!     wait_high or wait_low — at cycle 14 the next mid-bit edge will transition
+//!     the line to its opposite, regardless of whether there was a boundary
+//!     edge in between (case-different: line still at V, next mid-bit flips it
+//!     to !V; case-same: line at !V after boundary, next mid-bit flips it to V).
+//!     Either way: wait for the OPPOSITE of the current level.
+//!   - Cycle 15: `wait` catches the next mid-bit edge, jmp back to top.
 //!
-//! Cycle plan (bit period = 15 SM cycles at 150 MHz, anchor at cycle 0 = just
-//! after a detected mid-bit edge):
-//!   - cycles 1–4 : pre-sample coast
-//!   - cycle 5    : `in pins, 1` SAMPLE → emit bit (level-based, not state)
-//!   - cycles 6–9 : post-sample coast (through boundary edge region ~+7.5)
-//!   - cycle 10   : `jmp pin` reads current line level → pick window path
-//!   - cycle 11   : `set x` loads the window counter
-//!   - cycles 12+ : poll loop (2 cyc/iter via `jmp pin` + `jmp x--`); accepts
-//!                  an edge within ~±jitter of the expected +15 PIO cycle.
-//!   - on edge found → `jmp new_bit` resync (anchor moves to detected edge).
-//!   - on window timeout → coast routine free-runs to next bit's window
-//!                          (preserves the bit clock from the last good edge).
+//! Loop is 15 SM cycles = exactly one bit period at 150 MHz, so the wait stalls
+//! 0-1 cycles at the actual edge — self-clocked. **DPLL ride-through (P2):** a
+//! single jitter-induced edge mis-catch shifts phase by ≤ a few cycles, but the
+//! next bit's `in pins, 1` reads the actual line level — the bit is still right
+//! if the sample lands anywhere in the right half-bit. No alternation state to
+//! cascade-corrupt, unlike the per-edge decoders. Offline-validated as
+//! `decode_dpll_model` in `tools/clock-recovery/harness.py` (holds full-MTU
+//! lock on 2/3 corpus frames, no drift ramp / no tail cliff — see plan §12).
+//!
+//! 7 PIO1 instructions, no `out pc` (no `.origin 0` needed), no clock divider.
 
 use rp235x_hal as hal;
 use hal::pac::PIO1;
@@ -37,67 +42,54 @@ use hal::pio::{
 
 pub type DecRxFifo = Rx<(PIO1, SM0)>;
 
-/// PIO1 SM0 windowed-DPLL Manchester decoder. Holds the running SM.
+/// PIO1 SM0 clock-recovery DPLL decoder. Holds the running SM so it isn't dropped.
 pub struct EthRxPio {
     _sm: StateMachine<(PIO1, SM0), Running>,
 }
 
 impl EthRxPio {
+    /// Install + start the decoder on PIO1 SM0, sampling `rx_pin_id` (must
+    /// already be assigned to a PIO function — GPIO inputs are visible to all
+    /// PIO blocks, so PIO0's funcsel on RXD is fine). Returns the decoder
+    /// handle and the RX FIFO (decoded-byte words, LSB-first).
     pub fn new(
         pio: &mut hal::pio::PIO<PIO1>,
         sm: UninitStateMachine<(PIO1, SM0)>,
         rx_pin_id: u8,
     ) -> (Self, DecRxFifo) {
-        // Windowed-DPLL Manchester decoder. Two-path edge detection (rising
-        // mid-bit when line is currently LOW; falling when HIGH — picked by
-        // `jmp pin` at cycle 10). Each polling iteration is 2 cycles: `jmp pin`
-        // checks the awaited edge condition; `jmp x--` decrements the window
-        // counter. X=2 ⇒ 3 polls @ cycles 12, 14, 16 — a 5-cycle window around
-        // the expected PIO cycle 15 (where the next mid-bit edge becomes visible
-        // through the 2-cycle input synchronizer when the real bit period is 15
-        // SM cycles). The coast routine after a missed edge nudges the loop
-        // toward the next expected window without resync-ing the phase.
+        // Single-path loop (sample-by-pin makes the LOW/HIGH state split
+        // unnecessary — bit value comes from in pins, 1, not from a code branch).
+        // 7 instructions, total 15 SM cycles/iter at the steady-state bit period.
         let program = pio::pio_asm!(
             "sample_path:",
-            "    nop          [2]",          // cycles 1-3
-            "    in pins, 1   [4]",          // cycle 4 SAMPLE; 4 delay → ends cyc 9
-            "    jmp pin, w_low",            // cycle 10: pick window direction
-            // ----- window: line was LOW, waiting for RISING mid-bit edge -----
-            "w_high:",
-            "    set x, 2",                  // cycle 11: 3 polls
-            "poll_h:",
-            "    jmp pin, sync_edge",        // even cycles: check pin HIGH
-            "    jmp x--, poll_h",           // odd cycles: dec & retry
-            "    jmp coast_miss",            // window elapsed
-            // ----- window: line was HIGH, waiting for FALLING mid-bit edge -----
-            "w_low:",
-            "    set x, 2",
-            "poll_l:",
-            "    jmp pin, still_h",          // pin HIGH = no edge yet
-            "    jmp sync_edge",             // pin LOW = falling edge caught
-            "still_h:",
-            "    jmp x--, poll_l",
-            "    jmp coast_miss",
-            // ----- edge found: resync (anchor → detected edge) -----
-            "sync_edge:",
+            "    nop          [2]",   // pre-sample delay (3 cyc total)
+            "    in pins, 1   [7]",   // SAMPLE pin level (2nd half-bit); coast 7 cyc
+            "    jmp pin, wait_low",  // read pin → choose wait direction
+            // Loop totals exactly 15 SM cycles between wait completions = 1 bit
+            // @150 MHz: jmp(1)+nop[2](3)+in[7](8)+jmp_pin(1)+wait(1, stall 1 to
+            // catch edge)+jmp(1) = 16 with the wait stall — the wait STALLS until
+            // the next mid-bit edge transitions the line and the synchronizer
+            // delivers it, so the loop self-clocks to the actual bit rate.
+            "wait_high:",
+            "    wait 1 pin 0",       // wait for rising mid-bit edge
             "    jmp sample_path",
-            // ----- no edge in window: coast one bit, preserve phase -----
-            "coast_miss:",
-            "    nop          [4]",          // free-run a fraction of a bit
+            "wait_low:",
+            "    wait 0 pin 0",       // wait for falling mid-bit edge
             "    jmp sample_path",
         );
 
         let installed = pio.install(&program.program).unwrap();
 
         let (mut sm, rx, _tx) = hal::pio::PIOBuilder::from_installed_program(installed)
-            .in_pin_base(rx_pin_id)
-            .jmp_pin(rx_pin_id)
-            .in_shift_direction(ShiftDirection::Right)
+            .in_pin_base(rx_pin_id) // `in pins, 1` reads this pin
+            .jmp_pin(rx_pin_id)     // `jmp pin` tests this pin's level
+            .in_shift_direction(ShiftDirection::Right) // LSB-first, like frame bytes
             .autopush(true)
             .push_threshold(32)
             .buffers(Buffers::OnlyRx)
             .build(sm);
 
+        // No clock divisor => SM runs at sysclk (150 MHz, ~15 cycles/bit).
         let _ = &mut sm;
         let sm = sm.start();
         (Self { _sm: sm }, rx)

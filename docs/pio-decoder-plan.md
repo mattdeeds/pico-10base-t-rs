@@ -333,3 +333,42 @@ corpus). **Next:** capture a 150 MHz corpus (finer window + idle context) to tun
 window/sample/acquisition, OR go straight to the PIO program and tune acquisition
 on-wire (idle context present) with `pio_dump.py`. The full-MTU-lock result
 de-risks the core idea; acquisition robustness is the remaining open item.
+
+### 12b. DPLL v3 — 180 MHz overclock + v1 (2026-05-28)
+
+**Took option (i) from §12a. Major win on the wire.** Bumped sys_clk to 180 MHz
+(`PLL_SYS_180MHZ`: VCO 1080 / (6·1); manual `setup_pll_blocking`; flash QMI
+auto-handled the 20 % faster SCK with no manual config). Flashed via SWD/DAPLink
+— picotool self-reboot is risky on an overclock since a failed boot would leave
+no USB reset path. Device boots cleanly, ping 4/4 normal RTT, USB enumerated;
+TX/RX dividers become integer (TX÷9, RX÷3 — fractional-jitter gone, bonus).
+
+**v2 at 180 MHz failed** as expected: its polling cycle math was hardcoded for
+15 SM cyc/bit and at 18 the polls land before the expected edge, so v2 never
+catches a real mid-bit edge — output is all-idle `0xff`. (Reverted to v1.)
+
+**v1 at 180 MHz: ~10× improvement.** v1's `wait` auto-syncs to whatever the
+bit period is, so it ports unchanged. On-wire full-MTU (1472 B payload) sample:
+
+| bytes decoded before slip | outcome |
+|---|---|
+| 926 | slip |
+| 960 | slip |
+| 1216 | slip |
+| **1472 (full)** | **FCS-OK** ✓ |
+| **1472 (full)** | **FCS-OK** ✓ |
+
+512 B test: **6/6 FCS-OK, flat 0 % bins across all positions** (was ~0 at v1@150).
+Full-MTU **~40 % FCS-OK**, with partial decodes 926–1216 B for the rest — vs
+v1@150 maxing at 141 B. **P2 met** (flat bins, no cascade); **P1 partial** (~40 %,
+target ≥ 95 %).
+
+**Why:** SM cycle is 20 % finer (5.56 ns vs 6.67 ns) → edge detection and
+sample-by-pin land both with proportionally better timing resolution. The slip
+events are jitter-limited; finer resolution pushes the slip threshold from
+141 B out to ≥ 926 B, with a tail of full-MTU successes.
+
+**To push toward ≥ 95 % full-MTU:** sweep v1's `in pins, 1 [7]` delay at 18 cyc/bit
+(may benefit from tuning to e.g. `[10]`); redesign v2's polling cycle math for
+18 cyc/bit; or pivot to the CPU DPLL on the 2nd Hazard3 core (Phase-1 edge-track,
+sidesteps PIO timing).
