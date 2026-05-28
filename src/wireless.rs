@@ -20,6 +20,7 @@
 //! reviewable before the Pico 2 W arrives" milestone.
 
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicU32, Ordering};
 use core::task::Waker;
 
 use critical_section::Mutex;
@@ -30,6 +31,178 @@ use embassy_time_queue_utils::Queue;
 use rp235x_hal as hal;
 
 // =====================================================================
+// 0. Synchronous gSPI bring-up probe (R13 first on-board milestone)
+// =====================================================================
+//
+// Before the full async cyw43 stack, prove the most uncertain things — the
+// pin map, the power sequence, and our understanding of the gSPI protocol —
+// with a slow software bit-bang that reads the CYW43's bus *test register*
+// (REG_BUS_TEST_RO = 0x14), which must read back `0xFEEDBEAD`. The result is
+// stashed in `CYW43_PROBE` and logged over the existing 10BASE-T CDC/UDP
+// telemetry (this probe runs inside the normal production build, gated by the
+// `wireless` feature — so we keep that telemetry instead of needing USB-in-async
+// or LED visibility). Once this reads 0xFEEDBEAD, the transport is proven and we
+// move the same wire format onto the PIO1 gSPI program + the async cyw43 driver.
+//
+// Pico 2 W CYW43 pins (fixed on the PCB): GP23 = WL_ON (power), GP24 = DATA
+// (bidir gSPI), GP25 = CS, GP29 = CLK.
+
+/// Result of the last gSPI test-register probe. 0 = not run; otherwise the
+/// (byte-order-corrected) value read — `0xFEEDBEAD` means the bus is alive.
+pub static CYW43_PROBE: AtomicU32 = AtomicU32::new(0);
+/// First read of the probe loop + a "all 64 reads identical?" flag, for
+/// diagnosis: first==last & stable ⇒ chip driving a mis-framed value (timing);
+/// varying ⇒ DATA floating / chip not responding (power/setup).
+pub static CYW43_PROBE_FIRST: AtomicU32 = AtomicU32::new(0);
+pub static CYW43_PROBE_STABLE: AtomicU32 = AtomicU32::new(0);
+
+const PIN_PWR: u32 = 23;
+const PIN_DATA: u32 = 24;
+const PIN_CS: u32 = 25;
+const PIN_CLK: u32 = 29;
+/// Half-clock-phase spin (~0.25 µs @ 240 MHz → ~2 MHz gSPI). Slow + safe for
+/// bring-up; the real PIO transport will run far faster.
+const PHASE: u32 = 60;
+
+#[inline]
+fn cmd_word(write: bool, incr: bool, func: u32, addr: u32, len: u32) -> u32 {
+    (write as u32) << 31 | (incr as u32) << 30 | (func & 0b11) << 28 | (addr & 0x1_FFFF) << 11
+        | (len & 0x7FF)
+}
+#[inline]
+fn swap16(x: u32) -> u32 {
+    x.rotate_left(16)
+}
+
+// Raw SIO/IO_BANK0/PADS_BANK0 GPIO bit-banging — the probe doesn't consume the
+// typed HAL pins (avoids the ownership tangle with the production `led` on
+// GP25); it poetically pokes the registers directly. Experimental + gated.
+#[inline]
+fn gpio_set(n: u32) {
+    unsafe { (*hal::pac::SIO::ptr()).gpio_out_set().write(|w| w.bits(1 << n)) };
+}
+#[inline]
+fn gpio_clr(n: u32) {
+    unsafe { (*hal::pac::SIO::ptr()).gpio_out_clr().write(|w| w.bits(1 << n)) };
+}
+#[inline]
+fn gpio_oe(n: u32, output: bool) {
+    let sio = unsafe { &*hal::pac::SIO::ptr() };
+    if output {
+        sio.gpio_oe_set().write(|w| unsafe { w.bits(1 << n) });
+    } else {
+        sio.gpio_oe_clr().write(|w| unsafe { w.bits(1 << n) });
+    }
+}
+#[inline]
+fn gpio_read(n: u32) -> u32 {
+    (unsafe { (*hal::pac::SIO::ptr()).gpio_in().read().bits() } >> n) & 1
+}
+
+/// Route a pin to SIO function and de-isolate its pad (RP2350 pads power up
+/// isolated — the `iso` bit must be cleared before use). `ie` enabled so we can
+/// also read it (for the bidirectional DATA line).
+fn gpio_to_sio(n: u32) {
+    let io = unsafe { &*hal::pac::IO_BANK0::ptr() };
+    let pads = unsafe { &*hal::pac::PADS_BANK0::ptr() };
+    pads.gpio(n as usize).modify(|_, w| {
+        w.ie().set_bit();
+        w.od().clear_bit();
+        w.iso().clear_bit()
+    });
+    io.gpio(n as usize)
+        .gpio_ctrl()
+        .write(|w| unsafe { w.funcsel().bits(5) }); // 5 = SIO
+}
+
+/// One gSPI command+read transaction, bit-banged. Clocks `cmd` out MSB-first on
+/// DATA (chip latches on the rising CLK edge), turns the line around, then
+/// clocks 32 bits back in (sampled while CLK high). CS held low throughout.
+fn bitbang_cmd_read(cmd: u32) -> u32 {
+    gpio_clr(PIN_CS); // CS low — start transaction
+    hal::arch::delay(PHASE);
+
+    // --- write 32 cmd bits, MSB first ---
+    gpio_oe(PIN_DATA, true);
+    for i in (0..32).rev() {
+        if (cmd >> i) & 1 != 0 {
+            gpio_set(PIN_DATA);
+        } else {
+            gpio_clr(PIN_DATA);
+        }
+        hal::arch::delay(PHASE);
+        gpio_set(PIN_CLK); // rising edge latches the bit
+        hal::arch::delay(PHASE);
+        gpio_clr(PIN_CLK);
+    }
+
+    // --- turnaround: DATA becomes an input ---
+    gpio_oe(PIN_DATA, false);
+    hal::arch::delay(PHASE);
+
+    // --- read 32 bits, MSB first (sample while CLK high) ---
+    let mut r: u32 = 0;
+    for _ in 0..32 {
+        gpio_set(PIN_CLK);
+        hal::arch::delay(PHASE);
+        r = (r << 1) | gpio_read(PIN_DATA);
+        gpio_clr(PIN_CLK);
+        hal::arch::delay(PHASE);
+    }
+
+    gpio_set(PIN_CS); // CS high — end transaction
+    r
+}
+
+/// R13 bring-up probe: power the CYW43, read its bus test register, stash the
+/// result in [`CYW43_PROBE`]. Synchronous; call once at boot (it spins ~270 ms
+/// for the power-up sequence). Reads `0xFEEDBEAD` iff the transport + chip are
+/// alive. Uses `arch::delay` for timing (no Timer needed).
+pub fn probe_cyw43() {
+    // Pins: CLK/CS/PWR as outputs (CS + CLK idle high/low), DATA starts output.
+    for &n in &[PIN_CLK, PIN_CS, PIN_PWR, PIN_DATA] {
+        gpio_to_sio(n);
+        gpio_oe(n, true);
+    }
+    gpio_clr(PIN_CLK);
+    gpio_set(PIN_CS); // CS idle high
+    gpio_clr(PIN_DATA);
+
+    // Power-cycle WL_ON: low 20 ms, high, settle 250 ms (matches cyw43 init).
+    let ms = |n: u32| hal::arch::delay(n.saturating_mul(240_000)); // ~ms @ 240 MHz
+    gpio_clr(PIN_PWR);
+    ms(20);
+    gpio_set(PIN_PWR);
+    ms(250);
+
+    // read32_swapped(FUNC_BUS=0, REG_BUS_TEST_RO=0x14) — the initial gSPI mode
+    // is 16-bit-swapped, so swap the cmd and the result (per cyw43 spi.rs). The
+    // real driver loops `while != FEEDBEAD` because the bus can take a few reads
+    // to settle after power-up — do the same, reporting if it ever latches.
+    let cmd = swap16(cmd_word(false /*read*/, true /*incr*/, 0, 0x14, 4));
+    let mut last = 0u32;
+    let mut first = 0u32;
+    let mut stable = true;
+    for i in 0..64 {
+        let v = swap16(bitbang_cmd_read(cmd));
+        if i == 0 {
+            first = v;
+        } else if v != last {
+            stable = false; // some read differed from the previous → DATA varying
+        }
+        last = v;
+        if v == 0xFEED_BEAD {
+            break;
+        }
+        hal::arch::delay(24_000); // ~100 µs between attempts
+    }
+    // 0xDEAD0000 = ran but read all-zero; otherwise the last value (FEEDBEAD = win).
+    CYW43_PROBE.store(if last == 0 { 0xDEAD_0000 } else { last }, Ordering::Relaxed);
+    CYW43_PROBE_FIRST.store(first, Ordering::Relaxed);
+    CYW43_PROBE_STABLE.store(stable as u32, Ordering::Relaxed);
+}
+
+// =====================================================================
 // 1. embassy-time driver on RP2350 TIMER0
 // =====================================================================
 //
@@ -38,6 +211,8 @@ use rp235x_hal as hal;
 // no scaling is needed. ALARM0 (+ TIMER0_IRQ_0) drives the wakeups.
 
 /// We drive wakeups off TIMER0 ALARM0 → the TIMER0_IRQ_0 line.
+// Part of the async-runtime scaffolding (not used by the sync bring-up probe).
+#[allow(dead_code)]
 const ALARM_IRQ: hal::pac::Interrupt = hal::pac::Interrupt::TIMER0_IRQ_0;
 
 struct RpTimeDriver {
@@ -201,6 +376,9 @@ async fn heartbeat() {
 /// # Safety
 /// Call once, from a single core, after clocks + TIMER0 are running. The caller
 /// must not also be using TIMER0 ALARM0 / `TIMER0_IRQ_0`.
+// Async-runtime entry — validated-compiling future infra for the async cyw43
+// path; the current R13 milestone uses the sync `probe_cyw43` above instead.
+#[allow(dead_code)]
 pub unsafe fn run_executor() -> ! {
     // Let the time-driver's ALARM0 fire on this core.
     hal::arch::interrupt_unmask(ALARM_IRQ);

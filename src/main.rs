@@ -125,10 +125,6 @@ extern "C" fn core1_entry() -> ! {
 }
 
 #[hal::entry]
-// Under `--features wireless` the early handoff to the async executor diverges,
-// making the 10BASE-T setup below unreachable — that's intentional (the
-// wireless build is an R13 experiment, not the production firmware).
-#[cfg_attr(feature = "wireless", allow(unreachable_code, unused_variables, unused_mut))]
 fn main() -> ! {
     let mut pac = hal::pac::Peripherals::take().unwrap();
 
@@ -168,13 +164,12 @@ fn main() -> ! {
 
     let timer = hal::Timer::new_timer0(pac.TIMER0, &mut pac.RESETS, &clocks);
 
-    // R13 wireless-experiment build: clocks + TIMER0 are up, so hand off to the
-    // async executor (cyw43 + the router will live there). Never returns — the
-    // 10BASE-T/USB setup below is skipped. Production (wireless off) is unchanged.
+    // R13 — gSPI bring-up probe (gated). Powers the CYW43 and bit-bangs a read
+    // of its bus test register (want 0xFEEDBEAD); the result is logged over the
+    // existing CDC/UDP telemetry by `log_status`. Runs once at boot (~270 ms),
+    // then the normal 10BASE-T loop continues so we keep that telemetry.
     #[cfg(feature = "wireless")]
-    unsafe {
-        wireless::run_executor()
-    }
+    wireless::probe_cyw43();
 
     // GP14 → ISL3177E DI, GP13 → ISL3177E RO. Reassign both to PIO0 function.
     let _tx_pin: hal::gpio::Pin<_, FunctionPio0, _> = pins.gpio14.into_function();
@@ -585,6 +580,21 @@ fn log_status<B: UsbBus>(
         CORE1_TICKS.load(Ordering::Relaxed),
     );
     let _ = serial.write(line.as_bytes());
+
+    // R13 — gSPI bring-up probe result (wireless build only). 0xFEEDBEAD = the
+    // CYW43 bus is alive and our transport understands the gSPI protocol.
+    #[cfg(feature = "wireless")]
+    {
+        line.clear();
+        let _ = writeln!(
+            line,
+            "[Cyw43] test_reg=0x{:08x} first=0x{:08x} stable={} (want 0xFEEDBEAD)",
+            wireless::CYW43_PROBE.load(Ordering::Relaxed),
+            wireless::CYW43_PROBE_FIRST.load(Ordering::Relaxed),
+            wireless::CYW43_PROBE_STABLE.load(Ordering::Relaxed),
+        );
+        let _ = serial.write(line.as_bytes());
+    }
 
     // Snapshot the IRQ-managed RX stats (also resets the window-scoped fields).
     let rx = eth_mac::snapshot_rx_stats();
