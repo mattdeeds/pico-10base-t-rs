@@ -4,18 +4,18 @@ Checkpoint for picking up the Rust port of [Pico-10BASE-T](../Pico-10BASE-T/) af
 
 For the C reference and the proven Manchester / decoder design, see [`../Pico-10BASE-T/RESUME.md`](../Pico-10BASE-T/RESUME.md) and [`../Pico-10BASE-T/CLAUDE.md`](../Pico-10BASE-T/CLAUDE.md).
 
-## 👉 Next session — start here: merge the multicore-RX stack, or polish (true CD / NAT)
+## 👉 Next session — start here: the router proper (NAT / wireless / DHCP), or optional MAC polish
 
-**The multicore RX is DONE and a net win on every axis (2026-05-28).** Phases 3a→3e take the R11 23× collapse to a *consistent ≥-baseline-with-headroom* result. The stack lives on branch **`r12e-collision-avoidance`** (contains 3a+3c+3d+3e); only 3a is on `main` so far.
+**The multicore RX is DONE, a net win on every axis, and MERGED to `main` (2026-05-28, `8883e05`).** Phases 3a→3e turned the R11 23× collapse into a *consistent ≥-baseline-with-headroom* result. `main` now runs the multicore RX + carrier-sense + CSMA/CA backoff in production.
 
-- **3a** multicore foundation ✅ (merged to `main`; §9f).
+- **3a** multicore foundation ✅ — Hazard3 RISC-V core-1 launch (`src/multicore_riscv.rs`; §9f).
 - **3c** RX decode on core 1 ✅ — fixed CPU starvation; revealed carrier-sense (not core separation) is the real TCP lever (§9g).
-- **3d** PIO carrier-sense ✅ — carrier-detect SM (PIO0 SM2) + `wait_carrier_idle` before TX; recovered idle to 114–914, collisions ~30→~4.5 (§9h).
+- **3d** PIO carrier-sense ✅ — carrier-detect SM (PIO0 SM2) + `wait_carrier_idle` before TX (§9h).
 - **3e** CSMA/CA backoff + 32 KB TCP window ✅ — `csma_acquire()` random backoff in `send_raw_frame` + larger send window so residual losses fast-retransmit instead of RTO-stall (§9i).
 
-**Final on-wire (240 MHz, http-bulk-test), Phase 3e vs single-core `main`:**
+**Final on-wire (240 MHz, http-bulk-test), merged stack vs the old single-core:**
 
-| Metric | single-core | **Phase 3e** |
+| Metric | single-core (pre-R12) | **now (R12e)** |
 |---|---|---|
 | Idle 1 MB curl | 596 stable | **500–987, avg 742** (> baseline) |
 | Blast 1 MB curl (50 pps) | 26 | **251–988** (10–38×) |
@@ -23,14 +23,13 @@ For the C reference and the proven Manchester / decoder design, see [`../Pico-10
 | ping / UDP echo | 100% | **100% / 10-10** |
 | CPU starvation under load | yes | **fixed** |
 
-**Decision pending: merge `r12e-collision-avoidance` → `main`?** It's a strict improvement (higher idle throughput, no starvation, 10–38× under stress, same reliability). The default (non-http-bulk) production build gets the multicore RX + carrier-sense + CSMA backoff (the 32 KB window is http-bulk-test-only). Recommend merging.
+The merged feature branches (`r12c`/`r12d`/`r12e`) can be deleted now that `main` has the squash-free fast-forward history. The `project-vision-router` goal is now unblocked on the throughput/starvation front — **next is the router proper: NAT/forwarding, the wireless interface, DHCP.**
 
-**Optional polish (none are blockers):**
+**Optional MAC polish (none are blockers — already above baseline):**
 1. **True per-bit collision-*detect*** (abort+jam mid-frame) — would kill the last ~0.5 coll/curl + the bimodal ~500 lows. Hard/fragile PIO (RO-vs-DI per-cycle compare; loopback-latch schemes have false-positive windows — see §9i). Future polish.
 2. **Tune** the CSMA backoff window / TX-window size; bump the *default*-build TCP buffers if real forwarded traffic needs throughput.
-3. Then the router proper: **NAT/forwarding, the wireless interface, DHCP** (see `project-vision-router`).
 
-**Working state:** `main` = single-core 596 baseline; `r12e-collision-avoidance` = the full win. Device currently has the 3e http-bulk-test build flashed. To run the production build: `git checkout r12e-collision-avoidance && cargo run --release`.
+**Working state:** `main` = the full multicore-RX win (`8883e05`). Device has the **default production build** of `main` flashed (verified: core 1 up, ping 100%, curl 200, UDP 10/10). For throughput measurement, rebuild with `cargo run --release --features http-bulk-test`.
 
 ## Where we are
 
