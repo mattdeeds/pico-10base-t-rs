@@ -21,6 +21,22 @@ diag = []
 # See `niccle-comparison-fcs-ceiling` memory + the triage plan.
 decoder-openloop = []
 
+# A/B experiment knob (FCS-ceiling triage, experiment 5): drop the PIO
+# sampler from 60 MHz (3 samples/half-bit) to 20 MHz (1 sample/half-bit),
+# matching Niccle's digital pipeline exactly. Auto-implies decoder-openloop
+# because edge-tracking is meaningless at 1 sample/half-bit. Tests whether
+# the 60 MHz oversampling itself is what's exposing us to transient noise
+# the 20 MHz fixed-stride pipeline physically can't see. See the triage plan.
+sample-rate-20mhz = ["decoder-openloop"]
+
+# A/B experiment knob (FCS-ceiling triage, experiment 6): drop sys_clk from
+# the R10 240 MHz overclock back to the HAL stock 150 MHz. At 150 MHz the
+# PIO dividers go back to fractional (RX ÷2.5, TX ÷7.5, ±3.3 ns jitter) but
+# we lose any second-order supply-noise / VREG-margin contribution of the
+# overclock. Combine with other features to map the 6-cell decoder × clock
+# matrix (DPLL vs openloop vs 20 MHz openloop, each at 240 and 150 MHz).
+clock-150mhz = []
+
 [dependencies]
 critical-section = "1.2.0"
 embedded-hal = "1.0.0"

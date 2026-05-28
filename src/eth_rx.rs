@@ -23,8 +23,29 @@ use hal::pio::{
 #[cfg(feature = "decoder-openloop")]
 use crate::eth_mac::MAX_FRAME_BYTES;
 
-/// Sample rate — 3 samples per Manchester half-bit (half-bit = 50 ns @ 10 Mbps).
+/// Sample rate. Default: 60 MHz = 3 samples per Manchester half-bit
+/// (half-bit = 50 ns @ 10 Mbps). With `--features sample-rate-20mhz` the
+/// PIO sampler runs at 20 MHz = 1 sample per half-bit (Niccle's pipeline),
+/// which is the Nyquist minimum and disables any per-bit edge tracking —
+/// hence the feature also forces the open-loop decoder.
+#[cfg(not(feature = "sample-rate-20mhz"))]
 pub const SAMPLE_HZ: u32 = 60_000_000;
+#[cfg(feature = "sample-rate-20mhz")]
+pub const SAMPLE_HZ: u32 = 20_000_000;
+
+/// Samples per data bit and the in-bit center offset, derived from `SAMPLE_HZ`.
+/// At 60 MHz: 6 samples/bit, midpoint of HB[1] = bit-start + 4 (= half-bit
+/// width 3 + offset 1 into the second half). At 20 MHz: 2 samples/bit, "center"
+/// of HB[1] = bit-start + 1.
+#[cfg(not(feature = "sample-rate-20mhz"))]
+const SAMPLES_PER_BIT: usize = 6;
+#[cfg(feature = "sample-rate-20mhz")]
+const SAMPLES_PER_BIT: usize = 2;
+
+#[cfg(not(feature = "sample-rate-20mhz"))]
+const HB1_CENTER_OFFSET: usize = 4;
+#[cfg(feature = "sample-rate-20mhz")]
+const HB1_CENTER_OFFSET: usize = 1;
 
 /// Words per half-buffer. 4096 u32 = 16 KB = 16384 bytes = ~2.18 ms of audio.
 pub const BUF_WORDS: usize = 4096;
@@ -33,11 +54,12 @@ pub const BUF_BYTES: usize = BUF_WORDS * 4;
 
 /// Maximum trailing-active bytes we carry from one DMA half into the next so
 /// frames straddling the boundary aren't truncated. A max-sized Ethernet
-/// frame (1518 bytes) + preamble/SFD (8) = 1526 data bytes × 6 sample-bytes
-/// per data byte ≈ 9.2 KB on the wire. 16 KB gives ample slack for TP_IDL
-/// straggle + a few NLPs trailing into the carry. Bumped from 12 KB after
-/// post-R5 telemetry suggested a small fraction of frames were getting their
-/// preamble clipped at the cap (see `carry_capped` on `EthRx`).
+/// frame (1518 bytes) + preamble/SFD (8) = 1526 data bytes. At 60 MHz (default)
+/// that's × 6 sample-bytes per data byte ≈ 9.2 KB; at 20 MHz it's ≈ 3 KB.
+/// 16 KB gives ample slack for TP_IDL straggle + a few NLPs trailing into
+/// the carry. Bumped from 12 KB after post-R5 telemetry suggested a small
+/// fraction of frames were getting their preamble clipped at the cap (see
+/// `carry_capped` on `EthRx`).
 pub const MAX_CARRY_BYTES: usize = 16 * 1024;
 
 /// Stitch buffer = prior half's trailing active tail + the just-finished half.
@@ -91,14 +113,16 @@ fn find_first_falling_edge(bytes: &[u8], base_bit: usize, nsamples: usize) -> Op
 }
 
 /// The phase-locked data bit at logical half-bit index `k`: the sample at
-/// `F + 4 + 6k` (the midpoint of the second half-bit of Manchester pair k —
-/// 3 samples per half-bit). Returns `None` once that sample would fall past
-/// `nsamples`, i.e. the run ran out before bit `k`. This is the per-bit
-/// primitive the single-pass decoder reads on demand, instead of
-/// materializing every bit into an intermediate `Vec`.
+/// `F + HB1_CENTER_OFFSET + SAMPLES_PER_BIT * k` (the midpoint of the second
+/// half-bit of Manchester pair k). Stride/offset come from `SAMPLE_HZ` —
+/// default 60 MHz gives F+4+6k, the `sample-rate-20mhz` feature gives F+1+2k.
+/// Returns `None` once that sample would fall past `nsamples`, i.e. the run
+/// ran out before bit `k`. This is the per-bit primitive the single-pass
+/// decoder reads on demand, instead of materializing every bit into an
+/// intermediate `Vec`.
 #[inline]
 fn data_bit(bytes: &[u8], base_bit: usize, f: usize, k: usize, nsamples: usize) -> Option<u8> {
-    let idx = f + 4 + 6 * k;
+    let idx = f + HB1_CENTER_OFFSET + SAMPLES_PER_BIT * k;
     if idx >= nsamples {
         None
     } else {
@@ -353,9 +377,9 @@ impl EthRx {
         // with a striding offset and no per-bit bound check or `Option`.
         let start_bit = sfd_end + 1;
         let limit = base_bit + nsamples;
-        let first_off = base_bit + f + 4 + 6 * start_bit;
+        let first_off = base_bit + f + HB1_CENTER_OFFSET + SAMPLES_PER_BIT * start_bit;
         let avail_bits = if first_off < limit {
-            (limit - 1 - first_off) / 6 + 1
+            (limit - 1 - first_off) / SAMPLES_PER_BIT + 1
         } else {
             0
         };
@@ -385,7 +409,7 @@ impl EthRx {
                 // buffer), so off >> 3 < bytes.len() for every read.
                 let s = (unsafe { *bytes.get_unchecked(off >> 3) } >> (off & 7)) & 1;
                 byte |= s << j;
-                off += 6;
+                off += SAMPLES_PER_BIT;
             }
             // nframe <= MAX_FRAME_BYTES == capacity, so this never fails.
             let _ = frame.push(byte);

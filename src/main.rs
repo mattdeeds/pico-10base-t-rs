@@ -35,6 +35,8 @@ use hal::pio::PIOExt;
 use hal::singleton;
 use hal::Clock; // brings .freq() into scope
 use hal::pll::{setup_pll_blocking, common_configs::PLL_USB_48MHZ, PLLConfig};
+#[cfg(feature = "clock-150mhz")]
+use hal::pll::common_configs::PLL_SYS_150MHZ;
 use hal::xosc::setup_xosc_blocking;
 use hal::clocks::ClocksManager;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
@@ -55,11 +57,12 @@ pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 /// Pico 2 board has a 12 MHz crystal.
 const XTAL_FREQ_HZ: u32 = 12_000_000u32;
 
-/// Phase 2d v3 — 240 MHz overclock. Buys 3 SM cycles/bit of PIO budget for the
-/// windowed DPLL (18 → 24 cyc/bit), AND gives integer PIO dividers (TX÷9 RX÷3,
-/// no fractional jitter). VCO 1080 MHz / (6 × 1) = 180 MHz. Recovery via SWD
-/// if flash gets corrupted at the higher QMI SCK (the DAPLink probe is
-/// attached; see the `sysclk-integer-pio-dividers` memory).
+/// Phase 2d v3 — 240 MHz overclock. VCO 1200 MHz / (5 × 1) = 240 MHz.
+/// Integer PIO dividers at this clock: TX 20 MHz = ÷12, RX 60 MHz = ÷4
+/// (no fractional jitter). Recovery via SWD if flash gets corrupted at the
+/// higher QMI SCK (the DAPLink probe is attached; see the
+/// `sysclk-integer-pio-dividers` memory).
+#[cfg_attr(feature = "clock-150mhz", allow(dead_code))]
 const PLL_SYS_240MHZ: PLLConfig = PLLConfig {
     vco_freq: HertzU32::MHz(1200),
     refdiv: 1,
@@ -67,19 +70,30 @@ const PLL_SYS_240MHZ: PLLConfig = PLLConfig {
     post_div2: 1,
 };
 
+/// Cargo feature `clock-150mhz` selects the HAL's stock 150 MHz PLL config
+/// instead of the 240 MHz overclock — for the FCS-ceiling triage (experiment
+/// 6: rule overclock side-effects in or out as a contributor). At 150 MHz
+/// the PIO dividers go back to fractional (RX ÷2.5, TX ÷7.5, ±3.3 ns jitter).
+#[cfg(not(feature = "clock-150mhz"))]
+const PLL_SYS_SELECTED: PLLConfig = PLL_SYS_240MHZ;
+#[cfg(feature = "clock-150mhz")]
+const PLL_SYS_SELECTED: PLLConfig = PLL_SYS_150MHZ;
+
 #[hal::entry]
 fn main() -> ! {
     let mut pac = hal::pac::Peripherals::take().unwrap();
 
     let mut watchdog = hal::Watchdog::new(pac.WATCHDOG);
-    // Manual clock setup so PLL_SYS goes to 180 MHz (vs the hal default 150 MHz).
+    // PLL_SYS config selected by the `clock-150mhz` cargo feature:
+    // default = 240 MHz overclock (integer PIO dividers), feature-on = the
+    // HAL stock 150 MHz (fractional PIO dividers, ±3.3 ns jitter).
     let xosc = setup_xosc_blocking(pac.XOSC, XTAL_FREQ_HZ.Hz()).unwrap();
     watchdog.enable_tick_generation((XTAL_FREQ_HZ / 1_000_000) as u16);
     let mut clocks = ClocksManager::new(pac.CLOCKS);
     let pll_sys = setup_pll_blocking(
         pac.PLL_SYS,
         xosc.operating_frequency(),
-        PLL_SYS_240MHZ,
+        PLL_SYS_SELECTED,
         &mut clocks,
         &mut pac.RESETS,
     )
