@@ -1,0 +1,13 @@
+[package]
+name = "dpll-rust"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Phase 3b — host-side offline validator for the Rust port of decode_edge_track.
+# Standalone package (not part of the firmware workspace) so it compiles for
+# the host with std. The decoder source itself is shared via `#[path]` include
+# (see src/main.rs) — single source of truth, the firmware uses the same code.
+
+[dependencies]
+heapless = "0.8"

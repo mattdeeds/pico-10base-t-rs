@@ -14,6 +14,8 @@ mod crc;
 mod eth_mac;
 mod eth_rx;
 mod eth_rx_pio; // TEMP (Phase 2b): experimental PIO clock-recovery decoder
+#[allow(dead_code)]
+mod eth_rx_dpll; // Phase 3b: CPU edge-track DPLL decoder (validated via tools/dpll-rust)
 mod eth_tx;
 mod manchester;
 mod pico_reset;

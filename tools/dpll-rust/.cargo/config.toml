@@ -1,0 +1,4 @@
+# Override the parent project's .cargo/config.toml RISC-V target — this is a
+# host-side validator that runs on Linux, not the device.
+[build]
+target = "x86_64-unknown-linux-gnu"
