@@ -14,7 +14,7 @@
 use rp235x_hal as hal;
 use hal::pac::PIO0;
 use hal::pio::{
-    PinDir, PinState, Running, ShiftDirection, StateMachine, Tx, SM0, UninitStateMachine,
+    PinDir, PinState, Running, ShiftDirection, StateMachine, Tx, SM0, SM2, UninitStateMachine,
 };
 
 use crate::manchester::MANCHESTER_TABLE;
@@ -33,10 +33,26 @@ pub struct UdpEndpoint {
 /// preamble(7) + SFD(1) + eth(14) + ip(20) + udp(8) + payload(<=1472) + FCS(4).
 const MAX_TX_FRAME: usize = 1526;
 
+/// Host-visible PIO IRQ flag the carrier-detect SM raises while RO (GP13) is
+/// active. Flags 0–3 are readable by the CPU; we don't enable its system
+/// interrupt, so it's purely a status bit the TX path polls. See
+/// `carrier_present` / `wait_carrier_idle`.
+const CARRIER_IRQ_FLAG: u8 = 0;
+
+/// Upper bound on how long a `send_*` call will defer for carrier (Phase 3d).
+/// Generous enough to wait out a full-MTU frame in flight (~1.2 ms), but
+/// bounded so a stuck-busy flag (RO noise / detector bug) degrades to
+/// "no carrier-sense" rather than wedging TX entirely. Counted in poll
+/// iterations of the PIO IRQ register, not wall-clock — rough by design.
+const CARRIER_WAIT_SPINS: u32 = 200_000;
+
 /// PIO TX state machine handle. We hold onto the running StateMachine so that
 /// Rust's type-state ownership doesn't drop it (which would be a footgun).
 pub struct EthTx {
     _sm: StateMachine<(PIO0, SM0), Running>,
+    /// Carrier-detect SM (Phase 3d). Runs autonomously watching RO; we only
+    /// keep the handle alive so it isn't dropped (which would stop the SM).
+    _cs_sm: StateMachine<(PIO0, SM2), Running>,
     tx: Tx<(PIO0, SM0)>,
     ip_identifier: u16,
     /// Scratch buffer the UDP broadcast builder assembles into before the
@@ -46,13 +62,16 @@ pub struct EthTx {
 }
 
 impl EthTx {
-    /// Initialize the TX PIO program and state machine on PIO0 SM0.
-    /// `tx_pin_id` is the GPIO that drives the ISL3177E DI input (= GP14 here).
-    /// `sys_clk_hz` is the clk_sys frequency, used to derive the PIO divider.
+    /// Initialize the TX PIO program (PIO0 SM0) + the carrier-detect SM
+    /// (PIO0 SM2, Phase 3d). `tx_pin_id` drives the ISL3177E DI input
+    /// (= GP14); `rx_pin_id` is the RO line (= GP13) the carrier detector
+    /// watches. `sys_clk_hz` is clk_sys, used for both PIO dividers.
     pub fn new(
         pio: &mut hal::pio::PIO<PIO0>,
         sm: UninitStateMachine<(PIO0, SM0)>,
+        cs_sm: UninitStateMachine<(PIO0, SM2)>,
         tx_pin_id: u8,
+        rx_pin_id: u8,
         sys_clk_hz: u32,
     ) -> Self {
         // PIO program: 1-bit side-set, dispatches IDLE/LOW/HIGH based on the
@@ -91,12 +110,87 @@ impl EthTx {
         sm.set_pindirs([(tx_pin_id, PinDir::Output)]);
         let sm = sm.start();
 
+        // --- Phase 3d: carrier-detect state machine (PIO0 SM2) ---
+        //
+        // Watches RO (GP13) and raises host-visible PIO IRQ flag 0 while the
+        // line is *active* (toggling = a frame on the wire), clearing it once
+        // the line has been *stable* for GUARD samples (idle). 10BASE-T idle
+        // is a steady level (the RX `find_active_run` logic relies on idle
+        // bytes being 0x00/0xFF), so "carrier present" == "transitions seen
+        // recently". The TX path polls this flag before grabbing the wire,
+        // restoring the carrier-sense that Phase 3c's multicore RX removed
+        // (gotcha #10). Detection lives in PIO; the TX gate is in software.
+        //
+        // GUARD = 8 iterations × 2 cyc @ 60 MHz ≈ 267 ns of quiet ⇒ idle.
+        // The max gap between edges in live Manchester is one bit (100 ns ≈
+        // 3 iterations), so GUARD=8 never falsely declares idle mid-frame yet
+        // releases TX quickly once a frame ends.
+        let cs_program = pio::pio_asm!(
+            "restart:",
+            "    set x, 8",            // GUARD: stable-sample countdown
+            "    jmp pin, track_high", // branch on current RO level
+            "track_low:",
+            "    jmp pin, edge",       // RO went high while low ⇒ edge
+            "    jmp x--, track_low",  // still low; count down
+            "    jmp idle",            // stable low for GUARD ⇒ idle
+            "track_high:",
+            "    jmp pin, high_cont",  // still high
+            "    jmp edge",            // RO went low ⇒ edge
+            "high_cont:",
+            "    jmp x--, track_high",
+            "    jmp idle",
+            "edge:",
+            "    irq set 0",           // carrier present (busy)
+            "    jmp restart",
+            "idle:",
+            "    irq clear 0",         // line idle
+            "    jmp restart",
+        );
+        let cs_installed = pio.install(&cs_program.program).unwrap();
+        // 60 MHz, same as the RX sampler — fine edge resolution for GUARD.
+        let (cs_div_int, cs_div_frac) = crate::pio_util::clock_divider(sys_clk_hz, 60_000_000.0);
+        let (mut cs_sm, _cs_rx, _cs_tx) = hal::pio::PIOBuilder::from_installed_program(cs_installed)
+            .jmp_pin(rx_pin_id)
+            .clock_divisor_fixed_point(cs_div_int, cs_div_frac)
+            .build(cs_sm);
+        // RO is an input (driven by the ISL3177E). Set it explicitly so the
+        // detector reads a valid level even before EthRx::new configures it.
+        cs_sm.set_pindirs([(rx_pin_id, PinDir::Input)]);
+        let cs_sm = cs_sm.start();
+
         Self {
             _sm: sm,
+            _cs_sm: cs_sm,
             tx,
             ip_identifier: 0,
             raw_frame: [0; MAX_TX_FRAME],
         }
+    }
+
+    /// Is the carrier-detect SM currently reporting RO activity (a frame on
+    /// the wire)? Reads the host-visible PIO IRQ flag the SM maintains.
+    #[inline]
+    fn carrier_present() -> bool {
+        // Safety: read-only access to PIO0's IRQ status register.
+        let pio = unsafe { &*hal::pac::PIO0::ptr() };
+        (pio.irq().read().irq().bits() & (1 << CARRIER_IRQ_FLAG)) != 0
+    }
+
+    /// Carrier-sense: spin until the wire is idle (or the timeout fires).
+    /// Call before grabbing the wire for a frame so we don't transmit on top
+    /// of an in-flight host frame (collision). Bounded so a stuck-busy flag
+    /// degrades to "transmit anyway" rather than wedging TX. Returns the
+    /// number of spins spent waiting (0 = wire was already idle).
+    #[inline]
+    fn wait_carrier_idle() -> u32 {
+        let mut spins = 0u32;
+        while Self::carrier_present() {
+            spins += 1;
+            if spins >= CARRIER_WAIT_SPINS {
+                break;
+            }
+        }
+        spins
     }
 
     /// Emit a 10BASE-T Normal Link Pulse: 100 ns positive pulse, then idle.
@@ -114,6 +208,9 @@ impl EthTx {
     /// (one NLP write alone is safe, but the 12 padding writes spin on
     /// FIFO availability and so could be preempted mid-loop).
     pub fn send_nlp(&mut self) {
+        // Carrier-sense before transmitting (Phase 3d) — don't drive an NLP
+        // on top of an in-flight host frame.
+        Self::wait_carrier_idle();
         critical_section::with(|_| {
             let _ = self.tx.write(0x0000_000A_u32);
             for _ in 0..12 {
@@ -150,6 +247,14 @@ impl EthTx {
             crate::crc::crc32_ieee802_3_padded(body, pad_len)
         };
         let crc_bytes = crc.to_le_bytes();
+
+        // Carrier-sense before grabbing the wire (Phase 3d). Done outside the
+        // critical section so we defer with interrupts enabled; the small
+        // window between this and the preamble write is acceptable for
+        // carrier-sense-only (no collision detect). This is the main path the
+        // curl's TCP segments take, so it's where the gotcha-#10 collisions
+        // were happening once RX moved to core 1.
+        Self::wait_carrier_idle();
 
         critical_section::with(|_| {
             // 7 × preamble byte (0x55) + 1 × SFD byte (0xD5).
@@ -196,6 +301,9 @@ impl EthTx {
         let total_bytes =
             build_eth_ipv4_udp_frame(ep, payload, &mut self.raw_frame, self.ip_identifier);
         self.ip_identifier = self.ip_identifier.wrapping_add(1);
+
+        // Carrier-sense before grabbing the wire (Phase 3d).
+        Self::wait_carrier_idle();
 
         // Critical section: same reason as send_raw_frame — keep the
         // DMA_IRQ_0 decoder from preempting these per-byte writes and

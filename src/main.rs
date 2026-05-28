@@ -164,12 +164,14 @@ fn main() -> ! {
     let _tx_pin: hal::gpio::Pin<_, FunctionPio0, _> = pins.gpio14.into_function();
     let _rx_pin: hal::gpio::Pin<_, FunctionPio0, _> = pins.gpio13.into_function();
 
-    // PIO0 SM0 drives the Manchester TX; SM1 runs the RX sampler. The CPU
-    // edge-track DPLL (eth_rx_dpll) handles clock recovery in software off
-    // the same 60 MHz sample stream — PIO1 is free for future use.
-    let (mut pio0, sm0, sm1, _sm2, _sm3) = pac.PIO0.split(&mut pac.RESETS);
+    // PIO0 SM0 drives the Manchester TX; SM1 runs the RX sampler; SM2 is the
+    // Phase-3d carrier detector (watches RO for the TX carrier-sense gate).
+    // The CPU edge-track DPLL (eth_rx_dpll) handles clock recovery in software
+    // off the 60 MHz sample stream — SM3 + PIO1 are free for future use.
+    let (mut pio0, sm0, sm1, sm2, _sm3) = pac.PIO0.split(&mut pac.RESETS);
     let sys_clk_hz = clocks.system_clock.freq().to_Hz();
-    let eth_tx = eth_tx::EthTx::new(&mut pio0, sm0, HW_PIN_TXD, sys_clk_hz);
+    // SM0 = Manchester TX; SM2 = carrier detector (Phase 3d) watching RO (GP13).
+    let eth_tx = eth_tx::EthTx::new(&mut pio0, sm0, sm2, HW_PIN_TXD, HW_PIN_RXD, sys_clk_hz);
 
     // DMA channels 0 and 1 ferry samples from the PIO RX FIFO into two
     // 16 KB half-buffers. EthRx::poll_with hands the just-filled half to

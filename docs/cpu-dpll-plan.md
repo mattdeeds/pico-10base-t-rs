@@ -697,3 +697,64 @@ until then (don't merge a 12× TCP regression to `main`; `main` keeps the
    recover much of the throughput as a stop-gap to validate the diagnosis.
 3. **smoltcp tuning band-aid** (larger TX window so losses trigger fast
    retransmit instead of RTO). Treats the symptom; fragile; not recommended.
+
+### 9h. Phase 3d — PIO carrier-sense: recovers most throughput, residual collisions remain (2026-05-28)
+
+Phase 3d adds carrier-sense (option 1 from §9g) and **validates the diagnosis
+decisively**: collisions were the cause, carrier-sense is most of the cure.
+On branch `r12d-carrier-sense` (built on `r12c`), not merged.
+
+**Implementation** (`eth_tx.rs`):
+- A dedicated **carrier-detect SM (PIO0 SM2)** watches RO (GP13) via `jmp_pin`
+  and raises host-visible **PIO IRQ flag 0** while the line is *active*
+  (toggling), clearing it once the line has been *stable* for GUARD≈8 samples
+  (~267 ns @ 60 MHz) — idle. (10BASE-T idle is a steady level, so carrier ==
+  recent transitions; the RX `find_active_run` logic relies on the same fact.)
+  ~13 PIO instructions; fits easily alongside TX (3) + RX (1).
+- `wait_carrier_idle()` polls flag 0 before the preamble in `send_raw_frame` /
+  `send_udp_broadcast` / `send_nlp` (outside the critical section, so we defer
+  with interrupts enabled). **Bounded spin** (`CARRIER_WAIT_SPINS`) so a
+  stuck-busy flag degrades to "transmit anyway", never wedges TX.
+- Detection in PIO; the gate is a few lines in software. The proven Manchester
+  TX dispatcher is untouched.
+
+**On-wire (240 MHz, http-bulk-test):**
+
+| Metric | single-core | Phase 3c | Phase 3d |
+|---|---|---|---|
+| Idle 1 MB curl | 596 kB/s | ~45 | **114–914, avg ~340** (peaks > baseline) |
+| Host collisions / curl | ~0 | ~30 | **~1–4.5** (6–22× fewer) |
+| Blast 1 MB curl (50 pps) | 26 | ~45 | **156–470** (6–18× better) |
+| TX alive / ping / core 1 | — | — | nlps 62–63/s, ping 100%, ticks ~458/s ✓ |
+
+**Result: carrier-sense recovers most of the throughput and crushes most
+collisions.** Collision-free curls hit **914 kB/s — above the single-core
+baseline** (no decode stealing core-0 TX time + no collisions), proving the
+ceiling is there. Under broadcast blast, 156–470 kB/s vs single-core's 26 —
+6–18× better, meeting the §4 3c gate (>300) on good runs.
+
+**But it's carrier-sense ONLY — residual collisions remain** (~1–4.5/curl, vs
+~30 in 3c). Two sources: (a) no collision *detection* — if the Pico and host
+start within the detection/start latency, both transmit and corrupt; (b) the
+small window between `wait_carrier_idle` returning and the preamble actually
+hitting the wire. Each residual collision costs a TCP RTO stall, which is why
+idle throughput is *variable* (114–914) with a median (~340) still below the
+596 baseline. The lows are curls that hit a collision; the highs are
+collision-free.
+
+**Hardware enables the next step (Phase 3e — full CSMA/CD).** The ISL3177E has
+**no DE/RE — driver and receiver are always enabled** (see the
+`hardware-isl3177e` memory), so RO loops our own TX back. That means we can
+**detect collisions**: compare RO to the bit we're driving on DI; a mismatch
+mid-frame = another station transmitting = collision → abort, jam, binary-
+exponential backoff, retransmit. That should mop up the residual collisions and
+take idle throughput to a consistent ≥596 (with the 3c starvation fix intact
+and the stress numbers far above single-core). CD is more PIO work (the TX SM
+must sense RO per-bit during transmission and signal collisions back to the
+CPU/smoltcp for retransmit), but the loopback path makes it feasible.
+
+**Net:** Phase 3c (core separation) + Phase 3d (carrier-sense) together make
+the multicore RX a *near* net win — far better under stress, no starvation,
+peaks above baseline — with residual-collision variance that Phase 3e (CD)
+should close. Don't merge to `main` yet: the idle *median* is still below the
+596 baseline, so it's not yet a strict improvement for the idle case.
