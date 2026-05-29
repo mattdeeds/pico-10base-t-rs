@@ -429,11 +429,20 @@ a smoltcp `Interface`." Verified false for *raw* smoltcp (what `EthMac` uses on
 the 10BT side): `cyw43::NetDriver<'a> = embassy_net_driver_channel::Device<'a,
 MTU>`, which implements the **async, waker-based `embassy_net_driver::Driver`**
 trait — that plugs into *embassy-net*, not raw smoltcp's synchronous
-`phy::Device`. **But** the same `ch::Device` also exposes a clean **synchronous**
-API — `try_rx_buf()`/`rx_done(len)`, `try_tx_buf()`/`tx_done()`, and
-`borrow_split() → (StateRunner, RxRunner, TxRunner)` — so we write a thin
-`phy::Device` shim over it. **No `embassy-net` dependency, no noop-waker hack,
-one smoltcp stack for both interfaces.** This adapter is the keystone new piece.
+`phy::Device`. **CORRECTION (R14.3, after building it):** an earlier draft of
+this section claimed `ch::Device` also exposes a synchronous
+`try_rx_buf`/`try_tx_buf`/`borrow_split` API we could shim over directly. **That
+was wrong** — those methods live on the *producer-side* `ch::Runner` (and
+`Rx/TxRunner`), which **cyw43's `Runner` owns internally and never exposes**; the
+`NetDriver` we get is consumer-only and async-Driver-only. The actual bridge
+(`src/cyw43_phy.rs`): call the async `Driver::receive`/`transmit` with a
+**no-op-waker `Context`** — they're poll-style (`Some(tokens)` when ready, else
+`None` after registering the waker we discard), which *is* smoltcp's synchronous
+`phy::Device` contract since our net task re-polls on its own cadence. Still **no
+`embassy-net` dependency** (just the `embassy-net-driver` trait crate, pinned to
+cyw43's version), one smoltcp stack for both interfaces. This adapter is the
+keystone new piece — **proven on-device: a Wi-Fi client pings `192.168.4.1`
+5/5.**
 
 ### 12.2 Steps (lowest-risk increment first; each has its own on-wire accept)
 
@@ -441,7 +450,7 @@ one smoltcp stack for both interfaces.** This adapter is the keystone new piece.
 |---|---|---|
 | **R14.1 — continuous Runner** | Replace `cyw43_bringup_blocking`'s `select→return` with: `cyw43::new()` → `Control::init(clm)` → **spawn `Runner::run()` as a long-lived executor task**, keep `Control` live. Relocate the heartbeat LED to `Control::gpio_set(0,…)` (GP25 is now WL_CS — retire `main.rs:163`'s `led`). | LED blinks **indefinitely** (not just 6×) ⇒ Runner stays up under the executor. The core de-risk — everything else builds on it. |
 | **R14.2 — start AP** | After init: `Control::start_ap_wpa2(SSID, passphrase, channel)` (sig confirmed, cyw43 0.7.0). Read the MAC via `Control::address()`. | The SSID appears in a phone/laptop wifi scan. |
-| **R14.3 — phy adapter + LAN `Interface`** | New `src/cyw43_phy.rs`: wrap `ch::Device` in smoltcp `phy::Device` using `borrow_split()` so the rx+tx tokens `receive()` returns borrow disjoint halves. `receive` = `try_rx_buf()`→RxToken (`rx_done(len)` on consume); `transmit` = `try_tx_buf()`→TxToken (write + `tx_done()`). Build a 2nd smoltcp `Interface` (static `192.168.4.1/24`, `HardwareAddress::Ethernet` from `Control::address()`), polled in the net task. | A **manually-configured** client (static `192.168.4.2/24`) pings `192.168.4.1` (auto-icmp-echo-reply is already in our smoltcp features). Proves the data path through cyw43 + adapter before DHCP exists. |
+| **R14.3 — phy adapter + LAN `Interface`** ✅ DONE (`5039a11`) | New `src/cyw43_phy.rs`: `Cyw43Phy` wraps the `NetDriver` and bridges its async `embassy_net_driver::Driver` to smoltcp `phy::Device` via a **no-op-waker `Context`** (NOT the sync buf API — see §12.1 correction). `receive`/`transmit` map the embassy tokens to smoltcp tokens (delegating `consume`). Stop dropping `_net`; build a 2nd smoltcp `Interface` (static `192.168.4.1/24`, MAC from `Control::address()`) in a `net_task` poll loop (no sockets — ARP + auto-icmp-echo-reply answer from the Interface). | ✅ A client (host RTL88x2bu) joined the AP, static `192.168.4.2/24`, **`ping 192.168.4.1` = 5/5 ~6 ms**; device `rx` counter climbed in step. Data path proven both directions before DHCP. |
 | **R14.4 — DHCP server** (§6.3; the bulk) | New `src/dhcp_server.rs`: smoltcp UDP socket on `0.0.0.0:67`; parse BOOTP/DHCP DISCOVER + REQUEST; emit OFFER + ACK broadcast to `255.255.255.255:68` with yiaddr from a fixed `heapless` lease pool in `192.168.4.0/24`, router+DNS = `192.168.4.1`, subnet mask + lease time. Lease table keyed by client MAC. | **The R14 milestone:** a phone joins the SSID, **auto-gets a lease**, pings `192.168.4.1`. |
 | **R14.5 — mgmt sanity + docs** | Bind the existing tiny HTTP server to the LAN `Interface` (`192.168.4.1:80`, reusing `serve_http`) so a joined phone loads a status page. Update RESUME + this doc. | Joined phone loads the status page; live demo of the LAN. |
 
@@ -452,8 +461,11 @@ one smoltcp stack for both interfaces.** This adapter is the keystone new piece.
 2. **DHCP broadcast quirks** — clients send from `0.0.0.0` → `255.255.255.255`
    *before* they hold an IP; the smoltcp UDP socket bind / broadcast-accept + the
    BOOTP broadcast flag are the fiddliest new code. Budget time here.
-3. **Adapter borrow model** — resolved via `borrow_split` (disjoint rx/tx), but
-   verify the lifetimes hold inside a `phy::Device` struct.
+3. ~~**Adapter borrow model**~~ — RESOLVED (R14.3): the async `Driver::receive`
+   already returns the rx+tx token pair co-borrowing the `NetDriver`, so the
+   smoltcp `phy::Device` lifetimes line up with no `borrow_split` needed. The
+   real surprise was the *mechanism* (noop-waker over the async Driver, not a
+   sync buf API) — see the §12.1 correction.
 4. **gSPI at 2 MHz busy-poll** — the *continuous* Runner now does ongoing SPI
    (not one-shot init); fine for LAN-only R14, but DMA on the transport (deferred
    in §11) becomes wanted at R16 when the core is also forwarding.
