@@ -182,7 +182,7 @@ fn main() -> ! {
         let sys_clk_hz_w = clocks.system_clock.freq().to_Hz();
         let pwr = pins.gpio23.into_push_pull_output();
         let spi = wireless::PioSpiCyw43::new(&mut pio1, pio1_sm0, sys_clk_hz_w);
-        wireless::cyw43_new_blocking(pwr, spi);
+        wireless::cyw43_bringup_blocking(pwr, spi);
     }
 
     // GP14 → ISL3177E DI, GP13 → ISL3177E RO. Reassign both to PIO0 function.
@@ -603,8 +603,10 @@ fn log_status<B: UsbBus>(
         line.clear();
         let _ = writeln!(
             line,
-            "[Cyw43] new_done={} (1 = cyw43::new ok over PIO1)",
+            "[Cyw43] new={} init={} led={} (1=ok: new=fw+nvram, init=CLM+wifi, led=gpio_set blink)",
             wireless::CYW43_NEW_DONE.load(Ordering::Relaxed),
+            wireless::CYW43_INIT_DONE.load(Ordering::Relaxed),
+            wireless::CYW43_LED_DONE.load(Ordering::Relaxed),
         );
         let _ = serial.write(line.as_bytes());
     }

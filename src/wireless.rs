@@ -664,39 +664,63 @@ impl cyw43::SpiBusCyw43 for PioSpiCyw43 {
 }
 
 // =====================================================================
-// 2b. cyw43 bring-up via block_on (R13 Step 3a — no executor yet)
+// 2b. cyw43 bring-up via block_on (R13 Step 3 — no executor)
 // =====================================================================
+//
+// We drive the whole bring-up with `embassy_futures::block_on` instead of the
+// embassy executor: block_on busy-spins the future, cyw43's `Timer::after`
+// delays resolve against the TIMER0 time-driver's `now()`, and our transport's
+// cmd_read/cmd_write are synchronous busy-polls — so no async runtime / alarm
+// IRQ is needed yet. `cyw43::new()` runs self-contained; `Control::init` + the
+// LED blink need the Runner running *concurrently*, so we `select(runner.run(),
+// seq)`: select returns when `seq` finishes (Runner then dropped) and block_on
+// returns, so the normal 10BASE-T loop continues and reports the stage flags
+// over CDC. (A persistent executor + continuous Runner come with R14+.)
 
-/// CYW43 bring-up progress (R13 Step 3a). 0 = not started; 1 = `cyw43::new()`
-/// returned — i.e. the 231 KB firmware + nvram downloaded over our PIO1 gSPI
-/// transport and the bus handshake passed under the real driver. A failure inside
-/// `new()` panics (it `.unwrap()`s) rather than clearing this.
+/// 1 once `cyw43::new()` returned (firmware + nvram loaded + bus handshake OK).
 pub static CYW43_NEW_DONE: AtomicU32 = AtomicU32::new(0);
+/// 1 once `Control::init(clm)` returned (CLM loaded + WiFi firmware up).
+pub static CYW43_INIT_DONE: AtomicU32 = AtomicU32::new(0);
+/// 1 once the onboard-LED blink sequence finished (gpio_set ioctls work).
+pub static CYW43_LED_DONE: AtomicU32 = AtomicU32::new(0);
 
-/// R13 Step 3a — drive `cyw43::new()` to completion with `block_on` (no executor
-/// yet). `block_on` busy-spins the future; cyw43's power-up `Timer::after` delays
-/// resolve against the TIMER0 time-driver's `now()` (no alarm IRQ needed). Runs
-/// the real firmware + nvram download + bus handshake over our transport, then
-/// drops the returned driver objects (Step 3b keeps them + adds the executor +
-/// LED). Blocks ~1 s at our 2 MHz gSPI. `spi` must be a fresh [`PioSpiCyw43`]
-/// (bus idle); `pwr` is WL_ON — cyw43 power-cycles it during init (the bus is
-/// already idle, gotcha #11). Call once at boot, before the USB/10BASE-T loop.
-pub fn cyw43_new_blocking<PWR: embedded_hal::digital::OutputPin>(pwr: PWR, spi: PioSpiCyw43) {
-    // Firmware + nvram blobs, 4-byte aligned via cyw43's macro (paths relative to
-    // this file → repo `cyw43-firmware/`). CLM is loaded later by Control::init
-    // (Step 3b), so it isn't needed here.
+/// R13 Step 3 — full cyw43 bring-up via `block_on`: `cyw43::new()` (firmware +
+/// nvram over our PIO1 transport) → run the Runner concurrently with
+/// `Control::init(clm)` + a few onboard-LED blinks (`gpio_set` ioctls), then
+/// return. Stage flags ([`CYW43_NEW_DONE`]/[`CYW43_INIT_DONE`]/[`CYW43_LED_DONE`])
+/// are reported by `log_status`. Blocks a few seconds at our 2 MHz gSPI. `spi`
+/// must be a fresh [`PioSpiCyw43`] (bus idle); `pwr` is WL_ON (cyw43 power-cycles
+/// it during init — bus already idle, gotcha #11). Call once at boot, before the
+/// USB/10BASE-T loop. A failure inside cyw43 panics (`.unwrap()`); a chip that
+/// never answers an ioctl would hang here (the corresponding flag stays 0).
+pub fn cyw43_bringup_blocking<PWR: embedded_hal::digital::OutputPin>(pwr: PWR, spi: PioSpiCyw43) {
     let fw = cyw43::aligned_bytes!("../cyw43-firmware/43439A0.bin");
     let nvram = cyw43::aligned_bytes!("../cyw43-firmware/nvram_rp2040.bin");
+    let clm: &[u8] = include_bytes!("../cyw43-firmware/43439A0_clm.bin");
 
     // cyw43::State is large (driver + channel buffers) — keep it in a static.
     static mut STATE: cyw43::State = cyw43::State::new();
     let state = unsafe { &mut *core::ptr::addr_of_mut!(STATE) };
 
     embassy_futures::block_on(async move {
-        let (_net, _control, _runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
-        // Reaching here = new() succeeded (it `.unwrap()`s internally on failure).
+        let (_net, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
         CYW43_NEW_DONE.store(1, Ordering::Relaxed);
-        // 3a: objects drop here (stops the SM). 3b keeps them + runs the executor.
+
+        let seq = async {
+            control.init(clm).await;
+            CYW43_INIT_DONE.store(1, Ordering::Relaxed);
+            // Blink the onboard LED (CYW43 GPIO0) — visible proof + exercises
+            // gpio_set ioctls through the concurrently-running Runner.
+            for _ in 0..6 {
+                control.gpio_set(0, true).await;
+                Timer::after(Duration::from_millis(150)).await;
+                control.gpio_set(0, false).await;
+                Timer::after(Duration::from_millis(150)).await;
+            }
+            CYW43_LED_DONE.store(1, Ordering::Relaxed);
+        };
+        // Drive the Runner (cyw43 event loop) until `seq` completes, then return.
+        embassy_futures::select::select(runner.run(), seq).await;
     });
 }
 
