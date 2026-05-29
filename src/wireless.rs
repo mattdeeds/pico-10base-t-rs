@@ -20,21 +20,32 @@
 //! reviewable before the Pico 2 W arrives" milestone.
 
 use core::cell::RefCell;
+use core::fmt::Write as _;
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::task::Waker;
 
 use critical_section::Mutex;
-use embassy_executor::Executor;
+use embassy_executor::{Executor, Spawner};
 use embassy_time::{Duration, Timer};
 use embassy_time_driver::Driver;
 use embassy_time_queue_utils::Queue;
+use heapless::String;
 use rp235x_hal as hal;
+use usb_device::{class_prelude::*, prelude::*};
+use usbd_serial::SerialPort;
 
 use hal::pac::PIO1;
 use hal::pio::{
     PIOBuilder, PinDir, PinState, Running, Rx, ShiftDirection, StateMachine, Stopped, Tx,
     UninitStateMachine, SM0,
 };
+
+/// WL_ON (GP23) as a push-pull SIO output — the CYW43 `pwr` pin cyw43 owns and
+/// power-cycles during `cyw43::new`. Concrete (not generic) so it can name the
+/// type of the long-lived `Runner` task. GP23 resets to `(PullDown, Null)`, so
+/// `into_push_pull_output()` yields exactly this type.
+pub type WlOnPin =
+    hal::gpio::Pin<hal::gpio::bank0::Gpio23, hal::gpio::FunctionSioOutput, hal::gpio::PullDown>;
 
 // =====================================================================
 // 0. Synchronous gSPI bring-up probe (R13 first on-board milestone)
@@ -728,36 +739,181 @@ pub fn cyw43_bringup_blocking<PWR: embedded_hal::digital::OutputPin>(pwr: PWR, s
 // 3. Async runtime entry
 // =====================================================================
 
-/// Heartbeat task — exercises `embassy-time` (and therefore the time driver
-/// above) so the whole async/time stack is link-checked. On hardware this
-/// would toggle the CYW43's onboard LED via `Control::gpio_set`.
+// Concrete cyw43 handle types over our PIO1 transport — needed to name the
+// long-lived `Runner` task's argument (embassy `#[task]`s can't be generic).
+type CywBus = cyw43::SpiBus<WlOnPin, PioSpiCyw43>;
+type CywRunner = cyw43::Runner<'static, CywBus>;
+
+/// Build the USB stack (CDC telemetry + the picotool vendor reset interface) on
+/// a `'static` allocator, so it can move into the executor's `usb_task` and keep
+/// being polled while the executor owns core 0. Mirrors `main`'s 10BASE-T USB
+/// setup (same VID:PID, chip-ID serial number — so `picotool -f`/`cargo run`
+/// keep working). Call once.
+#[allow(clippy::type_complexity)] // a 3-tuple of usb-device handles reads fine here
+fn build_usb(
+    usb: hal::pac::USB,
+    usb_dpram: hal::pac::USB_DPRAM,
+    usb_clock: hal::clocks::UsbClock,
+    resets: &mut hal::pac::RESETS,
+) -> (
+    UsbDevice<'static, hal::usb::UsbBus>,
+    SerialPort<'static, hal::usb::UsbBus>,
+    crate::pico_reset::PicoResetInterface,
+) {
+    static mut USB_BUS: core::mem::MaybeUninit<UsbBusAllocator<hal::usb::UsbBus>> =
+        core::mem::MaybeUninit::uninit();
+    let usb_bus: &'static UsbBusAllocator<hal::usb::UsbBus> = unsafe {
+        let p = core::ptr::addr_of_mut!(USB_BUS);
+        (*p).write(UsbBusAllocator::new(hal::usb::UsbBus::new(
+            usb, usb_dpram, usb_clock, true, resets,
+        )));
+        &*(*p).as_ptr()
+    };
+
+    let serial = SerialPort::new(usb_bus);
+    let reset_iface = crate::pico_reset::PicoResetInterface::new(usb_bus);
+
+    // Serial = chip ID, so picotool tracks us across the app→BOOTSEL reboot
+    // (see main.rs / gotcha #4). `usb_dev` borrows this string, and we return
+    // `usb_dev`, so the serial must be `'static` — stash it in a one-shot static.
+    static mut SERIAL_STR: core::mem::MaybeUninit<String<16>> =
+        core::mem::MaybeUninit::uninit();
+    let serial_str: &'static str = unsafe {
+        let s = (*core::ptr::addr_of_mut!(SERIAL_STR)).write(String::new());
+        match hal::rom_data::sys_info_api::chip_info() {
+            Ok(Some(info)) => {
+                let _ = write!(s, "{:08X}{:08X}", info.wafer_id, info.device_id);
+            }
+            _ => {
+                let _ = write!(s, "0000000000000000");
+            }
+        }
+        s.as_str()
+    };
+
+    let usb_dev = UsbDeviceBuilder::new(usb_bus, UsbVidPid(0x2e8a, 0x000a))
+        .strings(&[StringDescriptors::default()
+            .manufacturer("pico-10base-t-rs")
+            .product("Pico-10BASE-T (Rust) — wireless")
+            .serial_number(serial_str)])
+        .unwrap()
+        .max_packet_size_0(64)
+        .unwrap()
+        .device_class(2) // USB CDC
+        .build();
+
+    (usb_dev, serial, reset_iface)
+}
+
+// =====================================================================
+// 3. Async runtime entry (R14.1 — persistent executor, continuous Runner)
+// =====================================================================
+
+/// USB poll loop, in the executor. Keeps CDC + the picotool reset interface
+/// serviced while the executor owns core 0 (so `cargo run`/`picotool -f` still
+/// reboot us into BOOTSEL), and emits a 1 Hz `[Cyw43]` status line so the cyw43
+/// bring-up stages + a live heartbeat are visible over CDC (gotcha #5: the host
+/// must assert DTR to see the bytes).
 #[embassy_executor::task]
-async fn heartbeat() {
+async fn usb_task(
+    mut usb_dev: UsbDevice<'static, hal::usb::UsbBus>,
+    mut serial: SerialPort<'static, hal::usb::UsbBus>,
+    mut reset_iface: crate::pico_reset::PicoResetInterface,
+) -> ! {
     let mut n: u32 = 0;
     loop {
-        Timer::after(Duration::from_millis(500)).await;
+        usb_dev.poll(&mut [&mut serial, &mut reset_iface]);
+        // Honor a picotool -f reboot request from clean (non-IRQ) context.
+        if let Some(kind) = reset_iface.take_pending_reboot() {
+            hal::reboot::reboot(kind, crate::pico_reset::RebootArch::Normal);
+        }
         n = n.wrapping_add(1);
-        core::hint::black_box(n); // keep the loop from being optimised away
+        // ~1 Hz at the 1 ms poll cadence.
+        if n % 1000 == 0 {
+            let mut line: String<96> = String::new();
+            let _ = write!(
+                line,
+                "[Cyw43] new={} init={} led={} hb={}\r\n",
+                CYW43_NEW_DONE.load(Ordering::Relaxed),
+                CYW43_INIT_DONE.load(Ordering::Relaxed),
+                CYW43_LED_DONE.load(Ordering::Relaxed),
+                n / 1000,
+            );
+            let _ = serial.write(line.as_bytes());
+        }
+        Timer::after(Duration::from_millis(1)).await;
     }
 }
 
-/// Run the wireless stack on this core. Sets up the time-driver alarm IRQ and
-/// hands control to the embassy executor (never returns).
+/// The cyw43 event loop — drives every gSPI transaction + chip event. Must run
+/// continuously for the chip to stay up (this is what R13's `block_on` could not
+/// provide once it returned). `runner.run()` itself diverges.
+#[embassy_executor::task]
+async fn cyw43_runner_task(runner: CywRunner) -> ! {
+    runner.run().await
+}
+
+/// One-shot bring-up: `cyw43::new()` (firmware + nvram over PIO1) → spawn the
+/// Runner → `Control::init(clm)` → blink the onboard LED forever. The LED can
+/// only keep toggling if the Runner task is continuously servicing `gpio_set`
+/// ioctls — so an indefinitely-blinking LED is the R14.1 acceptance signal.
+#[embassy_executor::task]
+async fn cyw43_bootstrap_task(spawner: Spawner, pwr: WlOnPin, spi: PioSpiCyw43) -> ! {
+    let fw = cyw43::aligned_bytes!("../cyw43-firmware/43439A0.bin");
+    let nvram = cyw43::aligned_bytes!("../cyw43-firmware/nvram_rp2040.bin");
+    let clm: &[u8] = include_bytes!("../cyw43-firmware/43439A0_clm.bin");
+
+    // cyw43::State is large (driver + channel buffers) — keep it in a static.
+    static mut STATE: cyw43::State = cyw43::State::new();
+    let state = unsafe { &mut *core::ptr::addr_of_mut!(STATE) };
+
+    let (_net, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
+    CYW43_NEW_DONE.store(1, Ordering::Relaxed);
+    // Hand the event loop to its own task so it runs concurrently with init.
+    if let Ok(t) = cyw43_runner_task(runner) {
+        spawner.spawn(t);
+    }
+
+    control.init(clm).await;
+    CYW43_INIT_DONE.store(1, Ordering::Relaxed);
+
+    let mut on = false;
+    loop {
+        on = !on;
+        control.gpio_set(0, on).await;
+        CYW43_LED_DONE.store(1, Ordering::Relaxed);
+        Timer::after(Duration::from_millis(250)).await;
+    }
+}
+
+/// R14.1 wireless-image entry: set up the USB stack, enable the time-driver
+/// alarm IRQ, then hand core 0 to the embassy executor forever. Spawns the USB
+/// poll loop + the cyw43 bring-up (which spawns the continuous Runner). Never
+/// returns — this is the standalone-wireless build, so 10BASE-T is not started
+/// (docs/router-plan.md §11/§12).
 ///
-/// # Safety
-/// Call once, from a single core, after clocks + TIMER0 are running. The caller
-/// must not also be using TIMER0 ALARM0 / `TIMER0_IRQ_0`.
-// Async-runtime entry — validated-compiling future infra for the async cyw43
-// path; the current R13 milestone uses the sync `probe_cyw43` above instead.
-#[allow(dead_code)]
-pub unsafe fn run_executor() -> ! {
+/// `spi` must be a fresh [`PioSpiCyw43`] (bus idle); `pwr` is WL_ON (cyw43
+/// power-cycles it during init — bus already idle, gotcha #11). The caller must
+/// not also drive TIMER0 ALARM0 / `TIMER0_IRQ_0` (the time-driver owns them).
+pub fn run(
+    pwr: WlOnPin,
+    spi: PioSpiCyw43,
+    usb: hal::pac::USB,
+    usb_dpram: hal::pac::USB_DPRAM,
+    usb_clock: hal::clocks::UsbClock,
+    resets: &mut hal::pac::RESETS,
+) -> ! {
+    let (usb_dev, serial, reset_iface) = build_usb(usb, usb_dpram, usb_clock, resets);
+
     // Let the time-driver's ALARM0 fire on this core.
-    hal::arch::interrupt_unmask(ALARM_IRQ);
-    hal::arch::interrupt_enable();
+    unsafe {
+        hal::arch::interrupt_unmask(ALARM_IRQ);
+        hal::arch::interrupt_enable();
+    }
 
     // The executor must live for 'static; stash it in a one-shot static.
     static mut EXECUTOR: core::mem::MaybeUninit<Executor> = core::mem::MaybeUninit::uninit();
-    let executor = {
+    let executor = unsafe {
         let p = core::ptr::addr_of_mut!(EXECUTOR);
         (*p).write(Executor::new());
         &mut *(*p).as_mut_ptr()
@@ -765,13 +921,12 @@ pub unsafe fn run_executor() -> ! {
 
     executor.run(|spawner| {
         // embassy-executor 0.10's `#[task]` macro returns a `Result` (the task
-        // arena slot can be exhausted); unwrap the one-shot startup spawn.
-        if let Ok(token) = heartbeat() {
-            spawner.spawn(token);
+        // arena slot can be exhausted); spawn the startup tasks.
+        if let Ok(t) = usb_task(usb_dev, serial, reset_iface) {
+            spawner.spawn(t);
         }
-        // TODO(R13 on-device): build PioSpiCyw43 + PWR pin, load the CYW43
-        // firmware blobs (cyw43-firmware), call cyw43::new(...) to get
-        // (NetDriver, Control, Runner); spawn Runner::run(); Control::init() +
-        // start_ap_wpa2(); wrap NetDriver in a smoltcp Interface for the LAN.
+        if let Ok(t) = cyw43_bootstrap_task(spawner, pwr, spi) {
+            spawner.spawn(t);
+        }
     });
 }

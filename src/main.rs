@@ -9,6 +9,15 @@
 
 #![no_std]
 #![no_main]
+// The `wireless` image is a standalone build (docs/router-plan.md §11/§12): the
+// embassy executor owns core 0 and 10BASE-T is not started, so the 10BT data
+// path (main_10bt + the eth_* modules + core-1 launch) is compiled but unused.
+// Silence the resulting dead-code/unused noise for that build only; the default
+// build keeps full lint coverage.
+#![cfg_attr(
+    feature = "wireless",
+    allow(dead_code, unused_variables, unused_mut, unused_imports)
+)]
 
 mod crc;
 mod eth_mac;
@@ -153,37 +162,65 @@ fn main() -> ! {
     .unwrap();
     clocks.init_default(&xosc, &pll_sys, &pll_usb).unwrap();
 
-    let mut sio = hal::Sio::new(pac.SIO);
+    let sio = hal::Sio::new(pac.SIO);
     let pins = hal::gpio::Pins::new(
         pac.IO_BANK0,
         pac.PADS_BANK0,
         sio.gpio_bank0,
         &mut pac.RESETS,
     );
-    let mut led = pins.gpio25.into_push_pull_output();
-
+    // TIMER0 out of reset → its free-running µs counter ticks. The 10BASE-T path
+    // uses this hal handle; the wireless time-driver reads TIMER0 directly (and
+    // owns ALARM0 / TIMER0_IRQ_0 — see wireless.rs), so don't arm alarms here.
     let timer = hal::Timer::new_timer0(pac.TIMER0, &mut pac.RESETS, &clocks);
 
-    // R13 Step 3a — cyw43 bring-up via block_on(cyw43::new) (gated). Builds our
-    // PIO1 gSPI transport (bus held idle) then drives cyw43::new() to completion
-    // *without an executor* (embassy_futures::block_on busy-spins the future; the
-    // TIMER0 time-driver's now() resolves the power-up delays). This downloads the
-    // 231 KB firmware + nvram over our transport and does the real bus handshake —
-    // proving the transport end-to-end under the real driver. Sets CYW43_NEW_DONE,
-    // reported by `log_status`. ~1 s at our 2 MHz gSPI; then the normal 10BASE-T
-    // loop continues (keeping CDC telemetry). DATA(GP24)/CLK(GP29) → PIO1; CS(GP25)
-    // SIO (in PioSpiCyw43); WL_ON(GP23) = cyw43's pwr pin. (Step 3b adds the
-    // executor + Runner + LED blink; probe_cyw43_pio/pin_selftest kept for ref.)
+    // ── Wireless router image (Pico 2 W). The embassy executor owns core 0 and
+    // never returns, so this is a *standalone* build — 10BASE-T is not started
+    // (docs/router-plan.md §11/§12). Build the PIO1 gSPI transport (CLK/CS/DATA
+    // held idle through WL_ON power-up, gotcha #11) + the WL_ON pin, then hand
+    // the transport + USB peripherals to wireless::run (which sets up the
+    // time-driver alarm IRQ + the executor: cyw43 Runner + bring-up/LED blink +
+    // the USB poll/reset task).
     #[cfg(feature = "wireless")]
     {
+        let _ = &timer; // keep TIMER0 un-reset; the hal handle is unused here
         let _cyw_data: hal::gpio::Pin<_, hal::gpio::FunctionPio1, _> = pins.gpio24.into_function();
         let _cyw_clk: hal::gpio::Pin<_, hal::gpio::FunctionPio1, _> = pins.gpio29.into_function();
         let (mut pio1, pio1_sm0, _, _, _) = pac.PIO1.split(&mut pac.RESETS);
         let sys_clk_hz_w = clocks.system_clock.freq().to_Hz();
         let pwr = pins.gpio23.into_push_pull_output();
         let spi = wireless::PioSpiCyw43::new(&mut pio1, pio1_sm0, sys_clk_hz_w);
-        wireless::cyw43_bringup_blocking(pwr, spi);
+        wireless::run(pwr, spi, pac.USB, pac.USB_DPRAM, clocks.usb_clock, &mut pac.RESETS);
     }
+
+    // ── 10BASE-T NIC image (default build). The wireless arm above diverges, so
+    // exactly one arm is ever compiled/run per build.
+    #[cfg(not(feature = "wireless"))]
+    main_10bt(
+        pac.PIO0, pac.DMA, pac.PSM, pac.USB, pac.USB_DPRAM, pac.RESETS, sio.fifo, clocks, pins, timer,
+    );
+}
+
+/// The 10BASE-T NIC (default build): PIO Manchester TX + PIO/DMA RX decoded on
+/// core 1, the smoltcp endpoint stack, USB CDC + the picotool reset interface —
+/// driven by a blocking poll loop on core 0 that never returns. Split out of
+/// `main` so the `wireless` build can replace this data path wholesale (R14.1);
+/// `main` does the shared clock/pin setup and hands the resources in.
+#[cfg(not(feature = "wireless"))]
+#[allow(clippy::too_many_arguments)] // dispatch boundary — resources handed in by `main`
+fn main_10bt(
+    pio0: hal::pac::PIO0,
+    dma: hal::pac::DMA,
+    mut psm: hal::pac::PSM,
+    usb: hal::pac::USB,
+    usb_dpram: hal::pac::USB_DPRAM,
+    mut resets: hal::pac::RESETS,
+    mut sio_fifo: hal::sio::SioFifo,
+    clocks: hal::clocks::ClocksManager,
+    pins: hal::gpio::Pins,
+    timer: hal::Timer<hal::timer::CopyableTimer0>,
+) -> ! {
+    let mut led = pins.gpio25.into_push_pull_output();
 
     // GP14 → ISL3177E DI, GP13 → ISL3177E RO. Reassign both to PIO0 function.
     let _tx_pin: hal::gpio::Pin<_, FunctionPio0, _> = pins.gpio14.into_function();
@@ -193,7 +230,7 @@ fn main() -> ! {
     // Phase-3d carrier detector (watches RO for the TX carrier-sense gate).
     // The CPU edge-track DPLL (eth_rx_dpll) handles clock recovery in software
     // off the 60 MHz sample stream — SM3 + PIO1 are free for future use.
-    let (mut pio0, sm0, sm1, sm2, _sm3) = pac.PIO0.split(&mut pac.RESETS);
+    let (mut pio0, sm0, sm1, sm2, _sm3) = pio0.split(&mut resets);
     let sys_clk_hz = clocks.system_clock.freq().to_Hz();
     // SM0 = Manchester TX; SM2 = carrier detector (Phase 3d) watching RO (GP13).
     let eth_tx = eth_tx::EthTx::new(&mut pio0, sm0, sm2, HW_PIN_TXD, HW_PIN_RXD, sys_clk_hz);
@@ -201,7 +238,7 @@ fn main() -> ! {
     // DMA channels 0 and 1 ferry samples from the PIO RX FIFO into two
     // 16 KB half-buffers. EthRx::poll_with hands the just-filled half to
     // the decoder while DMA continues filling the other.
-    let dma = pac.DMA.split(&mut pac.RESETS);
+    let dma = dma.split(&mut resets);
     let rx_buf_a = singleton!(: [u32; eth_rx::BUF_WORDS] = [0; eth_rx::BUF_WORDS]).unwrap();
     let rx_buf_b = singleton!(: [u32; eth_rx::BUF_WORDS] = [0; eth_rx::BUF_WORDS]).unwrap();
     // Carry + stitch buffers for ring-aware scan across DMA half boundaries.
@@ -247,7 +284,7 @@ fn main() -> ! {
     // core 0, so the main loop's iteration budget stays free.
     let core1_stack = unsafe { &mut (*core::ptr::addr_of_mut!(CORE1_STACK)).0 };
     let core1_launch_ok = unsafe {
-        multicore_riscv::launch_core1_riscv(&mut pac.PSM, &mut sio.fifo, core1_stack, core1_entry)
+        multicore_riscv::launch_core1_riscv(&mut psm, &mut sio_fifo, core1_stack, core1_entry)
             .is_ok()
     };
 
@@ -314,11 +351,11 @@ fn main() -> ! {
     };
     // USB CDC: appears on the host as /dev/ttyACM0.
     let usb_bus = UsbBusAllocator::new(hal::usb::UsbBus::new(
-        pac.USB,
-        pac.USB_DPRAM,
+        usb,
+        usb_dpram,
         clocks.usb_clock,
         true,
-        &mut pac.RESETS,
+        &mut resets,
     ));
     let mut serial = SerialPort::new(&usb_bus);
     // Vendor "reset interface" so `picotool -f` can self-reboot us into
