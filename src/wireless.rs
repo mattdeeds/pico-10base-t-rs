@@ -32,7 +32,7 @@ use embassy_time_queue_utils::Queue;
 use heapless::String;
 use rp235x_hal as hal;
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
-use smoltcp::socket::udp;
+use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 use usb_device::{class_prelude::*, prelude::*};
@@ -911,13 +911,61 @@ async fn net_task(net: cyw43::NetDriver<'static>, mac: [u8; 6]) -> ! {
     let dhcp_handle = sockets.add(dhcp_socket);
     let mut dhcp = DhcpServer::new();
 
+    // R14.5 — a tiny mgmt HTTP server on the LAN gateway IP (192.168.4.1:80).
+    let mut http_rx = [0u8; 1024];
+    let mut http_tx = [0u8; 1024];
+    let http_socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(&mut http_rx[..]),
+        tcp::SocketBuffer::new(&mut http_tx[..]),
+    );
+    let http_handle = sockets.add(http_socket);
+
     CYW43_NET_UP.store(1, Ordering::Relaxed);
     loop {
         iface.poll(now(), &mut device, &mut sockets);
         // Drain + answer DHCP after the iface has delivered inbound datagrams;
         // the queued replies go out on the next poll.
         dhcp.poll(sockets.get_mut::<udp::Socket>(dhcp_handle));
+        serve_status_http(sockets.get_mut::<tcp::Socket>(http_handle));
         Timer::after(Duration::from_millis(5)).await;
+    }
+}
+
+/// R14.5 — a one-shot HTTP/1.0 status page on `192.168.4.1:80`. Re-listens after
+/// each closed connection; ignores the request line (every GET gets the same
+/// page). Shows the AP + LAN config and the live `[Cyw43]` counters so a joined
+/// client can confirm it's talking to the Pico router.
+fn serve_status_http(socket: &mut tcp::Socket) {
+    if !socket.is_open() {
+        let _ = socket.listen(80);
+    }
+    if socket.may_recv() {
+        let _ = socket.recv(|buf| (buf.len(), ()));
+    }
+    if socket.can_send() {
+        let uptime_s = embassy_time::Instant::now().as_secs();
+        let mut body: String<320> = String::new();
+        let _ = write!(
+            body,
+            "Pico RP2350 Wireless Router (Rust)\r\n\
+             AP SSID:     {AP_SSID}\r\n\
+             LAN gateway: 192.168.4.1/24\r\n\
+             uptime:      {uptime_s}s\r\n\
+             DHCP replies:{}\r\n\
+             LAN rx:      {}\r\n",
+            crate::dhcp_server::DHCP_TX.load(Ordering::Relaxed),
+            crate::cyw43_phy::CYW43_RX_FRAMES.load(Ordering::Relaxed),
+        );
+        let mut head: String<128> = String::new();
+        let _ = write!(
+            head,
+            "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = socket.send_slice(head.as_bytes());
+        let _ = socket.send_slice(body.as_bytes());
+        socket.close();
     }
 }
 
