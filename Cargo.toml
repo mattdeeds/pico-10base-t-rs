@@ -46,6 +46,19 @@ clock-150mhz = []
 # silent SFD-lock failures) is confirmed and the gap is paper-only.
 http-bulk-test = []
 
+# R15a — make the 10BASE-T (WAN) side a DHCP *client* (instead of the static
+# 192.168.37.24): smoltcp's dhcpv4 client gets us an upstream IP + default route
+# + DNS, and the device originates a ping to 8.8.8.8 + resolves a name to prove
+# it reaches the internet out the wired link. OFF by default so the production
+# NIC build (static IP, all the R4–R8 host test recipes) is unchanged. The first
+# of the two R15 sub-steps; R15b (`router`) unifies this under the executor
+# alongside the wireless LAN — see docs/r15-plan.md.
+wan-dhcp = [
+    "smoltcp/socket-dhcpv4",   # DHCP client socket (proto-dhcpv4 wire codec already on)
+    "smoltcp/socket-icmp",     # device-originated ping (acceptance: ping 8.8.8.8)
+    "smoltcp/socket-dns",      # device-originated name resolution (acceptance: resolve a name)
+]
+
 # R13 — wireless router scaffolding (Pico 2 W / CYW43439). Pulls in the cyw43
 # driver + the async runtime (embassy-executor arch-riscv32 + embassy-time on a
 # custom rp235x-hal time-driver). OFF by default so the production 10BASE-T

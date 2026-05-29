@@ -64,6 +64,15 @@ use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+// R15a — WAN-as-DHCP-client: the dhcpv4/icmp/dns sockets + the ICMP echo wire
+// codec, plus the device's checksum capabilities for emitting/parsing echoes.
+// Gated so the default (static-IP) build pulls none of it.
+#[cfg(feature = "wan-dhcp")]
+use smoltcp::socket::{dhcpv4, dns, icmp};
+#[cfg(feature = "wan-dhcp")]
+use smoltcp::phy::{ChecksumCapabilities, Device as _};
+#[cfg(feature = "wan-dhcp")]
+use smoltcp::wire::{DnsQueryType, Icmpv4Packet, Icmpv4Repr, Ipv4Cidr};
 use usb_device::{class_prelude::*, prelude::*};
 use usbd_serial::SerialPort;
 
@@ -300,16 +309,27 @@ fn main_10bt(
     let mut mac = eth_mac::EthMac::new(eth_tx);
 
     let our_mac = EthernetAddress(our_mac_bytes);
-    let our_ip = IpAddress::Ipv4(Ipv4Address::new(192, 168, 37, 24));
     let mut iface_config = Config::new(HardwareAddress::Ethernet(our_mac));
     iface_config.random_seed = timer.get_counter().ticks();
     let now0_inst = Instant::from_micros(timer.get_counter().ticks() as i64);
     let mut iface = Interface::new(iface_config, &mut mac, now0_inst);
+    // Default build: static IP (mirrors the C reference + the host test recipes
+    // in RESUME.md). With `--features wan-dhcp` the address + default route are
+    // left empty — the dhcpv4 client installs them once it gets a lease (see the
+    // WAN socket wiring below).
+    #[cfg(not(feature = "wan-dhcp"))]
     iface.update_ip_addrs(|addrs| {
-        addrs.push(IpCidr::new(our_ip, 24)).unwrap();
+        addrs
+            .push(IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(192, 168, 37, 24)), 24))
+            .unwrap();
     });
 
+    // Default: UDP echo + HTTP = 2 sockets (5 slots of headroom). The wan-dhcp
+    // build adds 3 more (dhcpv4 + icmp + dns), so size for 8.
+    #[cfg(not(feature = "wan-dhcp"))]
     let mut sockets_storage: [SocketStorage; 5] = [SocketStorage::EMPTY; 5];
+    #[cfg(feature = "wan-dhcp")]
+    let mut sockets_storage: [SocketStorage; 8] = [SocketStorage::EMPTY; 8];
     let mut sockets = SocketSet::new(&mut sockets_storage[..]);
 
     // R4.6: UDP echo socket on port 1234. Storage lives in main's stack
@@ -344,6 +364,39 @@ fn main_10bt(
     let tcp_tx_buffer = tcp::SocketBuffer::new(&mut tcp_tx_storage[..]);
     let tcp_socket = tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer);
     let tcp_handle: SocketHandle = sockets.add(tcp_socket);
+
+    // R15a — WAN-as-DHCP-client sockets. Buffers live in this never-returning
+    // fn's stack (same pattern as the udp/tcp buffers above), so the borrows the
+    // SocketSet holds are valid for the life of the loop.
+    #[cfg(feature = "wan-dhcp")]
+    let dhcp_handle: SocketHandle = sockets.add(dhcpv4::Socket::new());
+
+    #[cfg(feature = "wan-dhcp")]
+    let mut icmp_rx_meta = [icmp::PacketMetadata::EMPTY; 8];
+    #[cfg(feature = "wan-dhcp")]
+    let mut icmp_rx_payload = [0u8; 512];
+    #[cfg(feature = "wan-dhcp")]
+    let mut icmp_tx_meta = [icmp::PacketMetadata::EMPTY; 8];
+    #[cfg(feature = "wan-dhcp")]
+    let mut icmp_tx_payload = [0u8; 512];
+    #[cfg(feature = "wan-dhcp")]
+    let icmp_handle: SocketHandle = sockets.add(icmp::Socket::new(
+        icmp::PacketBuffer::new(&mut icmp_rx_meta[..], &mut icmp_rx_payload[..]),
+        icmp::PacketBuffer::new(&mut icmp_tx_meta[..], &mut icmp_tx_payload[..]),
+    ));
+
+    // DNS query slots (no_std: a borrowed fixed array, not a Vec). Servers are
+    // empty until the dhcpv4 client hands us the lease's DNS option.
+    #[cfg(feature = "wan-dhcp")]
+    let mut dns_queries: [Option<dns::DnsQuery>; 2] = [None, None];
+    #[cfg(feature = "wan-dhcp")]
+    let dns_handle: SocketHandle = sockets.add(dns::Socket::new(&[], &mut dns_queries[..]));
+
+    #[cfg(feature = "wan-dhcp")]
+    let mut wan = WanState::new();
+    // The device's TX checksum capabilities — used to emit/parse ICMP echoes.
+    #[cfg(feature = "wan-dhcp")]
+    let wan_checksum: ChecksumCapabilities = mac.capabilities().checksum;
 
     // Mirror the C reference's network parameters so the host's existing
     // ethtool / IP route setup keeps working.
@@ -404,6 +457,10 @@ fn main_10bt(
     let mut next_nlp = now0;
     let mut next_udp = now0 + 200_000;
     let mut next_log = now0 + 1_000_000;
+    // R15a — once per second: emit one ICMP echo to 8.8.8.8 + (re)start a DNS
+    // query when idle. Reply draining + result polling happen every iteration.
+    #[cfg(feature = "wan-dhcp")]
+    let mut next_ping = now0 + 1_000_000;
     let mut nlps_sent: u32 = 0;
     let mut udp_sent: u32 = 0;
     let mut log_tick: u32 = 0;
@@ -434,6 +491,16 @@ fn main_10bt(
         let now_inst = Instant::from_micros(now as i64);
         iface.poll(now_inst, &mut mac, &mut sockets);
 
+        // R15a — WAN client work that runs every iteration (after iface.poll has
+        // delivered inbound datagrams): apply any DHCP lease change to the
+        // interface, drain ICMP echo replies, and harvest a finished DNS query.
+        #[cfg(feature = "wan-dhcp")]
+        {
+            wan_dhcp_apply(&mut iface, &mut sockets, dhcp_handle, dns_handle, &mut wan);
+            wan_ping_drain(&mut sockets, icmp_handle, &mut wan, &wan_checksum);
+            wan_dns_harvest(&mut sockets, dns_handle, &mut wan);
+        }
+
         // R4.6: UDP echo on port 1234. R7: tiny HTTP server on port 80.
         serve_udp_echo(&mut sockets, udp_handle);
         #[cfg(not(feature = "http-bulk-test"))]
@@ -461,6 +528,18 @@ fn main_10bt(
             udp_sent = udp_sent.wrapping_add(1);
         }
 
+        // R15a — once per second: send one ICMP echo to 8.8.8.8 and, if no DNS
+        // query is in flight and we know a server, kick off a name lookup. Only
+        // fires once a lease has installed an address (else there's no source IP).
+        #[cfg(feature = "wan-dhcp")]
+        if now >= next_ping {
+            next_ping = next_ping.wrapping_add(1_000_000);
+            if wan.addr.is_some() {
+                wan_ping_send(&mut sockets, icmp_handle, &mut wan, &wan_checksum);
+                wan_dns_start(&mut iface, &mut sockets, dns_handle, &mut wan);
+            }
+        }
+
         // Heartbeat + status print every 1 s.
         if now >= next_log {
             next_log = next_log.wrapping_add(1_000_000);
@@ -474,9 +553,283 @@ fn main_10bt(
             log_status(
                 &mut serial, &mut line, &mut mac, log_tick, nlps_sent, udp_sent, core1_launch_ok,
             );
+            #[cfg(feature = "wan-dhcp")]
+            log_wan(&mut serial, &mut line, &wan);
             nlps_sent = 0; // [R2b] reports nlps as a per-second rate
         }
     }
+}
+
+// =====================================================================
+// R15a — WAN-as-DHCP-client helpers (all gated by the `wan-dhcp` feature)
+// =====================================================================
+//
+// The 10BASE-T side becomes a DHCP client: it leases an upstream IP + default
+// route + DNS, then proves internet reachability by pinging 8.8.8.8 and
+// resolving a name out the wired link. NAPT/forwarding stay R16/R17 — this is
+// the router box being a *client*, not routing other clients' traffic. See
+// docs/r15-plan.md §5.
+
+/// Off-link ping target (Google public DNS) — reachable only via the default
+/// route, so a reply proves the DHCP-installed gateway works.
+#[cfg(feature = "wan-dhcp")]
+const WAN_PING_TARGET: Ipv4Address = Ipv4Address::new(8, 8, 8, 8);
+/// Name to resolve via the DHCP-provided DNS server (acceptance #3).
+#[cfg(feature = "wan-dhcp")]
+const WAN_DNS_NAME: &str = "example.com";
+/// ICMP echo identifier we bind to + match replies against.
+#[cfg(feature = "wan-dhcp")]
+const WAN_ICMP_IDENT: u16 = 0x42;
+
+/// Live WAN-client state, surfaced once per second over CDC as the `[Wan]` line
+/// — the on-device evidence for the R15a acceptance.
+#[cfg(feature = "wan-dhcp")]
+struct WanState {
+    /// Address the dhcpv4 client leased (`None` until configured).
+    addr: Option<Ipv4Cidr>,
+    /// Default gateway from the lease.
+    gw: Option<Ipv4Address>,
+    /// First DNS server from the lease.
+    dns0: Option<Ipv4Address>,
+    /// ICMP echo sequence counter + sent/replied tallies.
+    ping_seq: u16,
+    ping_sent: u32,
+    ping_ok: u32,
+    /// In-flight DNS query handle, if any.
+    dns_query: Option<dns::QueryHandle>,
+    /// Last A record resolved for [`WAN_DNS_NAME`].
+    resolved: Option<Ipv4Address>,
+}
+
+#[cfg(feature = "wan-dhcp")]
+impl WanState {
+    fn new() -> Self {
+        Self {
+            addr: None,
+            gw: None,
+            dns0: None,
+            ping_seq: 0,
+            ping_sent: 0,
+            ping_ok: 0,
+            dns_query: None,
+            resolved: None,
+        }
+    }
+}
+
+/// Apply a dhcpv4 lease change: install/clear the interface address + default
+/// route and feed (or clear) the DNS socket's server list. Call every poll,
+/// after `iface.poll`. The lease data is copied out of the borrowed `Event`
+/// first (it borrows the SocketSet) so we can then touch the dns socket.
+#[cfg(feature = "wan-dhcp")]
+fn wan_dhcp_apply(
+    iface: &mut Interface,
+    sockets: &mut SocketSet,
+    dhcp_handle: SocketHandle,
+    dns_handle: SocketHandle,
+    wan: &mut WanState,
+) {
+    enum Action {
+        None,
+        Deconfig,
+        Config {
+            addr: Ipv4Cidr,
+            router: Option<Ipv4Address>,
+            dns0: Option<Ipv4Address>,
+            servers: heapless::Vec<IpAddress, 4>,
+        },
+    }
+    // Drain the event into owned values; the dhcp-socket borrow ends here.
+    let action = match sockets.get_mut::<dhcpv4::Socket>(dhcp_handle).poll() {
+        None => Action::None,
+        Some(dhcpv4::Event::Deconfigured) => Action::Deconfig,
+        Some(dhcpv4::Event::Configured(cfg)) => {
+            let mut servers: heapless::Vec<IpAddress, 4> = heapless::Vec::new();
+            for s in cfg.dns_servers.iter() {
+                let _ = servers.push(IpAddress::Ipv4(*s));
+            }
+            Action::Config {
+                addr: cfg.address,
+                router: cfg.router,
+                dns0: cfg.dns_servers.first().copied(),
+                servers,
+            }
+        }
+    };
+
+    match action {
+        Action::None => {}
+        Action::Deconfig => {
+            iface.update_ip_addrs(|a| a.clear());
+            iface.routes_mut().remove_default_ipv4_route();
+            sockets.get_mut::<dns::Socket>(dns_handle).update_servers(&[]);
+            *wan = WanState::new();
+        }
+        Action::Config {
+            addr,
+            router,
+            dns0,
+            servers,
+        } => {
+            iface.update_ip_addrs(|a| {
+                a.clear();
+                let _ = a.push(IpCidr::Ipv4(addr));
+            });
+            iface.routes_mut().remove_default_ipv4_route();
+            if let Some(gw) = router {
+                let _ = iface.routes_mut().add_default_ipv4_route(gw);
+            }
+            sockets
+                .get_mut::<dns::Socket>(dns_handle)
+                .update_servers(&servers);
+            wan.addr = Some(addr);
+            wan.gw = router;
+            wan.dns0 = dns0;
+            // Servers may have changed — abandon any in-flight query.
+            wan.dns_query = None;
+        }
+    }
+}
+
+/// Send one ICMP echo request to [`WAN_PING_TARGET`] (binds the socket lazily).
+/// Replies are tallied in [`wan_ping_drain`].
+#[cfg(feature = "wan-dhcp")]
+fn wan_ping_send(
+    sockets: &mut SocketSet,
+    icmp_handle: SocketHandle,
+    wan: &mut WanState,
+    checksum: &ChecksumCapabilities,
+) {
+    let sock = sockets.get_mut::<icmp::Socket>(icmp_handle);
+    if !sock.is_open() && sock.bind(icmp::Endpoint::Ident(WAN_ICMP_IDENT)).is_err() {
+        return;
+    }
+    if !sock.can_send() {
+        return;
+    }
+    let repr = Icmpv4Repr::EchoRequest {
+        ident: WAN_ICMP_IDENT,
+        seq_no: wan.ping_seq,
+        data: b"pico-wan",
+    };
+    if let Ok(payload) = sock.send(repr.buffer_len(), IpAddress::Ipv4(WAN_PING_TARGET)) {
+        let mut pkt = Icmpv4Packet::new_unchecked(payload);
+        repr.emit(&mut pkt, checksum);
+        wan.ping_seq = wan.ping_seq.wrapping_add(1);
+        wan.ping_sent = wan.ping_sent.wrapping_add(1);
+    }
+}
+
+/// Drain ICMP echo replies; count the ones matching our ident.
+#[cfg(feature = "wan-dhcp")]
+fn wan_ping_drain(
+    sockets: &mut SocketSet,
+    icmp_handle: SocketHandle,
+    wan: &mut WanState,
+    checksum: &ChecksumCapabilities,
+) {
+    let sock = sockets.get_mut::<icmp::Socket>(icmp_handle);
+    while sock.can_recv() {
+        let Ok((payload, _from)) = sock.recv() else {
+            break;
+        };
+        let Ok(pkt) = Icmpv4Packet::new_checked(payload) else {
+            continue;
+        };
+        if let Ok(Icmpv4Repr::EchoReply { ident, .. }) = Icmpv4Repr::parse(&pkt, checksum) {
+            if ident == WAN_ICMP_IDENT {
+                wan.ping_ok = wan.ping_ok.wrapping_add(1);
+            }
+        }
+    }
+}
+
+/// Start a DNS A-record query for [`WAN_DNS_NAME`] when none is in flight and a
+/// server is known.
+#[cfg(feature = "wan-dhcp")]
+fn wan_dns_start(
+    iface: &mut Interface,
+    sockets: &mut SocketSet,
+    dns_handle: SocketHandle,
+    wan: &mut WanState,
+) {
+    if wan.dns_query.is_some() || wan.dns0.is_none() {
+        return;
+    }
+    let cx = iface.context();
+    if let Ok(handle) = sockets
+        .get_mut::<dns::Socket>(dns_handle)
+        .start_query(cx, WAN_DNS_NAME, DnsQueryType::A)
+    {
+        wan.dns_query = Some(handle);
+    }
+}
+
+/// Harvest a finished DNS query: record the first A record + free the slot.
+#[cfg(feature = "wan-dhcp")]
+fn wan_dns_harvest(sockets: &mut SocketSet, dns_handle: SocketHandle, wan: &mut WanState) {
+    let Some(handle) = wan.dns_query else {
+        return;
+    };
+    match sockets
+        .get_mut::<dns::Socket>(dns_handle)
+        .get_query_result(handle)
+    {
+        Ok(addrs) => {
+            wan.dns_query = None;
+            wan.resolved = addrs.iter().find_map(|ip| match ip {
+                IpAddress::Ipv4(v4) => Some(*v4),
+                #[allow(unreachable_patterns)] // ipv6 disabled — single variant
+                _ => None,
+            });
+        }
+        Err(dns::GetQueryResultError::Pending) => {}
+        // Failed (NXDOMAIN / SERVFAIL / timeout) — free the slot, retry later.
+        Err(_) => wan.dns_query = None,
+    }
+}
+
+/// Emit the once-per-second `[Wan]` status line: lease IP / gateway / DNS, the
+/// ICMP ping tally, and the last resolved A record.
+#[cfg(feature = "wan-dhcp")]
+fn log_wan<B: UsbBus>(serial: &mut SerialPort<'_, B>, line: &mut String<160>, wan: &WanState) {
+    line.clear();
+    let _ = write!(line, "[Wan] ");
+    match wan.addr {
+        Some(c) => {
+            let _ = write!(line, "ip={} ", c);
+        }
+        None => {
+            let _ = write!(line, "ip=none ");
+        }
+    }
+    match wan.gw {
+        Some(g) => {
+            let _ = write!(line, "gw={} ", g);
+        }
+        None => {
+            let _ = write!(line, "gw=none ");
+        }
+    }
+    match wan.dns0 {
+        Some(d) => {
+            let _ = write!(line, "dns={} ", d);
+        }
+        None => {
+            let _ = write!(line, "dns=none ");
+        }
+    }
+    let _ = write!(line, "ping={}/{} ", wan.ping_ok, wan.ping_sent);
+    match wan.resolved {
+        Some(a) => {
+            let _ = write!(line, "{}={}", WAN_DNS_NAME, a);
+        }
+        None => {
+            let _ = write!(line, "{}=?", WAN_DNS_NAME);
+        }
+    }
+    let _ = writeln!(line);
+    let _ = serial.write(line.as_bytes());
 }
 
 /// R4.6: UDP echo on port 1234 — bind lazily, then drain up to a few received
