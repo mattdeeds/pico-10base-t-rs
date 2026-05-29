@@ -692,8 +692,18 @@ impl cyw43::SpiBusCyw43 for PioSpiCyw43 {
 pub static CYW43_NEW_DONE: AtomicU32 = AtomicU32::new(0);
 /// 1 once `Control::init(clm)` returned (CLM loaded + WiFi firmware up).
 pub static CYW43_INIT_DONE: AtomicU32 = AtomicU32::new(0);
-/// 1 once the onboard-LED blink sequence finished (gpio_set ioctls work).
+/// 1 once at least one onboard-LED toggle has run (`gpio_set` ioctls work); the
+/// blink loop re-sets it every cycle, so it staying 1 while `hb` climbs proves
+/// the Runner is alive.
 pub static CYW43_LED_DONE: AtomicU32 = AtomicU32::new(0);
+/// 1 once `Control::start_ap_wpa2(...)` returned (R14.2 — AP beaconing).
+pub static CYW43_AP_DONE: AtomicU32 = AtomicU32::new(0);
+
+// R14.2 AP parameters (dev defaults for the LAN-side bring-up). WPA2 passphrase
+// must be 8..=63 bytes. 2.4 GHz channel 6. These become configurable later.
+const AP_SSID: &str = "pico-rp2350-router";
+const AP_PASSPHRASE: &str = "picorouter2350";
+const AP_CHANNEL: u8 = 6;
 
 /// R13 Step 3 — full cyw43 bring-up via `block_on`: `cyw43::new()` (firmware +
 /// nvram over our PIO1 transport) → run the Runner concurrently with
@@ -833,10 +843,11 @@ async fn usb_task(
             let mut line: String<96> = String::new();
             let _ = write!(
                 line,
-                "[Cyw43] new={} init={} led={} hb={}\r\n",
+                "[Cyw43] new={} init={} led={} ap={} hb={}\r\n",
                 CYW43_NEW_DONE.load(Ordering::Relaxed),
                 CYW43_INIT_DONE.load(Ordering::Relaxed),
                 CYW43_LED_DONE.load(Ordering::Relaxed),
+                CYW43_AP_DONE.load(Ordering::Relaxed),
                 n / 1000,
             );
             let _ = serial.write(line.as_bytes());
@@ -877,6 +888,21 @@ async fn cyw43_bootstrap_task(spawner: Spawner, pwr: WlOnPin, spi: PioSpiCyw43) 
     control.init(clm).await;
     CYW43_INIT_DONE.store(1, Ordering::Relaxed);
 
+    // R14.2 — bring up the AP. No power-save: an AP must stay available for
+    // clients (the default PM would let the radio nap and miss beacons/probes).
+    control
+        .set_power_management(cyw43::PowerManagementMode::None)
+        .await;
+    control
+        .start_ap_wpa2(AP_SSID, AP_PASSPHRASE, AP_CHANNEL)
+        .await;
+    CYW43_AP_DONE.store(1, Ordering::Relaxed);
+
+    // Keep blinking the onboard LED forever — still our liveness proof that the
+    // Runner stays up (and now that the AP is beaconing too). NB R14.2 acceptance
+    // is the SSID appearing in a passive scan; *joining* needs the data path
+    // (R14.3 phy adapter) + DHCP (R14.4) — the NetDriver (`_net`) is still
+    // dropped here, so don't try to associate yet.
     let mut on = false;
     loop {
         on = !on;
