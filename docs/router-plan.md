@@ -390,3 +390,72 @@ owns core 0) — out of R13 scope.
 sourcing for 0.7.0 · async links-but-misbehaves at runtime (heartbeat + Step-1
 telemetry surface it) · TIMER0/IRQ/CS conflicts (standalone build avoids 10BT
 contention) · executor ⊥ 10BT concurrency (deferred to R14).
+
+## 12. R14 — "LAN up": concrete step plan (2026-05-29)
+
+R13 proved the chip inits over our PIO1 transport (`[Cyw43] new=1 init=1 led=1`)
+via `block_on`. R14 turns that one-shot bring-up into a **live LAN**: an AP a
+phone can join, a DHCP server that leases it an address, and a smoltcp
+`Interface` on the wireless side that answers from the gateway IP.
+
+**Goal / acceptance (= §7's R14 row, unchanged):** *a phone joins the SSID, gets
+a DHCP lease, and pings the Pico's LAN gateway IP.* That is the whole bar.
+
+**Scope is deliberately NARROW — LAN-side only.** R14 does **not** include
+WAN-as-client (R15), L3 forwarding (R16), or NAPT/conntrack (R17). (The RESUME's
+older "AP + DHCP + NAPT" phrasing conflated those; this §12 + the §7 table are
+authoritative — NAPT stays R17.) Because the acceptance is purely LAN-side, R14
+**stays a standalone-wireless build** (`--features wireless`, 10BASE-T not
+started, per §11). The hard executor-⊥-10BT runtime unification is **R16's**
+problem, when transit traffic must actually cross the two interfaces.
+
+### 12.1 Two architecture decisions (DECIDED)
+
+**(1) Runtime model = the persistent embassy executor (DECIDED, not `block_on`).**
+R13's `block_on(select(runner.run(), seq))` *returned* after the 6-blink
+sequence — the Runner died. R14 needs `Runner::run()` alive **forever** (it
+services every gSPI transaction + chip event). We graduate to the real
+executor: `run_executor()` (already compiles + links since R13, but never yet
+*run* on hardware) spawns the Runner + a net task + the USB/telemetry task.
+Running the executor for the first time in this LAN-only setting **retires the
+project's documented #1 risk** (async runtime on Hazard3 at runtime, §8.1) at low
+stakes — no 10BT to corrupt if it misbehaves. **Fallback if the executor hangs
+at runtime:** `block_on(join3(runner.run(), net_loop(), usb_loop()))` reuses
+R13's exact proven primitive; the LAN logic below is identical either way.
+
+**(2) The `NetDriver` → smoltcp glue is a `phy::Device` ADAPTER we write — NOT a
+direct plug (corrects §3).** §3 claimed cyw43's `NetDriver` "plugs straight into
+a smoltcp `Interface`." Verified false for *raw* smoltcp (what `EthMac` uses on
+the 10BT side): `cyw43::NetDriver<'a> = embassy_net_driver_channel::Device<'a,
+MTU>`, which implements the **async, waker-based `embassy_net_driver::Driver`**
+trait — that plugs into *embassy-net*, not raw smoltcp's synchronous
+`phy::Device`. **But** the same `ch::Device` also exposes a clean **synchronous**
+API — `try_rx_buf()`/`rx_done(len)`, `try_tx_buf()`/`tx_done()`, and
+`borrow_split() → (StateRunner, RxRunner, TxRunner)` — so we write a thin
+`phy::Device` shim over it. **No `embassy-net` dependency, no noop-waker hack,
+one smoltcp stack for both interfaces.** This adapter is the keystone new piece.
+
+### 12.2 Steps (lowest-risk increment first; each has its own on-wire accept)
+
+| Step | Work | Acceptance |
+|---|---|---|
+| **R14.1 — continuous Runner** | Replace `cyw43_bringup_blocking`'s `select→return` with: `cyw43::new()` → `Control::init(clm)` → **spawn `Runner::run()` as a long-lived executor task**, keep `Control` live. Relocate the heartbeat LED to `Control::gpio_set(0,…)` (GP25 is now WL_CS — retire `main.rs:163`'s `led`). | LED blinks **indefinitely** (not just 6×) ⇒ Runner stays up under the executor. The core de-risk — everything else builds on it. |
+| **R14.2 — start AP** | After init: `Control::start_ap_wpa2(SSID, passphrase, channel)` (sig confirmed, cyw43 0.7.0). Read the MAC via `Control::address()`. | The SSID appears in a phone/laptop wifi scan. |
+| **R14.3 — phy adapter + LAN `Interface`** | New `src/cyw43_phy.rs`: wrap `ch::Device` in smoltcp `phy::Device` using `borrow_split()` so the rx+tx tokens `receive()` returns borrow disjoint halves. `receive` = `try_rx_buf()`→RxToken (`rx_done(len)` on consume); `transmit` = `try_tx_buf()`→TxToken (write + `tx_done()`). Build a 2nd smoltcp `Interface` (static `192.168.4.1/24`, `HardwareAddress::Ethernet` from `Control::address()`), polled in the net task. | A **manually-configured** client (static `192.168.4.2/24`) pings `192.168.4.1` (auto-icmp-echo-reply is already in our smoltcp features). Proves the data path through cyw43 + adapter before DHCP exists. |
+| **R14.4 — DHCP server** (§6.3; the bulk) | New `src/dhcp_server.rs`: smoltcp UDP socket on `0.0.0.0:67`; parse BOOTP/DHCP DISCOVER + REQUEST; emit OFFER + ACK broadcast to `255.255.255.255:68` with yiaddr from a fixed `heapless` lease pool in `192.168.4.0/24`, router+DNS = `192.168.4.1`, subnet mask + lease time. Lease table keyed by client MAC. | **The R14 milestone:** a phone joins the SSID, **auto-gets a lease**, pings `192.168.4.1`. |
+| **R14.5 — mgmt sanity + docs** | Bind the existing tiny HTTP server to the LAN `Interface` (`192.168.4.1:80`, reusing `serve_http`) so a joined phone loads a status page. Update RESUME + this doc. | Joined phone loads the status page; live demo of the LAN. |
+
+### 12.3 Risks (R14-specific)
+
+1. **First on-hardware executor run** (R14.1) — the #1 deferred risk finally
+   exercised. Mitigated by the `block_on(join)` fallback (12.1).
+2. **DHCP broadcast quirks** — clients send from `0.0.0.0` → `255.255.255.255`
+   *before* they hold an IP; the smoltcp UDP socket bind / broadcast-accept + the
+   BOOTP broadcast flag are the fiddliest new code. Budget time here.
+3. **Adapter borrow model** — resolved via `borrow_split` (disjoint rx/tx), but
+   verify the lifetimes hold inside a `phy::Device` struct.
+4. **gSPI at 2 MHz busy-poll** — the *continuous* Runner now does ongoing SPI
+   (not one-shot init); fine for LAN-only R14, but DMA on the transport (deferred
+   in §11) becomes wanted at R16 when the core is also forwarding.
+5. **Memory** — 2nd `Interface` + socket buffers + cyw43 `State`. The 231 KB
+   firmware is in *flash* (`include_bytes!`), not RAM. Budget against 520 KB.
