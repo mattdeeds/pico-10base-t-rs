@@ -164,12 +164,26 @@ fn main() -> ! {
 
     let timer = hal::Timer::new_timer0(pac.TIMER0, &mut pac.RESETS, &clocks);
 
-    // R13 — gSPI bring-up probe (gated). Powers the CYW43 and bit-bangs a read
-    // of its bus test register (want 0xFEEDBEAD); the result is logged over the
-    // existing CDC/UDP telemetry by `log_status`. Runs once at boot (~270 ms),
-    // then the normal 10BASE-T loop continues so we keep that telemetry.
+    // R13 Step 1 — gSPI bring-up probe over PIO1 (gated). Powers the CYW43 and
+    // reads its bus test register (want 0xFEEDBEAD) via a real PIO gSPI SM, not
+    // the bit-bang — the chip's input synchronizer needs PIO-grade timing. Result
+    // is logged over the existing CDC/UDP telemetry by `log_status`. Runs once at
+    // boot (~270 ms), then the normal 10BASE-T loop continues so we keep that
+    // telemetry. DATA (GP24) + CLK (GP29) → PIO1; CS (GP25)/WL_ON (GP23) are SIO
+    // driven inside the probe. (Bit-bang `probe_cyw43` kept for reference.)
     #[cfg(feature = "wireless")]
-    wireless::probe_cyw43();
+    {
+        // Debug self-test first: can the RP2350 even drive WL_ON/CS/CLK/DATA?
+        // (raw SIO drive + GPIO_IN readback). Runs before the PIO routing below;
+        // the gSPI probe re-power-cycles WL_ON, so the toggling here is reset.
+        wireless::pin_selftest();
+
+        let _cyw_data: hal::gpio::Pin<_, hal::gpio::FunctionPio1, _> = pins.gpio24.into_function();
+        let _cyw_clk: hal::gpio::Pin<_, hal::gpio::FunctionPio1, _> = pins.gpio29.into_function();
+        let (mut pio1, pio1_sm0, _, _, _) = pac.PIO1.split(&mut pac.RESETS);
+        let sys_clk_hz_w = clocks.system_clock.freq().to_Hz();
+        wireless::probe_cyw43_pio(&mut pio1, pio1_sm0, sys_clk_hz_w);
+    }
 
     // GP14 → ISL3177E DI, GP13 → ISL3177E RO. Reassign both to PIO0 function.
     let _tx_pin: hal::gpio::Pin<_, FunctionPio0, _> = pins.gpio14.into_function();
@@ -585,6 +599,23 @@ fn log_status<B: UsbBus>(
     // CYW43 bus is alive and our transport understands the gSPI protocol.
     #[cfg(feature = "wireless")]
     {
+        let pin_lo = wireless::CYW43_PIN_LO.load(Ordering::Relaxed);
+        let pin_hi = wireless::CYW43_PIN_HI.load(Ordering::Relaxed);
+        line.clear();
+        let _ = writeln!(
+            line,
+            "[PinTest] (lo/hi) pwr23={}/{} data24={}/{} cs25={}/{} clk29={}/{} (want 0/1)",
+            (pin_lo >> 23) & 1,
+            (pin_hi >> 23) & 1,
+            (pin_lo >> 24) & 1,
+            (pin_hi >> 24) & 1,
+            (pin_lo >> 25) & 1,
+            (pin_hi >> 25) & 1,
+            (pin_lo >> 29) & 1,
+            (pin_hi >> 29) & 1,
+        );
+        let _ = serial.write(line.as_bytes());
+
         line.clear();
         let _ = writeln!(
             line,

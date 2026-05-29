@@ -30,6 +30,11 @@ use embassy_time_driver::Driver;
 use embassy_time_queue_utils::Queue;
 use rp235x_hal as hal;
 
+use hal::pac::PIO1;
+use hal::pio::{
+    PIOBuilder, PinDir, PinState, Rx, ShiftDirection, Tx, UninitStateMachine, SM0,
+};
+
 // =====================================================================
 // 0. Synchronous gSPI bring-up probe (R13 first on-board milestone)
 // =====================================================================
@@ -62,6 +67,7 @@ const PIN_CS: u32 = 25;
 const PIN_CLK: u32 = 29;
 /// Half-clock-phase spin (~0.25 µs @ 240 MHz → ~2 MHz gSPI). Slow + safe for
 /// bring-up; the real PIO transport will run far faster.
+#[allow(dead_code)] // bit-bang probe machinery — superseded by probe_cyw43_pio, kept for reference
 const PHASE: u32 = 60;
 
 #[inline]
@@ -95,6 +101,7 @@ fn gpio_oe(n: u32, output: bool) {
     }
 }
 #[inline]
+#[allow(dead_code)] // only the bit-bang read needs this; the PIO probe reads via the SM
 fn gpio_read(n: u32) -> u32 {
     (unsafe { (*hal::pac::SIO::ptr()).gpio_in().read().bits() } >> n) & 1
 }
@@ -118,6 +125,7 @@ fn gpio_to_sio(n: u32) {
 /// One gSPI command+read transaction, bit-banged. Clocks `cmd` out MSB-first on
 /// DATA (chip latches on the rising CLK edge), turns the line around, then
 /// clocks 32 bits back in (sampled while CLK high). CS held low throughout.
+#[allow(dead_code)] // superseded by the PIO1 transport (pio_cmd_read32)
 fn bitbang_cmd_read(cmd: u32) -> u32 {
     gpio_clr(PIN_CS); // CS low — start transaction
     hal::arch::delay(PHASE);
@@ -158,6 +166,7 @@ fn bitbang_cmd_read(cmd: u32) -> u32 {
 /// result in [`CYW43_PROBE`]. Synchronous; call once at boot (it spins ~270 ms
 /// for the power-up sequence). Reads `0xFEEDBEAD` iff the transport + chip are
 /// alive. Uses `arch::delay` for timing (no Timer needed).
+#[allow(dead_code)] // superseded by probe_cyw43_pio (R13 Step 1); kept for reference
 pub fn probe_cyw43() {
     // Pins: CLK/CS/PWR as outputs (CS + CLK idle high/low), DATA starts output.
     for &n in &[PIN_CLK, PIN_CS, PIN_PWR, PIN_DATA] {
@@ -200,6 +209,203 @@ pub fn probe_cyw43() {
     CYW43_PROBE.store(if last == 0 { 0xDEAD_0000 } else { last }, Ordering::Relaxed);
     CYW43_PROBE_FIRST.store(first, Ordering::Relaxed);
     CYW43_PROBE_STABLE.store(stable as u32, Ordering::Relaxed);
+}
+
+// =====================================================================
+// 0b. PIO1 gSPI bring-up probe (R13 Step 1 — supersedes the bit-bang)
+// =====================================================================
+//
+// Same goal as `probe_cyw43` (read TEST_RO, expect 0xFEEDBEAD) but over a real
+// PIO1 gSPI state machine instead of a CPU bit-bang — so the chip's input
+// synchronizer sees the clock/data timing it actually expects (the bit-bang's
+// documented blind spot). This is the de-risk before the async cyw43 stack:
+// 0xFEEDBEAD here ⇒ our transport is proven, and we layer cyw43 on top.
+//
+// Self-contained + FIFO-driven (rp235x-hal has no easy set_x/set_y on a running
+// SM): each transaction pushes [write_bits-1, read_bits-1, data words...]. The
+// program loads X/Y from the first two words (autopull), clocks `write_bits` out
+// MSB-first (DATA driven, latched on the rising CLK edge), turns DATA around,
+// then clocks `read_bits` in (sampled while CLK is high) and autopushes — phase
+// + turnaround matched to embassy's proven cyw43-pio default program.
+//
+// Wiring: CLK = GP29 (side-set), DATA = GP24 (out/set/in — bidirectional), both
+// routed to FunctionPio1 by the caller. CS = GP25 and WL_ON = GP23 are driven
+// directly as SIO here (CS held low for the whole transaction).
+
+/// Build the PIO1 gSPI SM, power the CYW43, and read TEST_RO. Result lands in
+/// [`CYW43_PROBE`] (0xFEEDBEAD = transport + chip alive; 0xDEAD_0001 = the SM
+/// produced no word = stalled; 0xDEAD_0000 = never read). One-shot at boot —
+/// the SM is dropped (stopped) on return. `sys_clk_hz` sizes the PIO divider
+/// (~2 MHz gSPI clock — conservative for first bring-up) and the power delays.
+pub fn probe_cyw43_pio(
+    pio: &mut hal::pio::PIO<PIO1>,
+    sm: UninitStateMachine<(PIO1, SM0)>,
+    sys_clk_hz: u32,
+) {
+    // WL_ON (GP23) + CS (GP25) as SIO; DATA/CLK are PIO (caller-routed).
+    for &n in &[PIN_PWR, PIN_CS] {
+        gpio_to_sio(n);
+        gpio_oe(n, true);
+    }
+    gpio_set(PIN_CS); // CS idle high
+    gpio_clr(PIN_PWR); // WL_ON low (chip off) while we configure the bus pins
+
+    let cyc_per_ms = (sys_clk_hz / 1000).max(1);
+    let ms = |n: u32| hal::arch::delay(n.saturating_mul(cyc_per_ms));
+
+    // Self-contained FIFO-driven gSPI program (see docs/router-plan.md §11 #1).
+    let program = pio::pio_asm!(
+        ".side_set 1",
+        ".wrap_target",
+        "    out x, 32      side 0", // X = write_bits-1  (autopull from FIFO)
+        "    out y, 32      side 0", // Y = read_bits-1
+        "    set pindirs, 1 side 0", // DATA = output
+        "wloop:",
+        "    out pins, 1    side 0", // drive DATA bit (MSB first), CLK low
+        "    jmp x-- wloop  side 1", // CLK high → chip latches on rising edge
+        "    set pindirs, 0 side 0", // turnaround: DATA = input, CLK low
+        "    nop            side 0", // CLK stays LOW through turnaround (embassy default prog)
+        "rloop:",
+        "    in pins, 1     side 1", // CLK high → sample chip's DATA (matches embassy)
+        "    jmp y-- rloop  side 0", // CLK low; loop
+        ".wrap",
+    );
+    let installed = pio.install(&program.program).unwrap();
+
+    // ~2 MHz gSPI clock (2 PIO cycles/bit) — slow + safe for first bring-up.
+    let (div_int, div_frac) = crate::pio_util::clock_divider(sys_clk_hz, 4_000_000.0);
+    let (mut sm, mut rx, mut tx) = PIOBuilder::from_installed_program(installed)
+        .out_pins(PIN_DATA as u8, 1)
+        .set_pins(PIN_DATA as u8, 1)
+        .in_pin_base(PIN_DATA as u8)
+        .side_set_pin_base(PIN_CLK as u8)
+        .out_shift_direction(ShiftDirection::Left) // MSB first
+        .in_shift_direction(ShiftDirection::Left) // MSB first
+        .autopull(true)
+        .pull_threshold(32)
+        .autopush(true)
+        .push_threshold(32)
+        .clock_divisor_fixed_point(div_int, div_frac)
+        .build(sm);
+    // CLK + DATA outputs; CLK idle low.
+    sm.set_pindirs([
+        (PIN_CLK as u8, PinDir::Output),
+        (PIN_DATA as u8, PinDir::Output),
+    ]);
+    sm.set_pins([
+        (PIN_CLK as u8, PinState::Low),
+        (PIN_DATA as u8, PinState::Low),
+    ]);
+
+    // Power-cycle WL_ON *after* the bus is held idle (CLK low, CS high, DATA low),
+    // matching embassy/cyw43 (PioSpi is built — pins low — then init() powers the
+    // chip). A floating CLK/DATA during power-up can latch the CYW43 into a wrong
+    // gSPI mode; this ordering was the one thing mine got wrong vs the driver.
+    ms(20); // WL_ON held low ≥20 ms (chip off)
+    gpio_set(PIN_PWR); // WL_ON high
+    ms(250); // settle while the chip boots its gSPI
+
+    let _sm = sm.start(); // keep alive (drop would stop the SM)
+
+    // Read TEST_RO (FUNC_BUS=0, addr=0x14) — initial gSPI mode is 16-bit-swapped,
+    // so swap the cmd and the result (same as the bit-bang / cyw43 read32_swapped).
+    let cmd = swap16(cmd_word(false /*read*/, true /*incr*/, 0, 0x14, 4));
+    let mut last = 0u32;
+    let mut first = 0u32;
+    let mut stable = true;
+    for i in 0..64 {
+        let v = swap16(pio_cmd_read32(&mut tx, &mut rx, cmd));
+        if i == 0 {
+            first = v;
+        } else if v != last {
+            stable = false; // some read differed → DATA varying
+        }
+        last = v;
+        if v == 0xFEED_BEAD {
+            break;
+        }
+        ms(1); // bus can take a few reads to settle after power-up
+    }
+    CYW43_PROBE.store(if last == 0 { 0xDEAD_0000 } else { last }, Ordering::Relaxed);
+    CYW43_PROBE_FIRST.store(first, Ordering::Relaxed);
+    CYW43_PROBE_STABLE.store(stable as u32, Ordering::Relaxed);
+}
+
+/// One gSPI cmd+read32 transaction over the PIO1 SM. CS is held low for the
+/// whole transaction. Pushes `[31, 63, cmd]` — X=write_bits-1 (32 cmd bits out),
+/// Y=read_bits-1 (64 bits in = data word + trailing status word, exactly as
+/// cyw43's `cmd_read` does: `read.len()*32 + 32 - 1` with `read.len()==1`). The
+/// SM autopushes two words; we return the first (the data). Returns
+/// `0xDEAD_0001` if the SM produced nothing (stalled).
+fn pio_cmd_read32(
+    tx: &mut Tx<(PIO1, SM0)>,
+    rx: &mut Rx<(PIO1, SM0)>,
+    cmd: u32,
+) -> u32 {
+    while rx.read().is_some() {} // drain any stale words
+    gpio_clr(PIN_CS); // CS low — start transaction
+    hal::arch::delay(60);
+    while !tx.write(31) {} // X = write_bits-1 → clock 32 cmd bits out
+    while !tx.write(63) {} // Y = read_bits-1  → clock 64 bits in (data + status)
+    while !tx.write(cmd) {} // 32-bit command word
+    // Response: two autopushed words — data, then the gSPI status word. Take data.
+    let mut got = 0u32;
+    let mut data = 0xDEAD_0001u32; // default: SM produced nothing
+    let mut spins = 0u32;
+    while got < 2 {
+        if let Some(w) = rx.read() {
+            if got == 0 {
+                data = w;
+            }
+            got += 1;
+        } else {
+            spins += 1;
+            if spins > 2_000_000 {
+                break;
+            }
+        }
+    }
+    hal::arch::delay(60);
+    gpio_set(PIN_CS); // CS high — end transaction
+    data
+}
+
+// =====================================================================
+// 0c. Pin self-test (R13 Step 1 debug)
+// =====================================================================
+//
+// The PIO gSPI probe read floating data — same as the bit-bang — despite the
+// board being MicroPython-verified good. Before blaming the transport, confirm
+// the RP2350 can actually *drive* the four CYW43 pins: drive each as a plain
+// SIO output, low then high, and read it back via GPIO_IN. For a healthy pad
+// (OE on, RP2350 pad iso cleared, IE on, nothing external holding it) the
+// readback follows the driven level. A pin whose readback doesn't follow points
+// at a pad/funcsel/iso/OE fault on our side; WL_ON not following ⇒ the chip is
+// never powered (would explain everything). Result bits land at each pin's index.
+
+/// Per-pin GPIO_IN readback when the pin was driven LOW (want 0 at bits 23/24/25/29).
+pub static CYW43_PIN_LO: AtomicU32 = AtomicU32::new(0);
+/// Per-pin GPIO_IN readback when the pin was driven HIGH (want 1 at bits 23/24/25/29).
+pub static CYW43_PIN_HI: AtomicU32 = AtomicU32::new(0);
+
+/// Drive WL_ON/CS/CLK/DATA low then high as SIO outputs, read each back. See the
+/// section comment. Leaves WL_ON high; the gSPI probe re-power-cycles after, so
+/// any toggling here is reset before the real transaction.
+pub fn pin_selftest() {
+    let mut lo = 0u32;
+    let mut hi = 0u32;
+    for &pin in &[PIN_PWR, PIN_CS, PIN_CLK, PIN_DATA] {
+        gpio_to_sio(pin);
+        gpio_oe(pin, true);
+        gpio_clr(pin);
+        hal::arch::delay(200); // let the input synchronizer settle
+        lo |= gpio_read(pin) << pin;
+        gpio_set(pin);
+        hal::arch::delay(200);
+        hi |= gpio_read(pin) << pin;
+    }
+    CYW43_PIN_LO.store(lo, Ordering::Relaxed);
+    CYW43_PIN_HI.store(hi, Ordering::Relaxed);
 }
 
 // =====================================================================
