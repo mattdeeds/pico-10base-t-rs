@@ -35,6 +35,9 @@ mod pio_util;
 // `--features wireless` compile-checks the cyw43 + async-runtime integration.
 #[cfg(feature = "wireless")]
 mod wireless;
+// R14.3 — smoltcp phy::Device adapter over cyw43's NetDriver (wireless LAN).
+#[cfg(feature = "wireless")]
+mod cyw43_phy;
 
 use panic_halt as _;
 

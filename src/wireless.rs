@@ -31,9 +31,13 @@ use embassy_time_driver::Driver;
 use embassy_time_queue_utils::Queue;
 use heapless::String;
 use rp235x_hal as hal;
+use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
+use smoltcp::time::Instant;
+use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 use usb_device::{class_prelude::*, prelude::*};
 use usbd_serial::SerialPort;
 
+use crate::cyw43_phy::Cyw43Phy;
 use hal::pac::PIO1;
 use hal::pio::{
     PIOBuilder, PinDir, PinState, Running, Rx, ShiftDirection, StateMachine, Stopped, Tx,
@@ -698,6 +702,12 @@ pub static CYW43_INIT_DONE: AtomicU32 = AtomicU32::new(0);
 pub static CYW43_LED_DONE: AtomicU32 = AtomicU32::new(0);
 /// 1 once `Control::start_ap_wpa2(...)` returned (R14.2 — AP beaconing).
 pub static CYW43_AP_DONE: AtomicU32 = AtomicU32::new(0);
+/// 1 once the LAN smoltcp `Interface` is built + polling (R14.3 — data path up).
+pub static CYW43_NET_UP: AtomicU32 = AtomicU32::new(0);
+
+/// LAN gateway IP (the Pico's address on the wireless subnet, R14.3).
+const LAN_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
+const LAN_PREFIX: u8 = 24;
 
 // R14.2 AP parameters (dev defaults for the LAN-side bring-up). WPA2 passphrase
 // must be 8..=63 bytes. 2.4 GHz channel 6. These become configurable later.
@@ -843,11 +853,13 @@ async fn usb_task(
             let mut line: String<96> = String::new();
             let _ = write!(
                 line,
-                "[Cyw43] new={} init={} led={} ap={} hb={}\r\n",
+                "[Cyw43] new={} init={} led={} ap={} net={} rx={} hb={}\r\n",
                 CYW43_NEW_DONE.load(Ordering::Relaxed),
                 CYW43_INIT_DONE.load(Ordering::Relaxed),
                 CYW43_LED_DONE.load(Ordering::Relaxed),
                 CYW43_AP_DONE.load(Ordering::Relaxed),
+                CYW43_NET_UP.load(Ordering::Relaxed),
+                crate::cyw43_phy::CYW43_RX_FRAMES.load(Ordering::Relaxed),
                 n / 1000,
             );
             let _ = serial.write(line.as_bytes());
@@ -864,6 +876,35 @@ async fn cyw43_runner_task(runner: CywRunner) -> ! {
     runner.run().await
 }
 
+/// R14.3 — the LAN side: wrap cyw43's `NetDriver` in a smoltcp `phy::Device`
+/// (via [`Cyw43Phy`]) and run the Interface poll loop. Static gateway
+/// `192.168.4.1/24`; with smoltcp's `auto-icmp-echo-reply` the Interface answers
+/// ARP + ICMP echo with no sockets. R14.3 acceptance: a client statically
+/// configured as `192.168.4.2/24` (after joining the AP) pings `192.168.4.1`.
+#[embassy_executor::task]
+async fn net_task(net: cyw43::NetDriver<'static>, mac: [u8; 6]) -> ! {
+    let mut device = Cyw43Phy::new(net);
+
+    let now = || Instant::from_micros(embassy_time::Instant::now().as_micros() as i64);
+    let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+    config.random_seed = embassy_time::Instant::now().as_ticks();
+    let mut iface = Interface::new(config, &mut device, now());
+    iface.update_ip_addrs(|addrs| {
+        let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(LAN_IP), LAN_PREFIX));
+    });
+
+    // No sockets yet — ARP + ICMP echo are answered by the Interface itself.
+    // (R14.4 adds a DHCP-server UDP socket here.)
+    let mut sockets_storage: [SocketStorage; 2] = [SocketStorage::EMPTY; 2];
+    let mut sockets = SocketSet::new(&mut sockets_storage[..]);
+
+    CYW43_NET_UP.store(1, Ordering::Relaxed);
+    loop {
+        iface.poll(now(), &mut device, &mut sockets);
+        Timer::after(Duration::from_millis(5)).await;
+    }
+}
+
 /// One-shot bring-up: `cyw43::new()` (firmware + nvram over PIO1) → spawn the
 /// Runner → `Control::init(clm)` → blink the onboard LED forever. The LED can
 /// only keep toggling if the Runner task is continuously servicing `gpio_set`
@@ -878,7 +919,7 @@ async fn cyw43_bootstrap_task(spawner: Spawner, pwr: WlOnPin, spi: PioSpiCyw43) 
     static mut STATE: cyw43::State = cyw43::State::new();
     let state = unsafe { &mut *core::ptr::addr_of_mut!(STATE) };
 
-    let (_net, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
+    let (net, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
     CYW43_NEW_DONE.store(1, Ordering::Relaxed);
     // Hand the event loop to its own task so it runs concurrently with init.
     if let Ok(t) = cyw43_runner_task(runner) {
@@ -898,11 +939,16 @@ async fn cyw43_bootstrap_task(spawner: Spawner, pwr: WlOnPin, spi: PioSpiCyw43) 
         .await;
     CYW43_AP_DONE.store(1, Ordering::Relaxed);
 
-    // Keep blinking the onboard LED forever — still our liveness proof that the
-    // Runner stays up (and now that the AP is beaconing too). NB R14.2 acceptance
-    // is the SSID appearing in a passive scan; *joining* needs the data path
-    // (R14.3 phy adapter) + DHCP (R14.4) — the NetDriver (`_net`) is still
-    // dropped here, so don't try to associate yet.
+    // R14.3 — wire the NetDriver into a smoltcp LAN Interface. Read our MAC for
+    // the Interface's hardware address, then hand the NetDriver to net_task. The
+    // Runner keeps the chip's RX/TX channel pumped; net_task drains/fills it.
+    let mac = control.address().await;
+    if let Ok(t) = net_task(net, mac) {
+        spawner.spawn(t);
+    }
+
+    // Keep blinking the onboard LED forever — our liveness proof that the Runner
+    // stays up (AP beaconing + LAN Interface polling alongside it).
     let mut on = false;
     loop {
         on = !on;
