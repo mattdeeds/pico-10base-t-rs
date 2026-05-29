@@ -32,7 +32,8 @@ use rp235x_hal as hal;
 
 use hal::pac::PIO1;
 use hal::pio::{
-    PIOBuilder, PinDir, PinState, Rx, ShiftDirection, Tx, UninitStateMachine, SM0,
+    PIOBuilder, PinDir, PinState, Running, Rx, ShiftDirection, StateMachine, Stopped, Tx,
+    UninitStateMachine, SM0,
 };
 
 // =====================================================================
@@ -232,11 +233,78 @@ pub fn probe_cyw43() {
 // routed to FunctionPio1 by the caller. CS = GP25 and WL_ON = GP23 are driven
 // directly as SIO here (CS held low for the whole transaction).
 
+/// Build + configure the PIO1 gSPI state machine — the single source of truth
+/// for the program, shared by the probe and the async [`PioSpiCyw43`] transport.
+/// Drives the bus idle (CLK low, DATA low via `set_pins`) and returns the
+/// *stopped* SM so the caller starts it at the right moment: the probe starts it
+/// *after* the WL_ON power-up (gotcha #11); `PioSpiCyw43::new` starts it in
+/// `new()` (before cyw43 powers the chip). Does NOT touch CS or WL_ON.
+fn build_gspi_sm(
+    pio: &mut hal::pio::PIO<PIO1>,
+    sm: UninitStateMachine<(PIO1, SM0)>,
+    sys_clk_hz: u32,
+) -> (
+    StateMachine<(PIO1, SM0), Stopped>,
+    Tx<(PIO1, SM0)>,
+    Rx<(PIO1, SM0)>,
+) {
+    // Self-contained FIFO-driven gSPI program (docs/router-plan.md §11 #1): each
+    // txn pushes [write_bits-1, read_bits-1, words...]. MSB-first; CLK side-set
+    // idles low; chip latches our DATA on the rising edge, drives its DATA which
+    // we sample while CLK is high. Phase + turnaround matched to embassy
+    // cyw43-pio 0.7.0's default program.
+    let program = pio::pio_asm!(
+        ".side_set 1",
+        ".wrap_target",
+        "    out x, 32      side 0", // X = write_bits-1  (autopull from FIFO)
+        "    out y, 32      side 0", // Y = read_bits-1
+        "    set pindirs, 1 side 0", // DATA = output
+        "wloop:",
+        "    out pins, 1    side 0", // drive DATA bit (MSB first), CLK low
+        "    jmp x-- wloop  side 1", // CLK high → chip latches on rising edge
+        "    set pindirs, 0 side 0", // turnaround: DATA = input, CLK low
+        "    nop            side 0", // CLK stays LOW through turnaround
+        "rloop:",
+        "    in pins, 1     side 1", // CLK high → sample chip's DATA
+        "    jmp y-- rloop  side 0", // CLK low; loop
+        ".wrap",
+    );
+    let installed = pio.install(&program.program).unwrap();
+
+    // ~2 MHz gSPI clock (2 PIO cycles/bit) — slow + safe for bring-up.
+    let (div_int, div_frac) = crate::pio_util::clock_divider(sys_clk_hz, 4_000_000.0);
+    let (mut sm, rx, tx) = PIOBuilder::from_installed_program(installed)
+        .out_pins(PIN_DATA as u8, 1)
+        .set_pins(PIN_DATA as u8, 1)
+        .in_pin_base(PIN_DATA as u8)
+        .side_set_pin_base(PIN_CLK as u8)
+        .out_shift_direction(ShiftDirection::Left) // MSB first
+        .in_shift_direction(ShiftDirection::Left) // MSB first
+        .autopull(true)
+        .pull_threshold(32)
+        .autopush(true)
+        .push_threshold(32)
+        .clock_divisor_fixed_point(div_int, div_frac)
+        .build(sm);
+    // Bus idle: CLK + DATA outputs, both low. set_pins latches the pad outputs
+    // low and they hold until the caller start()s the SM.
+    sm.set_pindirs([
+        (PIN_CLK as u8, PinDir::Output),
+        (PIN_DATA as u8, PinDir::Output),
+    ]);
+    sm.set_pins([
+        (PIN_CLK as u8, PinState::Low),
+        (PIN_DATA as u8, PinState::Low),
+    ]);
+    (sm, tx, rx)
+}
+
 /// Build the PIO1 gSPI SM, power the CYW43, and read TEST_RO. Result lands in
 /// [`CYW43_PROBE`] (0xFEEDBEAD = transport + chip alive; 0xDEAD_0001 = the SM
 /// produced no word = stalled; 0xDEAD_0000 = never read). One-shot at boot —
 /// the SM is dropped (stopped) on return. `sys_clk_hz` sizes the PIO divider
 /// (~2 MHz gSPI clock — conservative for first bring-up) and the power delays.
+#[allow(dead_code)] // Step 1 transport probe — superseded by cyw43_new_blocking; kept as a minimal fallback
 pub fn probe_cyw43_pio(
     pio: &mut hal::pio::PIO<PIO1>,
     sm: UninitStateMachine<(PIO1, SM0)>,
@@ -253,49 +321,10 @@ pub fn probe_cyw43_pio(
     let cyc_per_ms = (sys_clk_hz / 1000).max(1);
     let ms = |n: u32| hal::arch::delay(n.saturating_mul(cyc_per_ms));
 
-    // Self-contained FIFO-driven gSPI program (see docs/router-plan.md §11 #1).
-    let program = pio::pio_asm!(
-        ".side_set 1",
-        ".wrap_target",
-        "    out x, 32      side 0", // X = write_bits-1  (autopull from FIFO)
-        "    out y, 32      side 0", // Y = read_bits-1
-        "    set pindirs, 1 side 0", // DATA = output
-        "wloop:",
-        "    out pins, 1    side 0", // drive DATA bit (MSB first), CLK low
-        "    jmp x-- wloop  side 1", // CLK high → chip latches on rising edge
-        "    set pindirs, 0 side 0", // turnaround: DATA = input, CLK low
-        "    nop            side 0", // CLK stays LOW through turnaround (embassy default prog)
-        "rloop:",
-        "    in pins, 1     side 1", // CLK high → sample chip's DATA (matches embassy)
-        "    jmp y-- rloop  side 0", // CLK low; loop
-        ".wrap",
-    );
-    let installed = pio.install(&program.program).unwrap();
-
-    // ~2 MHz gSPI clock (2 PIO cycles/bit) — slow + safe for first bring-up.
-    let (div_int, div_frac) = crate::pio_util::clock_divider(sys_clk_hz, 4_000_000.0);
-    let (mut sm, mut rx, mut tx) = PIOBuilder::from_installed_program(installed)
-        .out_pins(PIN_DATA as u8, 1)
-        .set_pins(PIN_DATA as u8, 1)
-        .in_pin_base(PIN_DATA as u8)
-        .side_set_pin_base(PIN_CLK as u8)
-        .out_shift_direction(ShiftDirection::Left) // MSB first
-        .in_shift_direction(ShiftDirection::Left) // MSB first
-        .autopull(true)
-        .pull_threshold(32)
-        .autopush(true)
-        .push_threshold(32)
-        .clock_divisor_fixed_point(div_int, div_frac)
-        .build(sm);
-    // CLK + DATA outputs; CLK idle low.
-    sm.set_pindirs([
-        (PIN_CLK as u8, PinDir::Output),
-        (PIN_DATA as u8, PinDir::Output),
-    ]);
-    sm.set_pins([
-        (PIN_CLK as u8, PinState::Low),
-        (PIN_DATA as u8, PinState::Low),
-    ]);
+    // Build the gSPI SM (shared with PioSpiCyw43); drives CLK/DATA low so the bus
+    // is held idle through the WL_ON power-up below. Returned stopped — we start
+    // it AFTER power-up (the proven ordering).
+    let (sm, mut tx, mut rx) = build_gspi_sm(pio, sm, sys_clk_hz);
 
     // Power-cycle WL_ON *after* the bus is held idle (CLK low, CS high, DATA low),
     // matching embassy/cyw43 (PioSpi is built — pins low — then init() powers the
@@ -337,6 +366,7 @@ pub fn probe_cyw43_pio(
 /// cyw43's `cmd_read` does: `read.len()*32 + 32 - 1` with `read.len()==1`). The
 /// SM autopushes two words; we return the first (the data). Returns
 /// `0xDEAD_0001` if the SM produced nothing (stalled).
+#[allow(dead_code)] // used by the Step 1 probe (probe_cyw43_pio), kept as a fallback
 fn pio_cmd_read32(
     tx: &mut Tx<(PIO1, SM0)>,
     rx: &mut Rx<(PIO1, SM0)>,
@@ -384,13 +414,16 @@ fn pio_cmd_read32(
 // never powered (would explain everything). Result bits land at each pin's index.
 
 /// Per-pin GPIO_IN readback when the pin was driven LOW (want 0 at bits 23/24/25/29).
+#[allow(dead_code)] // pin self-test (Step 1 debug) — pads proven; kept for reference
 pub static CYW43_PIN_LO: AtomicU32 = AtomicU32::new(0);
 /// Per-pin GPIO_IN readback when the pin was driven HIGH (want 1 at bits 23/24/25/29).
+#[allow(dead_code)] // pin self-test (Step 1 debug) — pads proven; kept for reference
 pub static CYW43_PIN_HI: AtomicU32 = AtomicU32::new(0);
 
 /// Drive WL_ON/CS/CLK/DATA low then high as SIO outputs, read each back. See the
 /// section comment. Leaves WL_ON high; the gSPI probe re-power-cycles after, so
 /// any toggling here is reset before the real transaction.
+#[allow(dead_code)] // pin self-test (Step 1 debug) — pads proven; kept for reference
 pub fn pin_selftest() {
     let mut lo = 0u32;
     let mut hi = 0u32;
@@ -517,46 +550,154 @@ fn TIMER0_IRQ_0() {
 // PIO1 (a half-duplex "gSPI": shared DATA line, ~33 MHz clock). The cyw43 CS is
 // held low for the whole transfer by the impl.
 //
-// TODO(R13 on-device): port the gSPI PIO program (ref: pico-sdk
-// `cyw43_bus_pio_spi.c` + embassy `cyw43-pio`) and fill in cmd_write/cmd_read
-// with real FIFO push/pull + DMA. The bodies below are placeholders that
-// type-check the wiring against `cyw43::new`.
+// R13 Step 2: real cmd_write/cmd_read over the proven PIO1 FIFO push/pull
+// (busy-poll; DMA later). Bit counts match embassy cyw43-pio 0.7.0.
 
-/// Our PIO1-based half-duplex SPI transport for the CYW43439.
-// Not yet wired into `cyw43::new` — that's the R13 on-board step (needs the
-// real gSPI PIO program + the firmware blobs + the board).
+/// Our PIO1-based half-duplex gSPI transport for the CYW43439. Owns the running
+/// gSPI SM + its FIFOs; CS (GP25) is driven directly as SIO. Built by
+/// [`PioSpiCyw43::new`] *before* `cyw43::new`, so the bus is already idle through
+/// the chip's WL_ON power-up (gotcha #11). (Constructed in R13 Step 3.)
 #[allow(dead_code)]
 pub struct PioSpiCyw43 {
-    // TODO(R13): hold the PIO1 SM handle, the DATA/CLK pins, the DMA channel,
-    // and the CS pin here. Left empty for the compile-only skeleton so we don't
-    // commit to peripheral types before the on-board bring-up.
-    _private: (),
+    _sm: StateMachine<(PIO1, SM0), Running>,
+    tx: Tx<(PIO1, SM0)>,
+    rx: Rx<(PIO1, SM0)>,
 }
 
 #[allow(dead_code)]
 impl PioSpiCyw43 {
-    /// Placeholder constructor — the real one will take the PIO1 SM, the gSPI
-    /// pins (DATA/CLK/CS), and a DMA channel.
-    pub fn new_placeholder() -> Self {
-        Self { _private: () }
+    /// Build the gSPI transport: CS (GP25) as SIO output idle-high, the PIO1 gSPI
+    /// SM built with the bus held idle (CLK low, DATA low) and started. Does NOT
+    /// power WL_ON — that's cyw43's `pwr` pin, raised inside `cyw43::new` *after*
+    /// this exists, so the bus stays idle through the chip's power-up. Construct
+    /// BEFORE `cyw43::new`.
+    pub fn new(
+        pio: &mut hal::pio::PIO<PIO1>,
+        sm: UninitStateMachine<(PIO1, SM0)>,
+        sys_clk_hz: u32,
+    ) -> Self {
+        gpio_to_sio(PIN_CS);
+        gpio_oe(PIN_CS, true);
+        gpio_set(PIN_CS); // CS idle high
+        let (sm, tx, rx) = build_gspi_sm(pio, sm, sys_clk_hz);
+        Self {
+            _sm: sm.start(),
+            tx,
+            rx,
+        }
+    }
+
+    /// Drain any stale RX words (defensive — a normal txn leaves RX empty).
+    fn drain_rx(&mut self) {
+        while self.rx.read().is_some() {}
+    }
+
+    /// Push one word to the TX FIFO. Bounded busy-wait so a stalled SM can't wedge
+    /// the executor forever — a timeout corrupts the txn (which cyw43's handshake
+    /// then catches) rather than hanging hard.
+    fn push(&mut self, w: u32) {
+        let mut spins = 0u32;
+        while !self.tx.write(w) {
+            spins += 1;
+            if spins > 8_000_000 {
+                break;
+            }
+        }
+    }
+
+    /// Pull one word from the RX FIFO (bounded busy-wait; 0 on timeout).
+    fn pull(&mut self) -> u32 {
+        let mut spins = 0u32;
+        loop {
+            if let Some(w) = self.rx.read() {
+                return w;
+            }
+            spins += 1;
+            if spins > 8_000_000 {
+                return 0;
+            }
+        }
     }
 }
 
 impl cyw43::SpiBusCyw43 for PioSpiCyw43 {
-    async fn cmd_write(&mut self, _write: &[u32]) -> u32 {
-        // TODO(R13): drive CS low, clock out `write` MSB-first on PIO1, read the
-        // status word back, release CS. Returns the bus status word.
-        0
+    /// Clock `write` out MSB-first, then read back the gSPI status word.
+    /// X = write.len()*32 - 1 (write bits); Y = 31 (read one status word).
+    async fn cmd_write(&mut self, write: &[u32]) -> u32 {
+        self.drain_rx();
+        gpio_clr(PIN_CS); // CS low
+        let wbits = (write.len() as u32).saturating_mul(32).saturating_sub(1);
+        self.push(wbits);
+        self.push(31); // read 32 bits = one status word
+        for &w in write {
+            self.push(w);
+        }
+        let status = self.pull();
+        gpio_set(PIN_CS); // CS high
+        status
     }
 
-    async fn cmd_read(&mut self, _write: u32, _read: &mut [u32]) -> u32 {
-        // TODO(R13): clock out the 32-bit cmd, then clock `read.len()` words in
-        // (backplane reads have one extra leading word — see the trait docs).
-        0
+    /// Clock the 32-bit `write` cmd out, then read `read.len()` data words plus
+    /// the trailing status word. X = 31 (32 cmd bits); Y = (read.len()+1)*32 - 1.
+    /// (The backplane's extra leading word is already counted in `read.len()` by
+    /// cyw43's caller — see the trait docs.) Matches embassy cyw43-pio.
+    async fn cmd_read(&mut self, write: u32, read: &mut [u32]) -> u32 {
+        self.drain_rx();
+        gpio_clr(PIN_CS); // CS low
+        self.push(31); // write 32 cmd bits
+        let rbits = (read.len() as u32)
+            .saturating_add(1)
+            .saturating_mul(32)
+            .saturating_sub(1);
+        self.push(rbits);
+        self.push(write);
+        for slot in read.iter_mut() {
+            *slot = self.pull();
+        }
+        let status = self.pull();
+        gpio_set(PIN_CS); // CS high
+        status
     }
 
     // `wait_for_event` uses the default (active-polling) impl for now; the real
     // one waits on the CYW43 IRQ/host-wake line.
+}
+
+// =====================================================================
+// 2b. cyw43 bring-up via block_on (R13 Step 3a — no executor yet)
+// =====================================================================
+
+/// CYW43 bring-up progress (R13 Step 3a). 0 = not started; 1 = `cyw43::new()`
+/// returned — i.e. the 231 KB firmware + nvram downloaded over our PIO1 gSPI
+/// transport and the bus handshake passed under the real driver. A failure inside
+/// `new()` panics (it `.unwrap()`s) rather than clearing this.
+pub static CYW43_NEW_DONE: AtomicU32 = AtomicU32::new(0);
+
+/// R13 Step 3a — drive `cyw43::new()` to completion with `block_on` (no executor
+/// yet). `block_on` busy-spins the future; cyw43's power-up `Timer::after` delays
+/// resolve against the TIMER0 time-driver's `now()` (no alarm IRQ needed). Runs
+/// the real firmware + nvram download + bus handshake over our transport, then
+/// drops the returned driver objects (Step 3b keeps them + adds the executor +
+/// LED). Blocks ~1 s at our 2 MHz gSPI. `spi` must be a fresh [`PioSpiCyw43`]
+/// (bus idle); `pwr` is WL_ON — cyw43 power-cycles it during init (the bus is
+/// already idle, gotcha #11). Call once at boot, before the USB/10BASE-T loop.
+pub fn cyw43_new_blocking<PWR: embedded_hal::digital::OutputPin>(pwr: PWR, spi: PioSpiCyw43) {
+    // Firmware + nvram blobs, 4-byte aligned via cyw43's macro (paths relative to
+    // this file → repo `cyw43-firmware/`). CLM is loaded later by Control::init
+    // (Step 3b), so it isn't needed here.
+    let fw = cyw43::aligned_bytes!("../cyw43-firmware/43439A0.bin");
+    let nvram = cyw43::aligned_bytes!("../cyw43-firmware/nvram_rp2040.bin");
+
+    // cyw43::State is large (driver + channel buffers) — keep it in a static.
+    static mut STATE: cyw43::State = cyw43::State::new();
+    let state = unsafe { &mut *core::ptr::addr_of_mut!(STATE) };
+
+    embassy_futures::block_on(async move {
+        let (_net, _control, _runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
+        // Reaching here = new() succeeded (it `.unwrap()`s internally on failure).
+        CYW43_NEW_DONE.store(1, Ordering::Relaxed);
+        // 3a: objects drop here (stops the SM). 3b keeps them + runs the executor.
+    });
 }
 
 // =====================================================================
