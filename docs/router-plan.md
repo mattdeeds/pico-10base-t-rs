@@ -451,7 +451,7 @@ keystone new piece — **proven on-device: a Wi-Fi client pings `192.168.4.1`
 | **R14.1 — continuous Runner** | Replace `cyw43_bringup_blocking`'s `select→return` with: `cyw43::new()` → `Control::init(clm)` → **spawn `Runner::run()` as a long-lived executor task**, keep `Control` live. Relocate the heartbeat LED to `Control::gpio_set(0,…)` (GP25 is now WL_CS — retire `main.rs:163`'s `led`). | LED blinks **indefinitely** (not just 6×) ⇒ Runner stays up under the executor. The core de-risk — everything else builds on it. |
 | **R14.2 — start AP** | After init: `Control::start_ap_wpa2(SSID, passphrase, channel)` (sig confirmed, cyw43 0.7.0). Read the MAC via `Control::address()`. | The SSID appears in a phone/laptop wifi scan. |
 | **R14.3 — phy adapter + LAN `Interface`** ✅ DONE (`5039a11`) | New `src/cyw43_phy.rs`: `Cyw43Phy` wraps the `NetDriver` and bridges its async `embassy_net_driver::Driver` to smoltcp `phy::Device` via a **no-op-waker `Context`** (NOT the sync buf API — see §12.1 correction). `receive`/`transmit` map the embassy tokens to smoltcp tokens (delegating `consume`). Stop dropping `_net`; build a 2nd smoltcp `Interface` (static `192.168.4.1/24`, MAC from `Control::address()`) in a `net_task` poll loop (no sockets — ARP + auto-icmp-echo-reply answer from the Interface). | ✅ A client (host RTL88x2bu) joined the AP, static `192.168.4.2/24`, **`ping 192.168.4.1` = 5/5 ~6 ms**; device `rx` counter climbed in step. Data path proven both directions before DHCP. |
-| **R14.4 — DHCP server** (§6.3; the bulk) | New `src/dhcp_server.rs`: smoltcp UDP socket on `0.0.0.0:67`; parse BOOTP/DHCP DISCOVER + REQUEST; emit OFFER + ACK broadcast to `255.255.255.255:68` with yiaddr from a fixed `heapless` lease pool in `192.168.4.0/24`, router+DNS = `192.168.4.1`, subnet mask + lease time. Lease table keyed by client MAC. | **The R14 milestone:** a phone joins the SSID, **auto-gets a lease**, pings `192.168.4.1`. |
+| **R14.4 — DHCP server** (§6.3; the bulk) ✅ DONE (`364281f`) | New `src/dhcp_server.rs`: smoltcp UDP socket on `:67`; reuses smoltcp's `DhcpRepr`/`DhcpPacket` wire codec (wireless-only `proto-dhcpv4` feature) — DISCOVER→OFFER, REQUEST→ACK; yiaddr from a fixed MAC-keyed pool `192.168.4.10..=.41`, router + server-id = `192.168.4.1`, /24 mask, 1 h lease; broadcast to `255.255.255.255:68`. **No DNS option** (R18; also avoids smoltcp's heapless-0.9 `dns_servers` Vec vs our 0.8). | ✅ host RTL88x2bu client: **`DHCPACK of 192.168.4.10 from 192.168.4.1`**; device `dhcp` counter climbed. The "LAN up" milestone — join + auto-lease (ping proven R14.3). |
 | **R14.5 — mgmt sanity + docs** | Bind the existing tiny HTTP server to the LAN `Interface` (`192.168.4.1:80`, reusing `serve_http`) so a joined phone loads a status page. Update RESUME + this doc. | Joined phone loads the status page; live demo of the LAN. |
 
 ### 12.3 Risks (R14-specific)
@@ -471,3 +471,14 @@ keystone new piece — **proven on-device: a Wi-Fi client pings `192.168.4.1`
    in §11) becomes wanted at R16 when the core is also forwarding.
 5. **Memory** — 2nd `Interface` + socket buffers + cyw43 `State`. The 231 KB
    firmware is in *flash* (`include_bytes!`), not RAM. Budget against 520 KB.
+6. **Validation gotcha (R14.4): the DHCP gateway hijacks the test host's default
+   route.** Our server correctly hands out `router = 192.168.4.1`; a normal DHCP
+   client (`dhclient`/NetworkManager) installs that as the host's *default
+   route*, so all internet/SSH traffic gets sent to the Pico — which can't
+   forward yet (NAT is R17) — and the box loses connectivity. When validating
+   from a multi-homed host (Wi-Fi + a real uplink), run the DHCP client so it
+   does NOT touch routing: `dhclient -v -1 -sf /bin/true <wlan>` proves the
+   exchange (prints `bound to 192.168.4.x`) and configures nothing; then
+   `ip addr add <leased-ip>/24 dev <wlan>` for the ping. (Goes away naturally
+   once the Pico actually NAT-forwards at R17, or test from a phone with no
+   other uplink.)
