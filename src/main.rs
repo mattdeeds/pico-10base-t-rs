@@ -41,6 +41,11 @@ mod cyw43_phy;
 // R14.4 — minimal LAN DHCP server (smoltcp UDP :67).
 #[cfg(feature = "wireless")]
 mod dhcp_server;
+// R15 — shared WAN-as-DHCP-client logic (10BASE-T side: dhcpv4 client + ICMP
+// ping + DNS resolve). Used by `main_10bt` (R15a, `wan-dhcp`) and the executor's
+// `wan_task` (R15b, `router`).
+#[cfg(any(feature = "wan-dhcp", feature = "router"))]
+mod wan;
 
 use panic_halt as _;
 
@@ -63,21 +68,30 @@ use hal::clocks::ClocksManager;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
-// R15a — WAN-as-DHCP-client: the dhcpv4/icmp/dns sockets + the ICMP echo wire
-// codec, plus the device's checksum capabilities for emitting/parsing echoes.
-// Gated so the default (static-IP) build pulls none of it.
+use smoltcp::wire::{EthernetAddress, HardwareAddress};
+// IpAddress/IpCidr/Ipv4Address are only used by the static-IP push in `main_10bt`
+// (compiled when neither `wan-dhcp` nor `wireless` is set). The wireless/router
+// builds blanket-allow unused imports (see the crate attr), so gating on
+// `not(wan-dhcp)` keeps the non-wireless `wan-dhcp` build warning-free.
+#[cfg(not(feature = "wan-dhcp"))]
+use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
+// R15a — WAN-as-DHCP-client: the dhcpv4/icmp/dns sockets are constructed here;
+// the per-poll logic lives in `crate::wan`. We also need the device's checksum
+// capabilities to seed the ICMP socket. Gated so the default build pulls none.
 #[cfg(feature = "wan-dhcp")]
 use smoltcp::socket::{dhcpv4, dns, icmp};
 #[cfg(feature = "wan-dhcp")]
 use smoltcp::phy::{ChecksumCapabilities, Device as _};
-#[cfg(feature = "wan-dhcp")]
-use smoltcp::wire::{DnsQueryType, Icmpv4Packet, Icmpv4Repr, Ipv4Cidr};
 use usb_device::{class_prelude::*, prelude::*};
 use usbd_serial::SerialPort;
 
 const HW_PIN_TXD: u8 = 14; // ISL3177E DI
 const HW_PIN_RXD: u8 = 13; // ISL3177E RO
+
+/// Our 10BASE-T (WAN) MAC. Used both by the IRQ-side RX filter (`install_rx`)
+/// and as the smoltcp `Interface` hardware address — shared by `main_10bt` and
+/// the router build's `wan_task`, so it lives in one place.
+const OUR_MAC: [u8; 6] = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC];
 
 /// Tell the Boot ROM about our application.
 #[link_section = ".start_block"]
@@ -189,14 +203,44 @@ fn main() -> ! {
     // owns ALARM0 / TIMER0_IRQ_0 — see wireless.rs), so don't arm alarms here.
     let timer = hal::Timer::new_timer0(pac.TIMER0, &mut pac.RESETS, &clocks);
 
-    // ── Wireless router image (Pico 2 W). The embassy executor owns core 0 and
-    // never returns, so this is a *standalone* build — 10BASE-T is not started
-    // (docs/router-plan.md §11/§12). Build the PIO1 gSPI transport (CLK/CS/DATA
-    // held idle through WL_ON power-up, gotcha #11) + the WL_ON pin, then hand
-    // the transport + USB peripherals to wireless::run (which sets up the
-    // time-driver alarm IRQ + the executor: cyw43 Runner + bring-up/LED blink +
-    // the USB poll/reset task).
-    #[cfg(feature = "wireless")]
+    // ── Router image (R15b, `--features router`): BOTH interfaces live under one
+    // embassy executor. Bring up the 10BASE-T (WAN) device on PIO0 + launch core 1
+    // for its RX decode, build the PIO1 gSPI transport for the cyw43 LAN, then
+    // hand both to wireless::run_router (executor: cyw43 Runner + LAN net_task +
+    // the WAN wan_task + USB). No GP25 LED — GP25 is the gSPI CS. See r15-plan §6.
+    #[cfg(feature = "router")]
+    {
+        let _ = &timer; // TIMER0 stays un-reset; the time-driver reads it directly
+        let sys_clk_hz = clocks.system_clock.freq().to_Hz();
+
+        // WAN: GP14/GP13 → PIO0; build EthMac + launch core 1 (RX decode). Pin
+        // handles held so the PIO0 function assignment outlives the executor.
+        let _tx_pin: hal::gpio::Pin<_, FunctionPio0, _> = pins.gpio14.into_function();
+        let _rx_pin: hal::gpio::Pin<_, FunctionPio0, _> = pins.gpio13.into_function();
+        let mut fifo = sio.fifo;
+        let (mac, core1_ok) = setup_eth_mac(
+            pac.PIO0, pac.DMA, &mut pac.PSM, &mut fifo, &mut pac.RESETS, sys_clk_hz,
+        );
+
+        // LAN: GP24/GP29 → PIO1, WL_ON = GP23, CS = GP25 (driven inside
+        // PioSpiCyw43); bus held idle through WL_ON power-up (gotcha #11).
+        let _cyw_data: hal::gpio::Pin<_, hal::gpio::FunctionPio1, _> = pins.gpio24.into_function();
+        let _cyw_clk: hal::gpio::Pin<_, hal::gpio::FunctionPio1, _> = pins.gpio29.into_function();
+        let (mut pio1, pio1_sm0, _, _, _) = pac.PIO1.split(&mut pac.RESETS);
+        let pwr = pins.gpio23.into_push_pull_output();
+        let spi = wireless::PioSpiCyw43::new(&mut pio1, pio1_sm0, sys_clk_hz);
+
+        wireless::run_router(
+            mac, core1_ok, pwr, spi, pac.USB, pac.USB_DPRAM, clocks.usb_clock, &mut pac.RESETS,
+        );
+    }
+
+    // ── Wireless-only image (R14 LAN, `--features wireless` without `router`).
+    // The embassy executor owns core 0 and never returns — a *standalone* build,
+    // 10BASE-T not started (docs/router-plan.md §11/§12). Build the PIO1 gSPI
+    // transport (CLK/CS/DATA held idle through WL_ON power-up, gotcha #11) + WL_ON,
+    // then hand to wireless::run (cyw43 Runner + LAN net_task + USB).
+    #[cfg(all(feature = "wireless", not(feature = "router")))]
     {
         let _ = &timer; // keep TIMER0 un-reset; the hal handle is unused here
         let _cyw_data: hal::gpio::Pin<_, hal::gpio::FunctionPio1, _> = pins.gpio24.into_function();
@@ -208,12 +252,64 @@ fn main() -> ! {
         wireless::run(pwr, spi, pac.USB, pac.USB_DPRAM, clocks.usb_clock, &mut pac.RESETS);
     }
 
-    // ── 10BASE-T NIC image (default build). The wireless arm above diverges, so
-    // exactly one arm is ever compiled/run per build.
+    // ── 10BASE-T NIC image (default build). Exactly one arm is compiled per build.
     #[cfg(not(feature = "wireless"))]
     main_10bt(
         pac.PIO0, pac.DMA, pac.PSM, pac.USB, pac.USB_DPRAM, pac.RESETS, sio.fifo, clocks, pins, timer,
     );
+}
+
+/// Build the 10BASE-T data path: PIO0 Manchester TX (SM0) + carrier-detect
+/// (SM2) + RX sampler (SM1) with the DMA double-buffer, install the RX engine,
+/// and launch core 1 to own the `DMA_IRQ_0` decode. Returns the core-0 `EthMac`
+/// (smoltcp `phy::Device`) + whether core 1 launched. Shared by `main_10bt`
+/// (R12e production loop) and the router build's dispatch (R15b) so the subtle
+/// RX-on-core-1 ordering lives in exactly one place.
+///
+/// The caller must have already routed GP13/GP14 to `FunctionPio0` (and must
+/// keep those pin handles alive). `OUR_MAC` is installed for the IRQ-side MAC
+/// filter. Call once (it claims the RX DMA buffers via `singleton!` + launches
+/// core 1). Ordering matches R12c: `EthRx::new` (PIO+DMA running) → `install_rx`
+/// (populate `RX_ENGINE`) → `launch_core1_riscv` (core 1 enables the IRQ).
+fn setup_eth_mac(
+    pio0: hal::pac::PIO0,
+    dma: hal::pac::DMA,
+    psm: &mut hal::pac::PSM,
+    sio_fifo: &mut hal::sio::SioFifo,
+    resets: &mut hal::pac::RESETS,
+    sys_clk_hz: u32,
+) -> (eth_mac::EthMac, bool) {
+    // PIO0 SM0 = Manchester TX; SM1 = RX sampler; SM2 = Phase-3d carrier detector
+    // (watches RO/GP13 for the TX carrier-sense gate). SM3 + PIO1 are free.
+    let (mut pio0, sm0, sm1, sm2, _sm3) = pio0.split(resets);
+    let eth_tx = eth_tx::EthTx::new(&mut pio0, sm0, sm2, HW_PIN_TXD, HW_PIN_RXD, sys_clk_hz);
+
+    // DMA channels 0 and 1 ferry samples from the PIO RX FIFO into two 16 KB
+    // half-buffers. EthRx::poll_with hands the just-filled half to the decoder
+    // while DMA continues filling the other. Buffers static via singleton!.
+    let dma = dma.split(resets);
+    let rx_buf_a = singleton!(: [u32; eth_rx::BUF_WORDS] = [0; eth_rx::BUF_WORDS]).unwrap();
+    let rx_buf_b = singleton!(: [u32; eth_rx::BUF_WORDS] = [0; eth_rx::BUF_WORDS]).unwrap();
+    let rx_carry =
+        singleton!(: [u8; eth_rx::MAX_CARRY_BYTES] = [0; eth_rx::MAX_CARRY_BYTES]).unwrap();
+    let rx_stitch =
+        singleton!(: [u8; eth_rx::STITCH_BUF_BYTES] = [0; eth_rx::STITCH_BUF_BYTES]).unwrap();
+    let eth_rx = eth_rx::EthRx::new(
+        &mut pio0, sm1, HW_PIN_RXD, sys_clk_hz, dma.ch0, dma.ch1, rx_buf_a, rx_buf_b, rx_carry,
+        rx_stitch,
+    );
+
+    // Install EthRx + our MAC into the core-1-exclusive RX engine *before*
+    // launching core 1 (which enables DMA_IRQ_0). Core 0 unmasks nothing — the
+    // decode never runs here, so the loop/executor can't be starved (R12c).
+    // Bounded launch → a dead core 1 returns an error rather than hanging core 0.
+    let _ = eth_mac::install_rx(eth_rx, OUR_MAC);
+    let core1_stack = unsafe { &mut (*core::ptr::addr_of_mut!(CORE1_STACK)).0 };
+    let core1_launch_ok =
+        unsafe { multicore_riscv::launch_core1_riscv(psm, sio_fifo, core1_stack, core1_entry).is_ok() };
+
+    // EthMac owns just the TX side + scratch; RX state lives in the shared static.
+    (eth_mac::EthMac::new(eth_tx), core1_launch_ok)
 }
 
 /// The 10BASE-T NIC (default build): PIO Manchester TX + PIO/DMA RX decoded on
@@ -237,78 +333,17 @@ fn main_10bt(
 ) -> ! {
     let mut led = pins.gpio25.into_push_pull_output();
 
-    // GP14 → ISL3177E DI, GP13 → ISL3177E RO. Reassign both to PIO0 function.
+    // GP14 → ISL3177E DI, GP13 → ISL3177E RO. Reassign both to PIO0 function;
+    // the handles are held (`_`) so the assignment outlives the never-returning
+    // loop. The PIO/DMA/RX-engine/core-1 bring-up is shared with the router
+    // build via `setup_eth_mac`.
     let _tx_pin: hal::gpio::Pin<_, FunctionPio0, _> = pins.gpio14.into_function();
     let _rx_pin: hal::gpio::Pin<_, FunctionPio0, _> = pins.gpio13.into_function();
-
-    // PIO0 SM0 drives the Manchester TX; SM1 runs the RX sampler; SM2 is the
-    // Phase-3d carrier detector (watches RO for the TX carrier-sense gate).
-    // The CPU edge-track DPLL (eth_rx_dpll) handles clock recovery in software
-    // off the 60 MHz sample stream — SM3 + PIO1 are free for future use.
-    let (mut pio0, sm0, sm1, sm2, _sm3) = pio0.split(&mut resets);
     let sys_clk_hz = clocks.system_clock.freq().to_Hz();
-    // SM0 = Manchester TX; SM2 = carrier detector (Phase 3d) watching RO (GP13).
-    let eth_tx = eth_tx::EthTx::new(&mut pio0, sm0, sm2, HW_PIN_TXD, HW_PIN_RXD, sys_clk_hz);
+    let (mut mac, core1_launch_ok) =
+        setup_eth_mac(pio0, dma, &mut psm, &mut sio_fifo, &mut resets, sys_clk_hz);
 
-    // DMA channels 0 and 1 ferry samples from the PIO RX FIFO into two
-    // 16 KB half-buffers. EthRx::poll_with hands the just-filled half to
-    // the decoder while DMA continues filling the other.
-    let dma = dma.split(&mut resets);
-    let rx_buf_a = singleton!(: [u32; eth_rx::BUF_WORDS] = [0; eth_rx::BUF_WORDS]).unwrap();
-    let rx_buf_b = singleton!(: [u32; eth_rx::BUF_WORDS] = [0; eth_rx::BUF_WORDS]).unwrap();
-    // Carry + stitch buffers for ring-aware scan across DMA half boundaries.
-    // Both static (in BSS via singleton!) — too big to want on the stack.
-    let rx_carry =
-        singleton!(: [u8; eth_rx::MAX_CARRY_BYTES] = [0; eth_rx::MAX_CARRY_BYTES]).unwrap();
-    let rx_stitch =
-        singleton!(: [u8; eth_rx::STITCH_BUF_BYTES] = [0; eth_rx::STITCH_BUF_BYTES]).unwrap();
-    let eth_rx = eth_rx::EthRx::new(
-        &mut pio0,
-        sm1,
-        HW_PIN_RXD,
-        sys_clk_hz,
-        dma.ch0,
-        dma.ch1,
-        rx_buf_a,
-        rx_buf_b,
-        rx_carry,
-        rx_stitch,
-    );
-
-    // Install EthRx + our MAC (for the IRQ-side MAC filter) into the
-    // core-1-exclusive RX engine the DMA_IRQ_0 handler reads. Must happen
-    // before core 1 is launched (below), so RX_ENGINE is populated before
-    // core 1's first IRQ.
-    let our_mac_bytes: [u8; 6] = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC];
-    let _ = eth_mac::install_rx(eth_rx, our_mac_bytes);
-
-    // Phase 3c — launch core 1 to OWN RX decode. core1_entry unmasks
-    // DMA_IRQ_0 on core 1's own interrupt controller + enables machine-external
-    // interrupts, then wfi-loops; the handler runs the stitch + decode + verify
-    // pipeline there. Core 0 unmasks nothing — it takes no DMA IRQ at all, so
-    // the main loop + smoltcp can't be starved by decode work under broadcast
-    // load (R12c; fixes the 23× TCP collapse from R11). Custom RISC-V launch
-    // because rp235x-hal's multicore::spawn is Cortex-M only (see
-    // src/multicore_riscv.rs / cpu-dpll-plan.md §9f). Bounded launch → a
-    // non-responsive core 1 returns an error rather than hanging core 0; the
-    // outcome is surfaced in the 1 Hz log.
-    //
-    // Ordering: after EthRx::new (PIO sampler + DMA already running, so the
-    // first DMA-half pending bit just latches until core 1 enables the IRQ)
-    // and after install_rx (RX_ENGINE populated). The decode never runs on
-    // core 0, so the main loop's iteration budget stays free.
-    let core1_stack = unsafe { &mut (*core::ptr::addr_of_mut!(CORE1_STACK)).0 };
-    let core1_launch_ok = unsafe {
-        multicore_riscv::launch_core1_riscv(&mut psm, &mut sio_fifo, core1_stack, core1_entry)
-            .is_ok()
-    };
-
-    // EthMac now owns just the TX side + a scratch buffer; RX state lives
-    // in the shared static. smoltcp's Interface still sees a single
-    // Device handle.
-    let mut mac = eth_mac::EthMac::new(eth_tx);
-
-    let our_mac = EthernetAddress(our_mac_bytes);
+    let our_mac = EthernetAddress(OUR_MAC);
     let mut iface_config = Config::new(HardwareAddress::Ethernet(our_mac));
     iface_config.random_seed = timer.get_counter().ticks();
     let now0_inst = Instant::from_micros(timer.get_counter().ticks() as i64);
@@ -393,7 +428,7 @@ fn main_10bt(
     let dns_handle: SocketHandle = sockets.add(dns::Socket::new(&[], &mut dns_queries[..]));
 
     #[cfg(feature = "wan-dhcp")]
-    let mut wan = WanState::new();
+    let mut wan = crate::wan::WanState::new();
     // The device's TX checksum capabilities — used to emit/parse ICMP echoes.
     #[cfg(feature = "wan-dhcp")]
     let wan_checksum: ChecksumCapabilities = mac.capabilities().checksum;
@@ -401,7 +436,7 @@ fn main_10bt(
     // Mirror the C reference's network parameters so the host's existing
     // ethtool / IP route setup keeps working.
     let endpoint = eth_tx::UdpEndpoint {
-        src_mac: our_mac_bytes,
+        src_mac: OUR_MAC,
         dst_mac: [0xFF; 6], // broadcast
         src_ip: [192, 168, 37, 24],
         dst_ip: [192, 168, 37, 19],
@@ -496,9 +531,9 @@ fn main_10bt(
         // interface, drain ICMP echo replies, and harvest a finished DNS query.
         #[cfg(feature = "wan-dhcp")]
         {
-            wan_dhcp_apply(&mut iface, &mut sockets, dhcp_handle, dns_handle, &mut wan);
-            wan_ping_drain(&mut sockets, icmp_handle, &mut wan, &wan_checksum);
-            wan_dns_harvest(&mut sockets, dns_handle, &mut wan);
+            crate::wan::dhcp_apply(&mut iface, &mut sockets, dhcp_handle, dns_handle, &mut wan);
+            crate::wan::ping_drain(&mut sockets, icmp_handle, &mut wan, &wan_checksum);
+            crate::wan::dns_harvest(&mut sockets, dns_handle, &mut wan);
         }
 
         // R4.6: UDP echo on port 1234. R7: tiny HTTP server on port 80.
@@ -535,8 +570,8 @@ fn main_10bt(
         if now >= next_ping {
             next_ping = next_ping.wrapping_add(1_000_000);
             if wan.addr.is_some() {
-                wan_ping_send(&mut sockets, icmp_handle, &mut wan, &wan_checksum);
-                wan_dns_start(&mut iface, &mut sockets, dns_handle, &mut wan);
+                crate::wan::ping_send(&mut sockets, icmp_handle, &mut wan, &wan_checksum);
+                crate::wan::dns_start(&mut iface, &mut sockets, dns_handle, &mut wan);
             }
         }
 
@@ -560,274 +595,15 @@ fn main_10bt(
     }
 }
 
-// =====================================================================
-// R15a — WAN-as-DHCP-client helpers (all gated by the `wan-dhcp` feature)
-// =====================================================================
-//
-// The 10BASE-T side becomes a DHCP client: it leases an upstream IP + default
-// route + DNS, then proves internet reachability by pinging 8.8.8.8 and
-// resolving a name out the wired link. NAPT/forwarding stay R16/R17 — this is
-// the router box being a *client*, not routing other clients' traffic. See
-// docs/r15-plan.md §5.
-
-/// Off-link ping target (Google public DNS) — reachable only via the default
-/// route, so a reply proves the DHCP-installed gateway works.
+/// Emit the once-per-second `[Wan]` status line over CDC (R15a): lease IP /
+/// gateway / DNS, the ICMP ping tally, and the last resolved A record. The body
+/// is formatted by [`crate::wan::WanState::write_status`] (shared with the
+/// router build's `usb_task`).
 #[cfg(feature = "wan-dhcp")]
-const WAN_PING_TARGET: Ipv4Address = Ipv4Address::new(8, 8, 8, 8);
-/// Name to resolve via the DHCP-provided DNS server (acceptance #3).
-#[cfg(feature = "wan-dhcp")]
-const WAN_DNS_NAME: &str = "example.com";
-/// ICMP echo identifier we bind to + match replies against.
-#[cfg(feature = "wan-dhcp")]
-const WAN_ICMP_IDENT: u16 = 0x42;
-
-/// Live WAN-client state, surfaced once per second over CDC as the `[Wan]` line
-/// — the on-device evidence for the R15a acceptance.
-#[cfg(feature = "wan-dhcp")]
-struct WanState {
-    /// Address the dhcpv4 client leased (`None` until configured).
-    addr: Option<Ipv4Cidr>,
-    /// Default gateway from the lease.
-    gw: Option<Ipv4Address>,
-    /// First DNS server from the lease.
-    dns0: Option<Ipv4Address>,
-    /// ICMP echo sequence counter + sent/replied tallies.
-    ping_seq: u16,
-    ping_sent: u32,
-    ping_ok: u32,
-    /// In-flight DNS query handle, if any.
-    dns_query: Option<dns::QueryHandle>,
-    /// Last A record resolved for [`WAN_DNS_NAME`].
-    resolved: Option<Ipv4Address>,
-}
-
-#[cfg(feature = "wan-dhcp")]
-impl WanState {
-    fn new() -> Self {
-        Self {
-            addr: None,
-            gw: None,
-            dns0: None,
-            ping_seq: 0,
-            ping_sent: 0,
-            ping_ok: 0,
-            dns_query: None,
-            resolved: None,
-        }
-    }
-}
-
-/// Apply a dhcpv4 lease change: install/clear the interface address + default
-/// route and feed (or clear) the DNS socket's server list. Call every poll,
-/// after `iface.poll`. The lease data is copied out of the borrowed `Event`
-/// first (it borrows the SocketSet) so we can then touch the dns socket.
-#[cfg(feature = "wan-dhcp")]
-fn wan_dhcp_apply(
-    iface: &mut Interface,
-    sockets: &mut SocketSet,
-    dhcp_handle: SocketHandle,
-    dns_handle: SocketHandle,
-    wan: &mut WanState,
-) {
-    enum Action {
-        None,
-        Deconfig,
-        Config {
-            addr: Ipv4Cidr,
-            router: Option<Ipv4Address>,
-            dns0: Option<Ipv4Address>,
-            servers: heapless::Vec<IpAddress, 4>,
-        },
-    }
-    // Drain the event into owned values; the dhcp-socket borrow ends here.
-    let action = match sockets.get_mut::<dhcpv4::Socket>(dhcp_handle).poll() {
-        None => Action::None,
-        Some(dhcpv4::Event::Deconfigured) => Action::Deconfig,
-        Some(dhcpv4::Event::Configured(cfg)) => {
-            let mut servers: heapless::Vec<IpAddress, 4> = heapless::Vec::new();
-            for s in cfg.dns_servers.iter() {
-                let _ = servers.push(IpAddress::Ipv4(*s));
-            }
-            Action::Config {
-                addr: cfg.address,
-                router: cfg.router,
-                dns0: cfg.dns_servers.first().copied(),
-                servers,
-            }
-        }
-    };
-
-    match action {
-        Action::None => {}
-        Action::Deconfig => {
-            iface.update_ip_addrs(|a| a.clear());
-            iface.routes_mut().remove_default_ipv4_route();
-            sockets.get_mut::<dns::Socket>(dns_handle).update_servers(&[]);
-            *wan = WanState::new();
-        }
-        Action::Config {
-            addr,
-            router,
-            dns0,
-            servers,
-        } => {
-            iface.update_ip_addrs(|a| {
-                a.clear();
-                let _ = a.push(IpCidr::Ipv4(addr));
-            });
-            iface.routes_mut().remove_default_ipv4_route();
-            if let Some(gw) = router {
-                let _ = iface.routes_mut().add_default_ipv4_route(gw);
-            }
-            sockets
-                .get_mut::<dns::Socket>(dns_handle)
-                .update_servers(&servers);
-            wan.addr = Some(addr);
-            wan.gw = router;
-            wan.dns0 = dns0;
-            // Servers may have changed — abandon any in-flight query.
-            wan.dns_query = None;
-        }
-    }
-}
-
-/// Send one ICMP echo request to [`WAN_PING_TARGET`] (binds the socket lazily).
-/// Replies are tallied in [`wan_ping_drain`].
-#[cfg(feature = "wan-dhcp")]
-fn wan_ping_send(
-    sockets: &mut SocketSet,
-    icmp_handle: SocketHandle,
-    wan: &mut WanState,
-    checksum: &ChecksumCapabilities,
-) {
-    let sock = sockets.get_mut::<icmp::Socket>(icmp_handle);
-    if !sock.is_open() && sock.bind(icmp::Endpoint::Ident(WAN_ICMP_IDENT)).is_err() {
-        return;
-    }
-    if !sock.can_send() {
-        return;
-    }
-    let repr = Icmpv4Repr::EchoRequest {
-        ident: WAN_ICMP_IDENT,
-        seq_no: wan.ping_seq,
-        data: b"pico-wan",
-    };
-    if let Ok(payload) = sock.send(repr.buffer_len(), IpAddress::Ipv4(WAN_PING_TARGET)) {
-        let mut pkt = Icmpv4Packet::new_unchecked(payload);
-        repr.emit(&mut pkt, checksum);
-        wan.ping_seq = wan.ping_seq.wrapping_add(1);
-        wan.ping_sent = wan.ping_sent.wrapping_add(1);
-    }
-}
-
-/// Drain ICMP echo replies; count the ones matching our ident.
-#[cfg(feature = "wan-dhcp")]
-fn wan_ping_drain(
-    sockets: &mut SocketSet,
-    icmp_handle: SocketHandle,
-    wan: &mut WanState,
-    checksum: &ChecksumCapabilities,
-) {
-    let sock = sockets.get_mut::<icmp::Socket>(icmp_handle);
-    while sock.can_recv() {
-        let Ok((payload, _from)) = sock.recv() else {
-            break;
-        };
-        let Ok(pkt) = Icmpv4Packet::new_checked(payload) else {
-            continue;
-        };
-        if let Ok(Icmpv4Repr::EchoReply { ident, .. }) = Icmpv4Repr::parse(&pkt, checksum) {
-            if ident == WAN_ICMP_IDENT {
-                wan.ping_ok = wan.ping_ok.wrapping_add(1);
-            }
-        }
-    }
-}
-
-/// Start a DNS A-record query for [`WAN_DNS_NAME`] when none is in flight and a
-/// server is known.
-#[cfg(feature = "wan-dhcp")]
-fn wan_dns_start(
-    iface: &mut Interface,
-    sockets: &mut SocketSet,
-    dns_handle: SocketHandle,
-    wan: &mut WanState,
-) {
-    if wan.dns_query.is_some() || wan.dns0.is_none() {
-        return;
-    }
-    let cx = iface.context();
-    if let Ok(handle) = sockets
-        .get_mut::<dns::Socket>(dns_handle)
-        .start_query(cx, WAN_DNS_NAME, DnsQueryType::A)
-    {
-        wan.dns_query = Some(handle);
-    }
-}
-
-/// Harvest a finished DNS query: record the first A record + free the slot.
-#[cfg(feature = "wan-dhcp")]
-fn wan_dns_harvest(sockets: &mut SocketSet, dns_handle: SocketHandle, wan: &mut WanState) {
-    let Some(handle) = wan.dns_query else {
-        return;
-    };
-    match sockets
-        .get_mut::<dns::Socket>(dns_handle)
-        .get_query_result(handle)
-    {
-        Ok(addrs) => {
-            wan.dns_query = None;
-            wan.resolved = addrs.iter().find_map(|ip| match ip {
-                IpAddress::Ipv4(v4) => Some(*v4),
-                #[allow(unreachable_patterns)] // ipv6 disabled — single variant
-                _ => None,
-            });
-        }
-        Err(dns::GetQueryResultError::Pending) => {}
-        // Failed (NXDOMAIN / SERVFAIL / timeout) — free the slot, retry later.
-        Err(_) => wan.dns_query = None,
-    }
-}
-
-/// Emit the once-per-second `[Wan]` status line: lease IP / gateway / DNS, the
-/// ICMP ping tally, and the last resolved A record.
-#[cfg(feature = "wan-dhcp")]
-fn log_wan<B: UsbBus>(serial: &mut SerialPort<'_, B>, line: &mut String<160>, wan: &WanState) {
+fn log_wan<B: UsbBus>(serial: &mut SerialPort<'_, B>, line: &mut String<160>, wan: &crate::wan::WanState) {
     line.clear();
     let _ = write!(line, "[Wan] ");
-    match wan.addr {
-        Some(c) => {
-            let _ = write!(line, "ip={} ", c);
-        }
-        None => {
-            let _ = write!(line, "ip=none ");
-        }
-    }
-    match wan.gw {
-        Some(g) => {
-            let _ = write!(line, "gw={} ", g);
-        }
-        None => {
-            let _ = write!(line, "gw=none ");
-        }
-    }
-    match wan.dns0 {
-        Some(d) => {
-            let _ = write!(line, "dns={} ", d);
-        }
-        None => {
-            let _ = write!(line, "dns=none ");
-        }
-    }
-    let _ = write!(line, "ping={}/{} ", wan.ping_ok, wan.ping_sent);
-    match wan.resolved {
-        Some(a) => {
-            let _ = write!(line, "{}={}", WAN_DNS_NAME, a);
-        }
-        None => {
-            let _ = write!(line, "{}=?", WAN_DNS_NAME);
-        }
-    }
+    wan.write_status(line);
     let _ = writeln!(line);
     let _ = serial.write(line.as_bytes());
 }

@@ -866,6 +866,28 @@ async fn usb_task(
                 n / 1000,
             );
             let _ = serial.write(line.as_bytes());
+
+            // R15b — the WAN (10BASE-T) side, when the router build is active.
+            // wan_task publishes a snapshot we format here, so all CDC output
+            // stays on this one task (no serial contention).
+            #[cfg(feature = "router")]
+            {
+                let snap = critical_section::with(|cs| WAN_PUB.borrow(cs).get());
+                let mut wline: String<128> = String::new();
+                let _ = write!(
+                    wline,
+                    "[Wan] core1={} ",
+                    if WAN_CORE1_OK.load(Ordering::Relaxed) != 0 { "ok" } else { "FAIL" }
+                );
+                match snap {
+                    Some(w) => w.write_status(&mut wline),
+                    None => {
+                        let _ = write!(wline, "(no lease yet)");
+                    }
+                }
+                let _ = write!(wline, "\r\n");
+                let _ = serial.write(wline.as_bytes());
+            }
         }
         Timer::after(Duration::from_millis(1)).await;
     }
@@ -1062,6 +1084,142 @@ pub fn run(
             spawner.spawn(t);
         }
         if let Ok(t) = cyw43_bootstrap_task(spawner, pwr, spi) {
+            spawner.spawn(t);
+        }
+    });
+}
+
+// =====================================================================
+// 4. R15b — the router: both interfaces live under one executor
+// =====================================================================
+//
+// `run_router` is `run` plus a `wan_task` that drives the 10BASE-T (WAN) side
+// as a 2nd smoltcp `Interface` over `EthMac`. The 10BT RX IRQ runs on **core 1**
+// (launched by `setup_eth_mac` before we hand core 0 to the executor), so the
+// long decode never starves the executor; `wan_task` only drains the inbox via
+// `EthMac::receive` (a brief `Spinlock<0>`) on its poll cadence. The cyw43 LAN
+// (`cyw43_bootstrap_task` → Runner + `net_task`) is unchanged. See
+// docs/r15-plan.md §6.
+
+/// WAN-client snapshot published by `wan_task` for `usb_task`'s `[Wan]` line —
+/// keeps all CDC output on the one task. `WanState` is `Copy`, so a plain `Cell`
+/// suffices under the `critical_section` mutex.
+#[cfg(feature = "router")]
+static WAN_PUB: Mutex<core::cell::Cell<Option<crate::wan::WanState>>> =
+    Mutex::new(core::cell::Cell::new(None));
+/// Whether core 1 (the 10BT RX engine) launched — surfaced in the `[Wan]` line.
+#[cfg(feature = "router")]
+static WAN_CORE1_OK: AtomicU32 = AtomicU32::new(0);
+
+/// R15b WAN task: a 2nd smoltcp `Interface` on `EthMac` (the 10BASE-T phy) that
+/// runs the shared `crate::wan` DHCP-client / ping / DNS logic + the NLP
+/// keepalive, polled on a 1 ms cadence. Mirrors `main_10bt`'s WAN handling but
+/// async, beside the cyw43 LAN. `EthMac` is `'static` (owns its TX state), so it
+/// moves into the task cleanly — same shape as `net_task` taking `NetDriver`.
+#[cfg(feature = "router")]
+#[embassy_executor::task]
+async fn wan_task(mut mac: crate::eth_mac::EthMac) -> ! {
+    use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
+    use smoltcp::phy::Device as _; // bring `capabilities()` into scope
+    use smoltcp::socket::{dhcpv4, dns, icmp};
+    use smoltcp::wire::{EthernetAddress, HardwareAddress};
+
+    // TX checksum caps for emitting/parsing ICMP echoes (read once; the device
+    // computes L3/L4 checksums on egress, no offload).
+    let dev_checksum = mac.capabilities().checksum;
+
+    let now = || Instant::from_micros(embassy_time::Instant::now().as_micros() as i64);
+    let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(crate::OUR_MAC)));
+    config.random_seed = embassy_time::Instant::now().as_ticks();
+    let mut iface = Interface::new(config, &mut mac, now());
+    // No static IP — the dhcpv4 client installs address + default route on lease.
+
+    let mut sockets_storage: [SocketStorage; 4] = [SocketStorage::EMPTY; 4];
+    let mut sockets = SocketSet::new(&mut sockets_storage[..]);
+    let dhcp_handle = sockets.add(dhcpv4::Socket::new());
+
+    let mut icmp_rx_meta = [icmp::PacketMetadata::EMPTY; 8];
+    let mut icmp_rx_payload = [0u8; 512];
+    let mut icmp_tx_meta = [icmp::PacketMetadata::EMPTY; 8];
+    let mut icmp_tx_payload = [0u8; 512];
+    let icmp_handle = sockets.add(icmp::Socket::new(
+        icmp::PacketBuffer::new(&mut icmp_rx_meta[..], &mut icmp_rx_payload[..]),
+        icmp::PacketBuffer::new(&mut icmp_tx_meta[..], &mut icmp_tx_payload[..]),
+    ));
+
+    let mut dns_queries: [Option<dns::DnsQuery>; 2] = [None, None];
+    let dns_handle = sockets.add(dns::Socket::new(&[], &mut dns_queries[..]));
+
+    let mut wan = crate::wan::WanState::new();
+
+    let mut next_nlp = embassy_time::Instant::now();
+    let mut next_ping = embassy_time::Instant::now();
+    loop {
+        iface.poll(now(), &mut mac, &mut sockets);
+        crate::wan::dhcp_apply(&mut iface, &mut sockets, dhcp_handle, dns_handle, &mut wan);
+        crate::wan::ping_drain(&mut sockets, icmp_handle, &mut wan, &dev_checksum);
+        crate::wan::dns_harvest(&mut sockets, dns_handle, &mut wan);
+
+        let nowt = embassy_time::Instant::now();
+        // NLP keepalive every 16 ms — IEEE 802.3 link integrity (gotcha #9).
+        if nowt >= next_nlp {
+            next_nlp = nowt + Duration::from_millis(16);
+            mac.send_nlp();
+        }
+        // Ping 8.8.8.8 + (re)start a DNS query once a second, once we hold a lease.
+        if nowt >= next_ping {
+            next_ping = nowt + Duration::from_secs(1);
+            if wan.addr.is_some() {
+                crate::wan::ping_send(&mut sockets, icmp_handle, &mut wan, &dev_checksum);
+                crate::wan::dns_start(&mut iface, &mut sockets, dns_handle, &mut wan);
+            }
+        }
+        // Publish a snapshot for usb_task's [Wan] line.
+        critical_section::with(|cs| WAN_PUB.borrow(cs).set(Some(wan)));
+
+        Timer::after(Duration::from_millis(1)).await;
+    }
+}
+
+/// R15b entry: `run` + the WAN task. Core 1 (10BT RX decode) must already be
+/// launched by `setup_eth_mac` before this is called (it seizes core 0). Spawns
+/// the USB poll/telemetry task, the cyw43 bring-up (→ Runner + LAN `net_task`),
+/// and `wan_task(mac)`. Never returns.
+#[cfg(feature = "router")]
+#[allow(clippy::too_many_arguments)] // dispatch boundary — both interfaces' resources
+pub fn run_router(
+    mac: crate::eth_mac::EthMac,
+    core1_ok: bool,
+    pwr: WlOnPin,
+    spi: PioSpiCyw43,
+    usb: hal::pac::USB,
+    usb_dpram: hal::pac::USB_DPRAM,
+    usb_clock: hal::clocks::UsbClock,
+    resets: &mut hal::pac::RESETS,
+) -> ! {
+    WAN_CORE1_OK.store(core1_ok as u32, Ordering::Relaxed);
+    let (usb_dev, serial, reset_iface) = build_usb(usb, usb_dpram, usb_clock, resets);
+
+    unsafe {
+        hal::arch::interrupt_unmask(ALARM_IRQ);
+        hal::arch::interrupt_enable();
+    }
+
+    static mut EXECUTOR: core::mem::MaybeUninit<Executor> = core::mem::MaybeUninit::uninit();
+    let executor = unsafe {
+        let p = core::ptr::addr_of_mut!(EXECUTOR);
+        (*p).write(Executor::new());
+        &mut *(*p).as_mut_ptr()
+    };
+
+    executor.run(|spawner| {
+        if let Ok(t) = usb_task(usb_dev, serial, reset_iface) {
+            spawner.spawn(t);
+        }
+        if let Ok(t) = cyw43_bootstrap_task(spawner, pwr, spi) {
+            spawner.spawn(t);
+        }
+        if let Ok(t) = wan_task(mac) {
             spawner.spawn(t);
         }
     });

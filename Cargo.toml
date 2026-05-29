@@ -59,6 +59,18 @@ wan-dhcp = [
     "smoltcp/socket-dns",      # device-originated name resolution (acceptance: resolve a name)
 ]
 
+# R15b — the router: BOTH interfaces live at once. Pulls in the wireless LAN
+# stack (cyw43 + embassy executor, = `wireless`) AND the WAN-client sockets, and
+# unifies them under one executor — the 10BT RX IRQ on core 1 + a `wan_task`
+# (the R15a dhcpv4/icmp/dns logic, async) on core 0 beside the cyw43 LAN. OFF by
+# default. NAPT/forwarding stay R16/R17. See docs/r15-plan.md §6.
+router = [
+    "wireless",
+    "smoltcp/socket-dhcpv4",
+    "smoltcp/socket-icmp",
+    "smoltcp/socket-dns",
+]
+
 # R13 — wireless router scaffolding (Pico 2 W / CYW43439). Pulls in the cyw43
 # driver + the async runtime (embassy-executor arch-riscv32 + embassy-time on a
 # custom rp235x-hal time-driver). OFF by default so the production 10BASE-T

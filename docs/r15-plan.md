@@ -364,11 +364,27 @@ NATs out the host's uplink → replies return; DNS queries to `.19` are forwarde
 - [x] `[Wan]` telemetry line. (`log_wan` — `ip=… gw=… dns=… ping=ok/sent <name>=<A>`.)
 - [x] Host harness (`tools/wan-test-host.sh`, nftables not iptables); validated acceptance #1–#3; default build byte-unchanged (all changes `#[cfg]`-gated). **Evidence:** `DHCPACK 192.168.37.129`; `tcpdump -ni eno1` device→`8.8.8.8` echo (id 66, len 16) + replies ~13 ms; `example.com` forwarded/resolved.
 
-**R15b (`--features router`):**
-- [ ] Add `router` feature; restructure the three `main()` dispatch arms.
-- [ ] Router arm: 10BT bring-up (no GP25 LED) + core-1 launch + PIO1 gSPI + WL_ON.
-- [ ] `wireless::run_router` + `wan_task(EthMac)` (R15a logic, async, NLP @16 ms).
-- [ ] Validate all three concurrent acceptances (§6.3): WAN out, LAN intact,
-      core 1 up.
-- [ ] Update `router-plan.md` §12 + §7 and `RESUME.md` to record R15a/R15b
-      and resolve the unification-location wording (§2).
+**R15b (`--features router`) — ✅ COMPLETE & on-device-validated 2026-05-29:**
+- [x] Add `router` feature; restructure the three `main()` dispatch arms
+      (`#[cfg(router)]` first, wireless-only re-gated `all(wireless, not(router))`).
+- [x] Extracted shared `src/wan.rs` (WAN logic) + `setup_eth_mac` (10BT bring-up)
+      so `main_10bt` and the router arm share one copy. `OUR_MAC` is one const.
+- [x] Router arm: 10BT bring-up (no GP25 LED — it's the gSPI CS) + core-1 launch
+      + PIO1 gSPI + WL_ON.
+- [x] `wireless::run_router` + `wan_task(EthMac)` (R15a logic, async, NLP @16 ms);
+      WAN status published to a `critical_section` cell, printed as `[Wan]` by
+      `usb_task`. `WAN_CORE1_OK` surfaces the core-1 launch result.
+- [x] All four build configs (default / wan-dhcp / wireless / router) compile
+      clean — zero new warnings (only the two pre-existing: `eth_rx.rs` args,
+      `build_gspi_sm` type).
+- [x] Validated all three concurrent acceptances (§6.3): **WAN out** (`[Wan]
+      core1=ok ip=192.168.37.129/24 ping=38/38 example.com=…`), **LAN intact**
+      (Wi-Fi client joined → `ping 192.168.4.1` 3/3 → `curl :80` page,
+      `DHCP replies:3`/`LAN rx:11`), **core 1 up** (`core1=ok`; WAN ping replies
+      are 10BT RX frames decoded there) — all at once, with `[Cyw43] ap=1 net=1`.
+- [x] N1–N4 (§3) confirmed: core 1 + executor in one image (N1) works; `main()`
+      plumbing (N2) clean; `Spinlock<0>`/`critical_section` coexistence (N3) holds
+      under concurrent load; 1 ms poll hand-off (N4) fine for a light client.
+- [ ] (Carryover) Update `router-plan.md` §12/§7 to point the unification at
+      R15b (§2) — RESUME + r15-plan are updated; router-plan §12 wording still
+      says R16. Low priority; fold into the R16 plan.
