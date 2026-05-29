@@ -38,6 +38,9 @@ mod wireless;
 // R14.3 — smoltcp phy::Device adapter over cyw43's NetDriver (wireless LAN).
 #[cfg(feature = "wireless")]
 mod cyw43_phy;
+// R14.4 — minimal LAN DHCP server (smoltcp UDP :67).
+#[cfg(feature = "wireless")]
+mod dhcp_server;
 
 use panic_halt as _;
 

@@ -60,6 +60,10 @@ wireless = [
     "dep:embassy-sync",
     "dep:embassy-futures",
     "dep:embassy-net-driver",
+    # DHCP wire codec (DhcpRepr/DhcpPacket) for the LAN DHCP server (R14.4).
+    # Enabled only in the wireless build so the default 10BT smoltcp set is
+    # unchanged.
+    "smoltcp/proto-dhcpv4",
 ]
 
 [dependencies]

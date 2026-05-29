@@ -32,12 +32,14 @@ use embassy_time_queue_utils::Queue;
 use heapless::String;
 use rp235x_hal as hal;
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
+use smoltcp::socket::udp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 use usb_device::{class_prelude::*, prelude::*};
 use usbd_serial::SerialPort;
 
 use crate::cyw43_phy::Cyw43Phy;
+use crate::dhcp_server::DhcpServer;
 use hal::pac::PIO1;
 use hal::pio::{
     PIOBuilder, PinDir, PinState, Running, Rx, ShiftDirection, StateMachine, Stopped, Tx,
@@ -853,13 +855,14 @@ async fn usb_task(
             let mut line: String<96> = String::new();
             let _ = write!(
                 line,
-                "[Cyw43] new={} init={} led={} ap={} net={} rx={} hb={}\r\n",
+                "[Cyw43] new={} init={} led={} ap={} net={} rx={} dhcp={} hb={}\r\n",
                 CYW43_NEW_DONE.load(Ordering::Relaxed),
                 CYW43_INIT_DONE.load(Ordering::Relaxed),
                 CYW43_LED_DONE.load(Ordering::Relaxed),
                 CYW43_AP_DONE.load(Ordering::Relaxed),
                 CYW43_NET_UP.load(Ordering::Relaxed),
                 crate::cyw43_phy::CYW43_RX_FRAMES.load(Ordering::Relaxed),
+                crate::dhcp_server::DHCP_TX.load(Ordering::Relaxed),
                 n / 1000,
             );
             let _ = serial.write(line.as_bytes());
@@ -893,14 +896,27 @@ async fn net_task(net: cyw43::NetDriver<'static>, mac: [u8; 6]) -> ! {
         let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(LAN_IP), LAN_PREFIX));
     });
 
-    // No sockets yet — ARP + ICMP echo are answered by the Interface itself.
-    // (R14.4 adds a DHCP-server UDP socket here.)
+    // ARP + ICMP echo are answered by the Interface itself; the one socket is
+    // the R14.4 DHCP server on UDP :67. Buffers sized for a few BOOTP packets.
     let mut sockets_storage: [SocketStorage; 2] = [SocketStorage::EMPTY; 2];
     let mut sockets = SocketSet::new(&mut sockets_storage[..]);
+    let mut dhcp_rx_meta = [udp::PacketMetadata::EMPTY; 4];
+    let mut dhcp_rx_payload = [0u8; 1536];
+    let mut dhcp_tx_meta = [udp::PacketMetadata::EMPTY; 4];
+    let mut dhcp_tx_payload = [0u8; 1536];
+    let dhcp_socket = udp::Socket::new(
+        udp::PacketBuffer::new(&mut dhcp_rx_meta[..], &mut dhcp_rx_payload[..]),
+        udp::PacketBuffer::new(&mut dhcp_tx_meta[..], &mut dhcp_tx_payload[..]),
+    );
+    let dhcp_handle = sockets.add(dhcp_socket);
+    let mut dhcp = DhcpServer::new();
 
     CYW43_NET_UP.store(1, Ordering::Relaxed);
     loop {
         iface.poll(now(), &mut device, &mut sockets);
+        // Drain + answer DHCP after the iface has delivered inbound datagrams;
+        // the queued replies go out on the next poll.
+        dhcp.poll(sockets.get_mut::<udp::Socket>(dhcp_handle));
         Timer::after(Duration::from_millis(5)).await;
     }
 }
