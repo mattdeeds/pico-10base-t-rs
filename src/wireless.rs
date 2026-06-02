@@ -1304,6 +1304,9 @@ async fn wan_task(mut mac: crate::eth_mac::EthMac) -> ! {
 
     let mut next_nlp = embassy_time::Instant::now();
     let mut next_ping = embassy_time::Instant::now();
+    // R19: gateway from the last lease — to ARP it the instant it first
+    // appears/changes (cold-start pre-warm, see below).
+    let mut prev_gw: Option<Ipv4Address> = None;
     loop {
         iface.poll(now(), &mut device, &mut sockets);
         crate::wan::dhcp_apply(&mut iface, &mut sockets, dhcp_handle, dns_handle, &mut wan);
@@ -1312,6 +1315,13 @@ async fn wan_task(mut mac: crate::eth_mac::EthMac) -> ! {
         if let Some(cidr) = wan.addr {
             device.set_lease(cidr, wan.gw);
         }
+        // R19: the instant the lease first provides a gateway (or it changes), ARP
+        // it right away — don't wait for the 1 Hz retry below — so WAN_NEIGH is warm
+        // before any client's first forwarded frame can race it.
+        if wan.gw.is_some() && wan.gw != prev_gw {
+            device.arp_gateway(now());
+        }
+        prev_gw = wan.gw;
         // R18: hand the WAN-learned upstream resolver to LAN DHCP clients. With
         // R17 NAPT forwarding their port-53 UDP, no DNS relay is needed — they
         // query it directly through our NAT. Until a lease provides one, the
@@ -1335,6 +1345,16 @@ async fn wan_task(mut mac: crate::eth_mac::EthMac) -> ! {
             if wan.addr.is_some() {
                 crate::wan::ping_send(&mut sockets, icmp_handle, &mut wan, &dev_checksum);
                 crate::wan::dns_start(&mut iface, &mut sockets, dns_handle, &mut wan);
+                // R19: pre-warm the WAN gateway's MAC so the first forwarded
+                // LAN→WAN frame isn't dropped while WAN_NEIGH is still empty (the
+                // cold-start `[Fwd] drop`). Re-ARP each second until the passive
+                // learner has it — robust to a reply lost on the half-duplex wire
+                // — then stop (no steady-state spam).
+                if let Some(gw) = wan.gw {
+                    if !crate::forward::wan_neigh_known(gw) {
+                        device.arp_gateway(now());
+                    }
+                }
             }
             // R17: sweep idle NAPT conntrack entries once a second.
             crate::forward::nat_reap(now().total_millis().max(0) as u64);

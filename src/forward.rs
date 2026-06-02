@@ -232,6 +232,30 @@ fn nexthop(dst: Ipv4Address, subnet: Ipv4Cidr, gateway: Option<Ipv4Address>) -> 
     }
 }
 
+/// Whether `ip`'s MAC is already in the WAN neighbor table — lets `wan_task`
+/// stop re-ARPing the gateway once the table is warm (R19 cold-start fix).
+pub fn wan_neigh_known(ip: Ipv4Address) -> bool {
+    critical_section::with(|cs| WAN_NEIGH.borrow_ref(cs).lookup(ip).is_some())
+}
+
+/// Build a broadcast ARP request ("who-has `tpa`, tell `spa`") as a 42-byte
+/// Ethernet/IPv4 frame. `EthMac::send_raw_frame` pads it to the 60-byte minimum
+/// and appends the FCS. The byte layout matches [`learn`]'s ARP parser, so the
+/// target's *reply* repopulates the neighbor table. R19 cold-start pre-warm.
+fn build_arp_request(our_mac: [u8; 6], spa: Ipv4Address, tpa: Ipv4Address) -> [u8; 42] {
+    let mut f = [0u8; 42];
+    f[0..6].copy_from_slice(&[0xff; 6]); // dst MAC = broadcast
+    f[6..12].copy_from_slice(&our_mac); // src MAC
+    f[12..14].copy_from_slice(&ETHERTYPE_ARP.to_be_bytes());
+    f[14..20].copy_from_slice(&[0x00, 0x01, 0x08, 0x00, 0x06, 0x04]); // htype/ptype/hlen/plen
+    f[20..22].copy_from_slice(&1u16.to_be_bytes()); // oper = request
+    f[22..28].copy_from_slice(&our_mac); // sha
+    f[28..32].copy_from_slice(&spa.octets()); // spa (sender = us)
+    // tha (f[32..38]) left zero — unknown, that's what we're asking for
+    f[38..42].copy_from_slice(&tpa.octets()); // tpa (target = the gateway)
+    f
+}
+
 // =====================================================================
 // R17 — NAPT: the single conntrack table + L4 parse / src-dst rewrite
 // =====================================================================
@@ -408,6 +432,24 @@ impl<D: Device> ForwardingDevice<D> {
     /// Access the inner phy (e.g. for `EthMac::send_nlp` — not part of `Device`).
     pub fn inner_mut(&mut self) -> &mut D {
         &mut self.inner
+    }
+
+    /// R19: proactively ARP this interface's gateway so its next-hop MAC lands in
+    /// the neighbor table (via the passive [`learn`] on the reply) *before* the
+    /// first forwarded frame — eliminating the cold-start `[Fwd] drop` while
+    /// `WAN_NEIGH` is still empty. No-op until a gateway + IP are leased. The owner
+    /// (`wan_task`) calls this once per second until [`wan_neigh_known`] is true.
+    pub fn arp_gateway(&mut self, now: Instant) {
+        let Some(gw) = self.cfg.gateway else {
+            return;
+        };
+        if self.cfg.our_ip.is_unspecified() {
+            return;
+        }
+        let arp = build_arp_request(self.cfg.our_mac, self.cfg.our_ip, gw);
+        if let Some(tx) = self.inner.transmit(now) {
+            tx.consume(arp.len(), |buf| buf.copy_from_slice(&arp));
+        }
     }
 
     /// Re-emit one forwarded frame (drained from the *ingress* channel by the
