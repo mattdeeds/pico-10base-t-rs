@@ -334,6 +334,12 @@ fn DMA_IRQ_0() {
     if !engine.rx.dma_irq_pending() {
         return;
     }
+    // Perf step 2 (router build): bracket the decode so core 1's RX utilisation
+    // is readable off `mcycle`. The span drops at function exit, right after the
+    // decode returns; cost is negligible vs the ≤2.57 ms pipeline, and it's
+    // absent from the production NIC build (its proven hot path stays unchanged).
+    #[cfg(feature = "router")]
+    let _cyc = crate::cycles::CycleSpan::new(&crate::cycles::CORE1_BUSY);
     process_completed_half(engine);
 }
 

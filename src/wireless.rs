@@ -872,8 +872,8 @@ async fn usb_task(
     // [Perf] rate state: previous cumulative counters (for per-second deltas) +
     // the conntrack live high-water. Router build only.
     #[cfg(feature = "router")]
-    let (mut prev_to_wan, mut prev_to_lan, mut prev_sent, mut ct_hwm) =
-        (0u32, 0u32, 0u32, 0usize);
+    let (mut prev_to_wan, mut prev_to_lan, mut prev_sent, mut ct_hwm, mut prev_c1, mut prev_fwd) =
+        (0u32, 0u32, 0u32, 0usize, 0u32, 0u32);
     loop {
         usb_dev.poll(&mut [&mut serial, &mut reset_iface]);
         // Honor a picotool -f reboot request from clean (non-IRQ) context.
@@ -964,14 +964,31 @@ async fn usb_task(
                 if ct > ct_hwm {
                     ct_hwm = ct;
                 }
-                let mut pline: String<192> = String::new();
+                // CPU utilisation (perf step 2): per-second busy-cycle deltas → %.
+                // cpu1 ≈ core-1 RX-decode load; cpu0 = the share of core-0
+                // wall-clock spent in the forwarding fast-path (NOT total core-0
+                // load). Published to atomics so the mgmt page reflects them too.
+                let c1 = crate::cycles::CORE1_BUSY.load(Ordering::Relaxed);
+                let fwd = crate::cycles::FWD_BUSY.load(Ordering::Relaxed);
+                let cpu1 = crate::cycles::permille(c1.wrapping_sub(prev_c1));
+                let cpu0 = crate::cycles::permille(fwd.wrapping_sub(prev_fwd));
+                prev_c1 = c1;
+                prev_fwd = fwd;
+                crate::cycles::CPU1_PERMILLE.store(cpu1, Ordering::Relaxed);
+                crate::cycles::CPU0_PERMILLE.store(cpu0, Ordering::Relaxed);
+                let mut pline: String<256> = String::new();
                 let _ = write!(
                     pline,
-                    "[Perf] up={}KB/s dn={}KB/s pps={} qmax={}/{} cthwm={}/{} \
+                    "[Perf] up={}KB/s dn={}KB/s pps={} cpu1={}.{}% cpu0={}.{}% \
+                     qmax={}/{} cthwm={}/{} \
                      drop[qf={} nh={} nat={} txb={} oth={}]\r\n",
                     up_kbs,
                     dn_kbs,
                     pps,
+                    cpu1 / 10,
+                    cpu1 % 10,
+                    cpu0 / 10,
+                    cpu0 % 10,
                     crate::forward::FWD_QHWM_L2W.load(Ordering::Relaxed),
                     crate::forward::FWD_QHWM_W2L.load(Ordering::Relaxed),
                     ct_hwm,
@@ -1158,6 +1175,19 @@ fn serve_status_http(socket: &mut tcp::Socket, dhcp: &DhcpServer) {
                 crate::forward::FWD_QHWM_L2W.load(Ordering::Relaxed),
                 crate::forward::FWD_QHWM_W2L.load(Ordering::Relaxed),
                 crate::forward::CHAN_DEPTH,
+            );
+            // CPU utilisation (perf step 2): the last per-second sample published
+            // by usb_task. core1 = RX-decode load; core0 = forwarding fast-path
+            // share of core-0 wall-clock (not total core-0 load).
+            let c1 = crate::cycles::CPU1_PERMILLE.load(Ordering::Relaxed);
+            let c0 = crate::cycles::CPU0_PERMILLE.load(Ordering::Relaxed);
+            let _ = write!(
+                body,
+                "CPU:         core1(rx-decode)={}.{}% core0(forward)={}.{}%\r\n",
+                c1 / 10,
+                c1 % 10,
+                c0 / 10,
+                c0 % 10,
             );
         }
 

@@ -483,6 +483,8 @@ impl<D: Device> ForwardingDevice<D> {
     /// checksum, resolve the next-hop MAC, rewrite the L2 header, and TX via the
     /// inner phy's normal token (EthMac → FCS/IFG/CSMA; cyw43 → NetDriver).
     pub fn egress(&mut self, frame: &mut Frame, now: Instant) {
+        // Perf step 2: count this core-0 forwarding work toward `FWD_BUSY`.
+        let _cyc = crate::cycles::CycleSpan::new(&crate::cycles::FWD_BUSY);
         // R17: NAPT the source on the way out the WAN (LAN→WAN). Rewrite IP src →
         // our WAN IP + L4 src port/id → an allocated WAN id, tracked in conntrack so
         // the reply can be matched back. The IP-header checksum fixup is handled by
@@ -612,6 +614,11 @@ impl<D: Device> Device for ForwardingDevice<D> {
         Self: 'a;
 
     fn receive(&mut self, ts: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        // Perf step 2: bracket the ingress classify/skim path toward `FWD_BUSY`.
+        // The span's Drop fires on every exit — including the `?` early-returns
+        // below — and before smoltcp consumes the returned tokens, so it captures
+        // forwarding work only, not the endpoint stack's processing.
+        let _cyc = crate::cycles::CycleSpan::new(&crate::cycles::FWD_BUSY);
         // Phase 1 — skim transit/drop frames (so they don't stall local ones
         // queued behind them) until the inbox yields a *local* frame or empties.
         // Each iteration's inner `tx` (a reply token) is dropped in-iteration; we

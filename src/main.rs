@@ -54,6 +54,10 @@ mod forward;
 // checksum helpers). Wired into the WAN ForwardingDevice. Router build only.
 #[cfg(feature = "router")]
 mod conntrack;
+// Perf characterization step 2 — `mcycle`-based per-core CPU-utilisation
+// counters (core-1 RX decode + core-0 forwarding fast-path). Router build only.
+#[cfg(feature = "router")]
+mod cycles;
 
 use panic_halt as _;
 
@@ -153,6 +157,10 @@ static mut CORE1_STACK: Core1Stack = Core1Stack([0; 4096]);
 /// `eth_mac.rs`) runs the stitch + decode + verify pipeline here — off core 0,
 /// so the main loop + smoltcp can't be starved by decode work under load.
 extern "C" fn core1_entry() -> ! {
+    // Perf step 2: un-inhibit this core's `mcycle` so the DMA_IRQ_0 handler can
+    // bracket its own RX-decode cost (router build — see `cycles`).
+    #[cfg(feature = "router")]
+    cycles::enable_mcycle();
     // Safety: enabling this core's own interrupts. The handler + shared RX
     // state were installed by core 0 (`install_rx`) before this core launched.
     unsafe {
@@ -219,6 +227,9 @@ fn main() -> ! {
     #[cfg(feature = "router")]
     {
         let _ = &timer; // TIMER0 stays un-reset; the time-driver reads it directly
+        // Perf step 2: un-inhibit core-0 `mcycle` before the executor takes over,
+        // so the forwarding fast-path can measure its own cycles (see `cycles`).
+        cycles::enable_mcycle();
         let sys_clk_hz = clocks.system_clock.freq().to_Hz();
 
         // WAN: GP14/GP13 → PIO0; build EthMac + launch core 1 (RX decode). Pin

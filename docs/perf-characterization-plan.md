@@ -39,21 +39,31 @@ queue/conntrack high-water, drop breakdown) **and** the mgmt page
 On-device: `[Perf]` renders, all counters read sanely at idle (0). **Real numbers
 need traffic** (the harness, §3).
 
-### Step 2 — `mcycle` CPU utilization ▶ NEXT (buildable without the rig)
-The "is a core saturated / is the radio the ceiling" metric:
-- **core 1**: bracket the `DMA_IRQ_0` RX-decode handler with `mcycle`, accumulate
-  busy-cycles → decode utilization %.
-- **core 0**: bracket the forwarding data path (`egress` + `classify_frame` + NAPT)
-  → forwarding-path utilization %. (A cooperative single-priority executor makes a
-  true total-idle figure hard; "cycles/sec in the routing path" is the number we
-  actually want for the core-balance question — `router-plan.md` §8.3.)
+### Step 2 — `mcycle` CPU utilization ✅ DONE (code complete, builds clean; on-device idle-validation pending a flash)
+New `src/cycles.rs` (router-only): `mcycle()` (CSR `0xB00`), `enable_mcycle()`
+(clears `mcountinhibit` CSR `0x320` — called per-core: core 0 in `main`'s router
+arm, core 1 at the top of `core1_entry`), and a `CycleSpan` RAII guard that
+brackets a scope and adds its `mcycle` delta (wrap-safe) to an accumulator.
+- **core 1**: a `CycleSpan` around `process_completed_half` in the `DMA_IRQ_0`
+  handler (`eth_mac.rs`) → `CORE1_BUSY` ≈ core-1 RX-decode utilization.
+- **core 0**: a `CycleSpan` at the top of `ForwardingDevice::receive` (classify/
+  skim) and `egress` (NAPT/TTL/L2-rewrite) in `forward.rs` → `FWD_BUSY` = the
+  *fraction of core-0 wall-clock spent forwarding* (NOT total core-0 load — the
+  executor/smoltcp/cyw43-SPI cost is outside the brackets; that's the
+  "cycles/sec in the routing path" number `router-plan.md` §8.3 wants).
 
-Mechanics (from the [[on-device-benchmarking]] memory, re-confirm against code):
-`mcycle` = CSR `0xB00` (`csrr {}, 0xb00`); **must clear `mcountinhibit` (CSR
-`0x320`, `csrw 0x320, x0`) per-core early** or all deltas read 0 — core 0 in
-`main()`, core 1 in its entry point; low 32 bits wrap ~28 s at 150 MHz (240 MHz:
-faster) → `wrapping_sub` deltas. Surface on `[Perf]` / the mgmt page. No external
-hardware needed (unlike low-power) — the CDC/mgmt readout is reliable over SWD.
+`usb_task` samples both accumulators once a second, divides each delta by
+`SYS_CLK_HZ` (240 MHz, or 150 with `clock-150mhz`), and publishes per-mille into
+`CPU1_PERMILLE`/`CPU0_PERMILLE` — surfaced as `cpu1=NN.N% cpu0=NN.N%` on the
+`[Perf]` CDC line **and** a `CPU:` row on the mgmt page (the reliable readout).
+Instrumentation is router-gated, so the production NIC build's hot path is
+byte-unchanged. No external hardware needed (unlike low-power).
+
+**Caveat for validation:** at idle, busy-cycles ≈ 0 *regardless* of whether the
+counter is enabled — so an idle read only confirms the fields render + read sane.
+Confirming the counters actually move (and the numbers mean something) needs
+traffic, i.e. the §3 run. Low 32 bits wrap ~18 s at 240 MHz / ~28 s at 150 MHz →
+always `wrapping_sub` deltas.
 
 ---
 
@@ -127,7 +137,12 @@ conntrack-pressure). The "real product" track (D) is independent + parallelizabl
 ## 5. Status / restart pointer
 
 - **Step 1 instrumentation: DONE** (`0285e31`), flashed, idle-validated.
-- **▶ NEXT: step 2** (`mcycle` CPU util) — buildable now without the rig.
-- **Then:** bring the rig up (`wan-test-host.sh` + `iperf3`), run
-  `tools/router-throughput.sh`, fill in §3, name the bottleneck.
-- **Unpushed on `main`:** `b32042d` (low-power doc) + `0285e31` (instr step 1).
+- **Step 2 (`mcycle` CPU util): DONE** (on `main`), all 4 configs/clippy
+  clean, SWD-flashed + idle-validated (fields render; `cpu1≈42% cpu0≈0.3%` at idle —
+  core 1 already busy decoding ambient 10BT, see the surprise finding above). The
+  counters can only be *meaningfully* exercised under load (§3).
+- **▶ NEXT:** bring the rig up (`wan-test-host.sh` + `iperf3`), run
+  `tools/router-throughput.sh`, watch `cpu1`/`cpu0` under routed load, fill in §3,
+  name the bottleneck.
+- **3 commits unpushed on `main`:** `b32042d` (low-power doc) + `0285e31` (instr
+  step 1) + the step-2 commit (this) — push held at the user's request.
