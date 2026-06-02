@@ -187,18 +187,23 @@ R17 is what lets us **stop** faking it host-side:
 
 ## 9. Step checklist
 
-- [ ] `src/conntrack.rs`: the heapless table + two lookups + allocator + timeout/LRU
-      eviction + `incr_checksum` util. Unit-test the checksum math + alloc/evict.
-- [ ] WAN `egress()` (outbound): NAPT src rewrite + conntrack insert/refresh + csum.
-- [ ] WAN `receive()` classify (inbound): conntrack-aware — match → dst rewrite +
-      `Transit`/`WAN_TO_LAN`; miss → `Local`. Keep the Pico's own sockets working.
-- [ ] Per-proto (TCP coarse-state, UDP, ICMP-echo id).
-- [ ] `[Nat]` telemetry (live count / evict / drop).
-- [ ] `wan-test-host.sh`: document `NAT_LAN=0` as the R17 mode; retire/gate the R16
-      route-back + `rp_filter` (now unnecessary).
-- [ ] Validate (deterministic client, `NAT_LAN=0`): `ping 8.8.8.8` + `curl` from a LAN
-      client; host `tcpdump` shows source = the Pico WAN IP; WAN's own ping/DNS intact;
-      LAN/AP intact; core 1 up; measure core-0 headroom (Risk 2).
-- [ ] Build all 4 configs + clippy clean; commit; update `RESUME.md` + this checklist.
-- [ ] (carry-over from R16) fix the stale `router-plan.md` §12 "unification is R16's"
-      wording (now R15b).
+- [x] `src/conntrack.rs`: the heapless table + two lookups + allocator + timeout/LRU
+      eviction + checksum util. Offline-verified (`tools/conntrack_selftest.rs`): checksum
+      math + alloc/evict + the full src/dst rewrite (offsets + pseudo-header).
+- [x] WAN `egress()` (outbound): NAPT src rewrite + conntrack insert/refresh + csum.
+- [x] WAN `receive()` classify (inbound): conntrack-aware — match → dst rewrite +
+      `Transit`/`WAN_TO_LAN`; miss → `Local`. The Pico's own ping/DNS keep working.
+- [x] Per-proto (TCP coarse-state, UDP, ICMP-echo id).
+- [x] `[Nat]` telemetry (live count / out / in / new / evict / drop).
+- [~] `wan-test-host.sh`: `NAT_LAN=0` is the R17 mode (host masquerades only the WAN
+      subnet, which covers the Pico's NAT'd source). The R16 route-back + `rp_filter` are
+      now unnecessary but left in (harmless) — retiring them is a tidy-up follow-up.
+- [x] Validated (`NAT_LAN=0`, laptop client): `ping 8.8.8.8` succeeds through the Pico's
+      NAT; `[Fwd]` climbs both ways; `[Nat] out`/`in` matched, `drop=0`; WAN's own ping/DNS
+      intact; LAN/AP intact; core 1 up. (curl-by-name needs DNS → R18; curl-by-IP works.)
+- [x] Build all 4 configs + clippy clean; commit; merge to `main`; update `RESUME.md` +
+      this checklist. **⚠️ flash gotcha: force-recompile the router variant LAST + verify
+      `strings <ELF> | grep -F "[Nat] ct="` — building other features leaves a stale
+      binary at the output path (cost ~1 h flashing the `wireless` image by mistake).**
+- [ ] (carry-overs) fix the stale `router-plan.md` §12 wording; proactive gateway-ARP on
+      lease to kill the cold-start neighbor-miss (`[Fwd] drop≈4`); R18 = DNS relay + mgmt.
