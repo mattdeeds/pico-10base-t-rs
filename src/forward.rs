@@ -32,7 +32,7 @@ use crate::conntrack; // R17 — NAPT connection tracking
 /// Max bytes of a forwarded L2 frame (matches `eth_mac::MAX_FRAME_BYTES`).
 pub const FRAME_CAP: usize = 1600;
 /// Per-direction forward-queue depth.
-const CHAN_DEPTH: usize = 4;
+pub const CHAN_DEPTH: usize = 4;
 
 /// A captured L2 frame in flight between the two interfaces.
 pub type Frame = Vec<u8, FRAME_CAP>;
@@ -43,11 +43,34 @@ pub static LAN_TO_WAN: FwdChannel = Channel::new();
 /// Frames the WAN side diverted, awaiting egress out the LAN (cyw43) phy.
 pub static WAN_TO_LAN: FwdChannel = Channel::new();
 
-// Telemetry — surfaced in the `[Wan]`/`[Cyw43]` CDC lines.
+// Telemetry — surfaced in the `[Wan]`/`[Cyw43]`/`[Perf]` CDC lines.
 pub static FWD_L2W: AtomicU32 = AtomicU32::new(0); // diverted LAN→WAN (enqueued)
 pub static FWD_W2L: AtomicU32 = AtomicU32::new(0); // diverted WAN→LAN (enqueued)
 pub static FWD_SENT: AtomicU32 = AtomicU32::new(0); // egressed (TX'd out the other phy)
-pub static FWD_DROP: AtomicU32 = AtomicU32::new(0); // dropped (queue full / no next-hop / TTL / TX busy)
+pub static FWD_DROP: AtomicU32 = AtomicU32::new(0); // total dropped (sum of the breakdown below)
+
+// --- Instrumentation (perf characterization) ---
+// Egressed bytes per direction (L2 frame length), for throughput. `up` = the
+// client-side LAN→WAN flow (egress on the WAN device), `dn` = WAN→LAN (egress on
+// the LAN device). u32 wraps ~every 4000 s at 1 MB/s → read as 1 Hz deltas.
+pub static FWD_BYTES_TO_WAN: AtomicU32 = AtomicU32::new(0);
+pub static FWD_BYTES_TO_LAN: AtomicU32 = AtomicU32::new(0);
+// `FWD_DROP` split by cause, so load tests show *why* frames drop.
+pub static FWD_DROP_QFULL: AtomicU32 = AtomicU32::new(0); // egress channel full (backpressure)
+pub static FWD_DROP_NONH: AtomicU32 = AtomicU32::new(0); // next-hop unresolved (no gw / no MAC)
+pub static FWD_DROP_NAT: AtomicU32 = AtomicU32::new(0); // NAPT port/id exhaustion
+pub static FWD_DROP_TXBUSY: AtomicU32 = AtomicU32::new(0); // inner phy TX not ready
+pub static FWD_DROP_OTHER: AtomicU32 = AtomicU32::new(0); // malformed / runt / TTL-expired
+// Max egress-queue depth seen per direction (vs `CHAN_DEPTH`) — a saturation signal.
+pub static FWD_QHWM_L2W: AtomicU32 = AtomicU32::new(0);
+pub static FWD_QHWM_W2L: AtomicU32 = AtomicU32::new(0);
+
+/// Record a dropped forwarded frame: bump the aggregate `FWD_DROP` and the
+/// specific reason in one place, so the two can't drift.
+fn count_drop(reason: &AtomicU32) {
+    FWD_DROP.fetch_add(1, Ordering::Relaxed);
+    reason.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Which interface a [`ForwardingDevice`] / neighbor table belongs to.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -484,7 +507,7 @@ impl<D: Device> ForwardingDevice<D> {
                 match wan_id {
                     Some(id) => napt_rewrite_src(&mut frame[..], &l4, self.cfg.our_ip, id),
                     None => {
-                        FWD_DROP.fetch_add(1, Ordering::Relaxed); // port/id exhaustion
+                        count_drop(&FWD_DROP_NAT); // port/id exhaustion
                         return;
                     }
                 }
@@ -495,12 +518,12 @@ impl<D: Device> ForwardingDevice<D> {
         // L3: TTL + checksum + capture dst (drop non-IPv4 / runt / TTL-expired).
         let dst = {
             let Ok(mut ip) = Ipv4Packet::new_checked(&mut frame[14..]) else {
-                FWD_DROP.fetch_add(1, Ordering::Relaxed);
+                count_drop(&FWD_DROP_OTHER); // malformed / runt
                 return;
             };
             let ttl = ip.hop_limit();
             if ttl <= 1 {
-                FWD_DROP.fetch_add(1, Ordering::Relaxed);
+                count_drop(&FWD_DROP_OTHER); // TTL expired
                 return;
             }
             ip.set_hop_limit(ttl - 1);
@@ -508,12 +531,12 @@ impl<D: Device> ForwardingDevice<D> {
             ip.dst_addr()
         };
         let Some(nh) = nexthop(dst, self.cfg.subnet, self.cfg.gateway) else {
-            FWD_DROP.fetch_add(1, Ordering::Relaxed);
+            count_drop(&FWD_DROP_NONH); // no gateway for an off-subnet dst
             return;
         };
         let Some(dmac) = critical_section::with(|cs| neigh(self.cfg.iface).borrow_ref(cs).lookup(nh))
         else {
-            FWD_DROP.fetch_add(1, Ordering::Relaxed); // next-hop MAC not learned yet
+            count_drop(&FWD_DROP_NONH); // next-hop MAC not learned yet
             return;
         };
         // L2: dst = next-hop MAC, src = this interface's MAC. (EtherType unchanged.)
@@ -524,8 +547,14 @@ impl<D: Device> ForwardingDevice<D> {
         if let Some(tx) = self.inner.transmit(now) {
             tx.consume(len, |buf| buf.copy_from_slice(&frame[..len]));
             FWD_SENT.fetch_add(1, Ordering::Relaxed);
+            // Throughput accounting: attribute egressed bytes by direction
+            // (WAN device egresses LAN→WAN = `up`; LAN device egresses WAN→LAN = `dn`).
+            match self.cfg.iface {
+                Iface::Wan => FWD_BYTES_TO_WAN.fetch_add(len as u32, Ordering::Relaxed),
+                Iface::Lan => FWD_BYTES_TO_LAN.fetch_add(len as u32, Ordering::Relaxed),
+            };
         } else {
-            FWD_DROP.fetch_add(1, Ordering::Relaxed);
+            count_drop(&FWD_DROP_TXBUSY);
         }
     }
 
@@ -604,16 +633,24 @@ impl<D: Device> Device for ForwardingDevice<D> {
                 Class::Local => break frame,
                 Class::Transit => {
                     if self.egress.try_send(frame).is_ok() {
+                        // Queue depth after enqueue → high-water (saturation signal).
+                        let depth = self.egress.len() as u32;
                         match self.cfg.iface {
-                            Iface::Lan => FWD_L2W.fetch_add(1, Ordering::Relaxed),
-                            Iface::Wan => FWD_W2L.fetch_add(1, Ordering::Relaxed),
+                            Iface::Lan => {
+                                FWD_L2W.fetch_add(1, Ordering::Relaxed);
+                                FWD_QHWM_L2W.fetch_max(depth, Ordering::Relaxed);
+                            }
+                            Iface::Wan => {
+                                FWD_W2L.fetch_add(1, Ordering::Relaxed);
+                                FWD_QHWM_W2L.fetch_max(depth, Ordering::Relaxed);
+                            }
                         };
                     } else {
-                        FWD_DROP.fetch_add(1, Ordering::Relaxed); // egress queue full
+                        count_drop(&FWD_DROP_QFULL); // egress queue full
                     }
                 }
                 Class::Drop => {
-                    FWD_DROP.fetch_add(1, Ordering::Relaxed);
+                    count_drop(&FWD_DROP_OTHER);
                 }
             }
         };

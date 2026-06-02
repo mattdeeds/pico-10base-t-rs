@@ -869,6 +869,11 @@ async fn usb_task(
     mut reset_iface: crate::pico_reset::PicoResetInterface,
 ) -> ! {
     let mut n: u32 = 0;
+    // [Perf] rate state: previous cumulative counters (for per-second deltas) +
+    // the conntrack live high-water. Router build only.
+    #[cfg(feature = "router")]
+    let (mut prev_to_wan, mut prev_to_lan, mut prev_sent, mut ct_hwm) =
+        (0u32, 0u32, 0u32, 0usize);
     loop {
         usb_dev.poll(&mut [&mut serial, &mut reset_iface]);
         // Honor a picotool -f reboot request from clean (non-IRQ) context.
@@ -942,6 +947,42 @@ async fn usb_task(
                     crate::conntrack::NAT_DROP.load(Ordering::Relaxed),
                 );
                 cdc_write_all(&mut usb_dev, &mut serial, &mut reset_iface, nline.as_bytes());
+
+                // [Perf] — per-second routed throughput + saturation/drop diagnostics.
+                // up = LAN→WAN (client upload), dn = WAN→LAN (download); rates are the
+                // 1 Hz delta of the cumulative byte/frame counters.
+                let to_wan = crate::forward::FWD_BYTES_TO_WAN.load(Ordering::Relaxed);
+                let to_lan = crate::forward::FWD_BYTES_TO_LAN.load(Ordering::Relaxed);
+                let sent = crate::forward::FWD_SENT.load(Ordering::Relaxed);
+                let up_kbs = to_wan.wrapping_sub(prev_to_wan) / 1024;
+                let dn_kbs = to_lan.wrapping_sub(prev_to_lan) / 1024;
+                let pps = sent.wrapping_sub(prev_sent);
+                prev_to_wan = to_wan;
+                prev_to_lan = to_lan;
+                prev_sent = sent;
+                let ct = crate::conntrack::live_count();
+                if ct > ct_hwm {
+                    ct_hwm = ct;
+                }
+                let mut pline: String<192> = String::new();
+                let _ = write!(
+                    pline,
+                    "[Perf] up={}KB/s dn={}KB/s pps={} qmax={}/{} cthwm={}/{} \
+                     drop[qf={} nh={} nat={} txb={} oth={}]\r\n",
+                    up_kbs,
+                    dn_kbs,
+                    pps,
+                    crate::forward::FWD_QHWM_L2W.load(Ordering::Relaxed),
+                    crate::forward::FWD_QHWM_W2L.load(Ordering::Relaxed),
+                    ct_hwm,
+                    crate::conntrack::CT_CAP,
+                    crate::forward::FWD_DROP_QFULL.load(Ordering::Relaxed),
+                    crate::forward::FWD_DROP_NONH.load(Ordering::Relaxed),
+                    crate::forward::FWD_DROP_NAT.load(Ordering::Relaxed),
+                    crate::forward::FWD_DROP_TXBUSY.load(Ordering::Relaxed),
+                    crate::forward::FWD_DROP_OTHER.load(Ordering::Relaxed),
+                );
+                cdc_write_all(&mut usb_dev, &mut serial, &mut reset_iface, pline.as_bytes());
             }
         }
         Timer::after(Duration::from_millis(1)).await;
@@ -1007,9 +1048,9 @@ async fn net_task(net: cyw43::NetDriver<'static>, mac: [u8; 6]) -> ! {
     let mut dhcp = DhcpServer::new();
 
     // R14.5/R18 — a tiny mgmt HTTP server on the LAN gateway IP (192.168.4.1:80).
-    // TX sized to hold the whole status page (clients + WAN + NAT) in one send.
+    // TX sized to hold the whole status page (clients + WAN + NAT + perf) in one send.
     let mut http_rx = [0u8; 1024];
-    let mut http_tx = [0u8; 2048];
+    let mut http_tx = [0u8; 2560];
     let http_socket = tcp::Socket::new(
         tcp::SocketBuffer::new(&mut http_rx[..]),
         tcp::SocketBuffer::new(&mut http_tx[..]),
@@ -1053,11 +1094,11 @@ fn serve_status_http(socket: &mut tcp::Socket, dhcp: &DhcpServer) {
                 .load(Ordering::Relaxed)
                 .to_be_bytes(),
         );
-        // Body = header block + one line per possible lease + the WAN/NAT block,
-        // sized from POOL_LEN (~40 B/lease) so it can't silently undersize if the
-        // pool grows. head + body stays under the 2 KB TX buffer; `write!`
+        // Body = header block + one line per possible lease + the WAN/NAT/Perf
+        // block, sized from POOL_LEN (~40 B/lease) so it can't silently undersize
+        // if the pool grows. head + body stays under the TX buffer; `write!`
         // truncation is a graceful backstop.
-        const STATUS_BODY_CAP: usize = 256 + crate::dhcp_server::POOL_LEN * 40 + 320;
+        const STATUS_BODY_CAP: usize = 256 + crate::dhcp_server::POOL_LEN * 40 + 512;
         let mut body: String<STATUS_BODY_CAP> = String::new();
         let _ = write!(
             body,
@@ -1097,7 +1138,9 @@ fn serve_status_http(socket: &mut tcp::Socket, dhcp: &DhcpServer) {
             let _ = write!(
                 body,
                 "\r\nNAT:         ct={}/{} out={} in={} drop={}\r\n\
-                 Forward:     sent={} drop={}\r\n",
+                 Forward:     sent={} drop={} (qf={} nh={} nat={} txb={} oth={})\r\n\
+                 Bytes:       up={} dn={}\r\n\
+                 Queue hwm:   l2w={} w2l={} (cap {})\r\n",
                 crate::conntrack::live_count(),
                 crate::conntrack::CT_CAP,
                 crate::conntrack::NAT_OUT.load(Ordering::Relaxed),
@@ -1105,6 +1148,16 @@ fn serve_status_http(socket: &mut tcp::Socket, dhcp: &DhcpServer) {
                 crate::conntrack::NAT_DROP.load(Ordering::Relaxed),
                 crate::forward::FWD_SENT.load(Ordering::Relaxed),
                 crate::forward::FWD_DROP.load(Ordering::Relaxed),
+                crate::forward::FWD_DROP_QFULL.load(Ordering::Relaxed),
+                crate::forward::FWD_DROP_NONH.load(Ordering::Relaxed),
+                crate::forward::FWD_DROP_NAT.load(Ordering::Relaxed),
+                crate::forward::FWD_DROP_TXBUSY.load(Ordering::Relaxed),
+                crate::forward::FWD_DROP_OTHER.load(Ordering::Relaxed),
+                crate::forward::FWD_BYTES_TO_WAN.load(Ordering::Relaxed),
+                crate::forward::FWD_BYTES_TO_LAN.load(Ordering::Relaxed),
+                crate::forward::FWD_QHWM_L2W.load(Ordering::Relaxed),
+                crate::forward::FWD_QHWM_W2L.load(Ordering::Relaxed),
+                crate::forward::CHAN_DEPTH,
             );
         }
 
