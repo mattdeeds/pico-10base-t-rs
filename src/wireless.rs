@@ -927,6 +927,21 @@ async fn usb_task(
                     crate::forward::FWD_DROP.load(Ordering::Relaxed),
                 );
                 cdc_write_all(&mut usb_dev, &mut serial, &mut reset_iface, fline.as_bytes());
+
+                // R17 NAPT conntrack counters.
+                let mut nline: String<96> = String::new();
+                let _ = write!(
+                    nline,
+                    "[Nat] ct={}/{} out={} in={} new={} evict={} drop={}\r\n",
+                    crate::conntrack::live_count(),
+                    crate::conntrack::CT_CAP,
+                    crate::conntrack::NAT_OUT.load(Ordering::Relaxed),
+                    crate::conntrack::NAT_IN.load(Ordering::Relaxed),
+                    crate::conntrack::NAT_NEW.load(Ordering::Relaxed),
+                    crate::conntrack::NAT_EVICT.load(Ordering::Relaxed),
+                    crate::conntrack::NAT_DROP.load(Ordering::Relaxed),
+                );
+                cdc_write_all(&mut usb_dev, &mut serial, &mut reset_iface, nline.as_bytes());
             }
         }
         Timer::after(Duration::from_millis(1)).await;
@@ -1196,7 +1211,7 @@ async fn wan_task(mut mac: crate::eth_mac::EthMac) -> ! {
     // are diverted to the LAN via WAN_TO_LAN. `accept_dst` restricts forwarding to
     // the LAN subnet; `our_ip`/`subnet`/`gateway` are UNSPECIFIED until the DHCP
     // lease lands (forwarding stays disabled until then — see set_lease below).
-    let mut device = crate::forward::ForwardingDevice::new(
+    let mut device = crate::forward::ForwardingDevice::new_napt(
         mac,
         crate::forward::IfaceCfg {
             iface: crate::forward::Iface::Wan,
@@ -1259,6 +1274,8 @@ async fn wan_task(mut mac: crate::eth_mac::EthMac) -> ! {
                 crate::wan::ping_send(&mut sockets, icmp_handle, &mut wan, &dev_checksum);
                 crate::wan::dns_start(&mut iface, &mut sockets, dns_handle, &mut wan);
             }
+            // R17: sweep idle NAPT conntrack entries once a second.
+            crate::forward::nat_reap(now().total_millis().max(0) as u64);
         }
         // R16: re-emit frames the LAN side forwarded toward the WAN out the 10BT
         // phy (next-hop = the WAN gateway for off-subnet dsts, MAC from the WAN

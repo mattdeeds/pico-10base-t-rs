@@ -27,6 +27,8 @@ use smoltcp::phy::{Device, DeviceCapabilities, RxToken, TxToken};
 use smoltcp::time::Instant;
 use smoltcp::wire::{Ipv4Address, Ipv4Cidr, Ipv4Packet};
 
+use crate::conntrack; // R17 — NAPT connection tracking
+
 /// Max bytes of a forwarded L2 frame (matches `eth_mac::MAX_FRAME_BYTES`).
 pub const FRAME_CAP: usize = 1600;
 /// Per-direction forward-queue depth.
@@ -231,6 +233,140 @@ fn nexthop(dst: Ipv4Address, subnet: Ipv4Cidr, gateway: Option<Ipv4Address>) -> 
 }
 
 // =====================================================================
+// R17 — NAPT: the single conntrack table + L4 parse / src-dst rewrite
+// =====================================================================
+
+/// The one NAPT conntrack table, owned by the WAN `ForwardingDevice`. Touched only
+/// from `wan_task` (core 0); the `critical_section` matches the neighbor-table
+/// pattern and guards against the TIMER0 IRQ. The LAN device never touches it, so
+/// it carries no per-device cost (vs. an `Option<Conntrack>` field).
+static WAN_CT: Mutex<RefCell<conntrack::Conntrack>> =
+    Mutex::new(RefCell::new(conntrack::Conntrack::new()));
+
+/// Periodic idle-entry sweep + the live count, for `wan_task` / the `[Nat]` line.
+pub fn nat_reap(now_ms: u64) {
+    critical_section::with(|cs| WAN_CT.borrow_ref_mut(cs).reap(now_ms));
+}
+
+const IPPROTO_ICMP: u8 = 1;
+const IPPROTO_TCP: u8 = 6;
+const IPPROTO_UDP: u8 = 17;
+
+/// Where a frame's L4 ports/id + checksum live (offsets honor the IHL), plus the
+/// proto + TCP flags. `src_id`/`dst_id` are TCP/UDP ports, or the ICMP echo id.
+struct L4 {
+    proto: conntrack::Proto,
+    l4_off: usize,
+    src_id: u16,
+    dst_id: u16,
+    csum_off: usize,
+    tcp_flags: u8,
+}
+
+fn parse_l4(frame: &[u8]) -> Option<L4> {
+    if frame.len() < 14 + 20 || u16::from_be_bytes([frame[12], frame[13]]) != ETHERTYPE_IPV4 {
+        return None;
+    }
+    let ihl = (frame[14] & 0x0f) as usize * 4;
+    if ihl < 20 {
+        return None;
+    }
+    let l4 = 14 + ihl;
+    match frame[14 + 9] {
+        IPPROTO_TCP if frame.len() >= l4 + 20 => Some(L4 {
+            proto: conntrack::Proto::Tcp,
+            l4_off: l4,
+            src_id: u16::from_be_bytes([frame[l4], frame[l4 + 1]]),
+            dst_id: u16::from_be_bytes([frame[l4 + 2], frame[l4 + 3]]),
+            csum_off: l4 + 16,
+            tcp_flags: frame[l4 + 13],
+        }),
+        IPPROTO_UDP if frame.len() >= l4 + 8 => Some(L4 {
+            proto: conntrack::Proto::Udp,
+            l4_off: l4,
+            src_id: u16::from_be_bytes([frame[l4], frame[l4 + 1]]),
+            dst_id: u16::from_be_bytes([frame[l4 + 2], frame[l4 + 3]]),
+            csum_off: l4 + 6,
+            tcp_flags: 0,
+        }),
+        // ICMP echo reply (0) / request (8): the identifier is the "port".
+        IPPROTO_ICMP if frame.len() >= l4 + 8 && (frame[l4] == 0 || frame[l4] == 8) => Some(L4 {
+            proto: conntrack::Proto::IcmpEcho,
+            l4_off: l4,
+            src_id: u16::from_be_bytes([frame[l4 + 4], frame[l4 + 5]]),
+            dst_id: 0,
+            csum_off: l4 + 2,
+            tcp_flags: 0,
+        }),
+        _ => None,
+    }
+}
+
+fn rd16(b: &[u8], i: usize) -> u16 {
+    u16::from_be_bytes([b[i], b[i + 1]])
+}
+fn wr16(b: &mut [u8], i: usize, v: u16) {
+    b[i..i + 2].copy_from_slice(&v.to_be_bytes());
+}
+
+/// NAPT the **source**: IP src → `new_ip`, L4 src port / ICMP id → `new_id`. Fixes
+/// the L4 checksum incrementally; the IPv4 header checksum is recomputed by
+/// `egress()` after TTL--, so it's left untouched here.
+fn napt_rewrite_src(frame: &mut [u8], l4: &L4, new_ip: Ipv4Address, new_id: u16) {
+    let old_ip = Ipv4Address::new(frame[26], frame[27], frame[28], frame[29]);
+    match l4.proto {
+        conntrack::Proto::Tcp | conntrack::Proto::Udp => {
+            let old_port = rd16(frame, l4.l4_off);
+            let old_csum = rd16(frame, l4.csum_off);
+            // UDP checksum 0 == "none" → leave it disabled.
+            if !(l4.proto == conntrack::Proto::Udp && old_csum == 0) {
+                let (oh, ol) = conntrack::addr_words(old_ip);
+                let (nh, nl) = conntrack::addr_words(new_ip);
+                let c =
+                    conntrack::checksum_incr(old_csum, &[(oh, nh), (ol, nl), (old_port, new_id)]);
+                wr16(frame, l4.csum_off, c);
+            }
+            wr16(frame, l4.l4_off, new_id); // src port
+        }
+        conntrack::Proto::IcmpEcho => {
+            let old_id = rd16(frame, l4.l4_off + 4);
+            let old_csum = rd16(frame, l4.csum_off);
+            let c = conntrack::checksum_incr(old_csum, &[(old_id, new_id)]);
+            wr16(frame, l4.csum_off, c);
+            wr16(frame, l4.l4_off + 4, new_id); // echo id
+        }
+    }
+    frame[26..30].copy_from_slice(&new_ip.octets()); // IP src (read above, write last)
+}
+
+/// NAPT the **destination**: IP dst → `new_ip`, L4 dst port / ICMP id → `new_id`.
+fn napt_rewrite_dst(frame: &mut [u8], l4: &L4, new_ip: Ipv4Address, new_id: u16) {
+    let old_ip = Ipv4Address::new(frame[30], frame[31], frame[32], frame[33]);
+    match l4.proto {
+        conntrack::Proto::Tcp | conntrack::Proto::Udp => {
+            let old_port = rd16(frame, l4.l4_off + 2);
+            let old_csum = rd16(frame, l4.csum_off);
+            if !(l4.proto == conntrack::Proto::Udp && old_csum == 0) {
+                let (oh, ol) = conntrack::addr_words(old_ip);
+                let (nh, nl) = conntrack::addr_words(new_ip);
+                let c =
+                    conntrack::checksum_incr(old_csum, &[(oh, nh), (ol, nl), (old_port, new_id)]);
+                wr16(frame, l4.csum_off, c);
+            }
+            wr16(frame, l4.l4_off + 2, new_id); // dst port
+        }
+        conntrack::Proto::IcmpEcho => {
+            let old_id = rd16(frame, l4.l4_off + 4);
+            let old_csum = rd16(frame, l4.csum_off);
+            let c = conntrack::checksum_incr(old_csum, &[(old_id, new_id)]);
+            wr16(frame, l4.csum_off, c);
+            wr16(frame, l4.l4_off + 4, new_id);
+        }
+    }
+    frame[30..34].copy_from_slice(&new_ip.octets()); // IP dst
+}
+
+// =====================================================================
 // ForwardingDevice<D> — the classifying phy::Device wrapper
 // =====================================================================
 
@@ -243,11 +379,21 @@ pub struct ForwardingDevice<D: Device> {
     cfg: IfaceCfg,
     /// The channel transit frames from *this* interface are pushed onto.
     egress: &'static FwdChannel,
+    /// R17: this is the WAN device → do NAPT (via the `WAN_CT` static) on the
+    /// transit path. The LAN device leaves this `false` and just forwards.
+    nat: bool,
 }
 
 impl<D: Device> ForwardingDevice<D> {
+    /// Plain L3-forwarding device (LAN side): no NAT.
     pub fn new(inner: D, cfg: IfaceCfg, egress: &'static FwdChannel) -> Self {
-        Self { inner, cfg, egress }
+        Self { inner, cfg, egress, nat: false }
+    }
+
+    /// NAPT device (WAN side): rewrites src on egress + does conntrack-aware
+    /// ingress classification. Shares the single `WAN_CT` table.
+    pub fn new_napt(inner: D, cfg: IfaceCfg, egress: &'static FwdChannel) -> Self {
+        Self { inner, cfg, egress, nat: true }
     }
 
     /// Sync this interface's address / subnet / gateway from a DHCP lease (the
@@ -269,6 +415,38 @@ impl<D: Device> ForwardingDevice<D> {
     /// checksum, resolve the next-hop MAC, rewrite the L2 header, and TX via the
     /// inner phy's normal token (EthMac → FCS/IFG/CSMA; cyw43 → NetDriver).
     pub fn egress(&mut self, frame: &mut Frame, now: Instant) {
+        // R17: NAPT the source on the way out the WAN (LAN→WAN). Rewrite IP src →
+        // our WAN IP + L4 src port/id → an allocated WAN id, tracked in conntrack so
+        // the reply can be matched back. The IP-header checksum fixup is handled by
+        // the `fill_checksum()` below (after TTL--); we only fix the L4 checksum.
+        if self.nat {
+            if let Some(l4) = parse_l4(&frame[..]) {
+                let src_ip = Ipv4Address::new(frame[26], frame[27], frame[28], frame[29]);
+                let dst_ip = Ipv4Address::new(frame[30], frame[31], frame[32], frame[33]);
+                // ICMP echo has no dst "port"; key the flow on its id alone.
+                let dst_id = if l4.proto == conntrack::Proto::IcmpEcho { 0 } else { l4.dst_id };
+                let tuple = conntrack::Tuple {
+                    proto: l4.proto,
+                    src_ip,
+                    src_id: l4.src_id,
+                    dst_ip,
+                    dst_id,
+                };
+                let now_ms = now.total_millis().max(0) as u64;
+                let wan_id = critical_section::with(|cs| {
+                    WAN_CT.borrow_ref_mut(cs).outbound(&tuple, l4.tcp_flags, now_ms)
+                });
+                match wan_id {
+                    Some(id) => napt_rewrite_src(&mut frame[..], &l4, self.cfg.our_ip, id),
+                    None => {
+                        FWD_DROP.fetch_add(1, Ordering::Relaxed); // port/id exhaustion
+                        return;
+                    }
+                }
+            }
+            // non-IPv4 / non-TCP-UDP-ICMP transit forwards unmodified (rare).
+        }
+
         // L3: TTL + checksum + capture dst (drop non-IPv4 / runt / TTL-expired).
         let dst = {
             let Ok(mut ip) = Ipv4Packet::new_checked(&mut frame[14..]) else {
@@ -305,6 +483,48 @@ impl<D: Device> ForwardingDevice<D> {
             FWD_DROP.fetch_add(1, Ordering::Relaxed);
         }
     }
+
+    /// Classify an ingress frame. On the WAN (NAPT) device, a reply addressed to
+    /// our WAN IP that matches a tracked flow is a NAT-return: rewrite the dst back
+    /// to the LAN client (in place) and forward it (`Transit`). Everything else
+    /// falls through to the plain R16 classifier — so a conntrack *miss* on a frame
+    /// to our WAN IP stays `Local` (the Pico's own ping/DNS), untouched.
+    fn classify_frame(&self, frame: &mut Frame, ts: Instant) -> Class {
+        if self.nat {
+            let cfg = self.cfg;
+            if !cfg.our_ip.is_unspecified()
+                && frame.len() >= 14 + 20
+                && frame[0..6] == cfg.our_mac
+                && ipv4_dst(&frame[..]) == Some(cfg.our_ip)
+            {
+                if let Some(l4) = parse_l4(&frame[..]) {
+                    let remote_ip = Ipv4Address::new(frame[26], frame[27], frame[28], frame[29]);
+                    // Inbound key: the WAN peer is the *source*; our allocated id is
+                    // the *dst* port (TCP/UDP) or the echo id (ICMP).
+                    let (remote_id, wan_id) = match l4.proto {
+                        conntrack::Proto::IcmpEcho => (0, l4.src_id),
+                        _ => (l4.src_id, l4.dst_id),
+                    };
+                    let now_ms = ts.total_millis().max(0) as u64;
+                    let m = critical_section::with(|cs| {
+                        WAN_CT.borrow_ref_mut(cs).inbound(
+                            l4.proto,
+                            remote_ip,
+                            remote_id,
+                            wan_id,
+                            l4.tcp_flags,
+                            now_ms,
+                        )
+                    });
+                    if let Some((lan_ip, lan_id)) = m {
+                        napt_rewrite_dst(&mut frame[..], &l4, lan_ip, lan_id);
+                        return Class::Transit;
+                    }
+                }
+            }
+        }
+        classify(&self.cfg, &frame[..])
+    }
 }
 
 impl<D: Device> Device for ForwardingDevice<D> {
@@ -324,14 +544,18 @@ impl<D: Device> Device for ForwardingDevice<D> {
         // must NOT return it from the loop, or its `&mut self.inner` borrow would
         // collide with the next iteration's `receive` (no Polonius on stable).
         let frame = loop {
-            let (rx, _tx) = self.inner.receive(ts)?;
             let mut frame: Frame = Vec::new();
-            rx.consume(|buf| {
-                let n = buf.len().min(FRAME_CAP);
-                let _ = frame.extend_from_slice(&buf[..n]);
-            });
+            {
+                // Scope the RX/TX tokens so the inner-device borrow ends before
+                // classify_frame borrows `&self` (the skim phase never replies).
+                let (rx, _tx) = self.inner.receive(ts)?;
+                rx.consume(|buf| {
+                    let n = buf.len().min(FRAME_CAP);
+                    let _ = frame.extend_from_slice(&buf[..n]);
+                });
+            }
             learn(&self.cfg, &frame);
-            match classify(&self.cfg, &frame) {
+            match self.classify_frame(&mut frame, ts) {
                 Class::Local => break frame,
                 Class::Transit => {
                     if self.egress.try_send(frame).is_ok() {

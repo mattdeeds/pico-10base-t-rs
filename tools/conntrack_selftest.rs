@@ -267,9 +267,227 @@ fn test_eviction() {
     assert_eq!(fails, 0);
 }
 
+// ===================== NAPT rewrite: offsets + pseudo-header =====================
+// Mirrors forward.rs parse_l4 / napt_rewrite_src / napt_rewrite_dst (using the
+// already-verified checksum_incr) and proves the wire offsets + pseudo-header
+// coverage by recomputing the FULL L4 checksum from scratch after each rewrite.
+const ETH: usize = 14;
+
+fn fold(acc0: u16, data: &[u8]) -> u16 {
+    let mut acc = acc0;
+    let mut i = 0;
+    while i + 1 < data.len() {
+        acc = add1c(acc, u16::from_be_bytes([data[i], data[i + 1]]));
+        i += 2;
+    }
+    if i < data.len() {
+        acc = add1c(acc, u16::from_be_bytes([data[i], 0]));
+    }
+    acc
+}
+
+/// (l4_off, l4_len, proto, csum_off)
+fn l4_bounds(frame: &[u8]) -> (usize, usize, u8, usize) {
+    let ihl = (frame[ETH] & 0x0f) as usize * 4;
+    let l4 = ETH + ihl;
+    let proto = frame[ETH + 9];
+    let ip_total = u16::from_be_bytes([frame[ETH + 2], frame[ETH + 3]]) as usize;
+    let l4_len = ip_total - ihl;
+    let cko = match proto {
+        6 => l4 + 16,
+        17 => l4 + 6,
+        1 => l4 + 2,
+        _ => l4,
+    };
+    (l4, l4_len, proto, cko)
+}
+
+fn pseudo_acc(frame: &[u8], l4_len: usize, proto: u8) -> u16 {
+    let mut acc = 0u16;
+    for off in [ETH + 12, ETH + 14, ETH + 16, ETH + 18] {
+        acc = add1c(acc, u16::from_be_bytes([frame[off], frame[off + 1]]));
+    }
+    acc = add1c(acc, proto as u16);
+    add1c(acc, l4_len as u16)
+}
+
+/// A valid internet checksum makes the sum over (pseudo-header + segment,
+/// INCLUDING the checksum field) fold to 0xffff.
+fn l4_valid(frame: &[u8]) -> bool {
+    let (l4, l4_len, proto, _) = l4_bounds(frame);
+    let seg = &frame[l4..l4 + l4_len];
+    let acc = if proto == 1 {
+        fold(0, seg) // ICMP: no pseudo-header
+    } else {
+        fold(pseudo_acc(frame, l4_len, proto), seg)
+    };
+    acc == 0xffff
+}
+
+fn set_l4_checksum(frame: &mut [u8]) {
+    let (l4, l4_len, proto, cko) = l4_bounds(frame);
+    frame[cko] = 0;
+    frame[cko + 1] = 0;
+    let acc = if proto == 1 {
+        fold(0, &frame[l4..l4 + l4_len])
+    } else {
+        fold(pseudo_acc(frame, l4_len, proto), &frame[l4..l4 + l4_len])
+    };
+    let ck = !acc;
+    frame[cko..cko + 2].copy_from_slice(&ck.to_be_bytes());
+}
+
+fn rewrite_src(frame: &mut [u8], new_ip: [u8; 4], new_id: u16) {
+    let (l4, _, proto, cko) = l4_bounds(frame);
+    let old_csum = u16::from_be_bytes([frame[cko], frame[cko + 1]]);
+    if proto == 1 {
+        let old_id = u16::from_be_bytes([frame[l4 + 4], frame[l4 + 5]]);
+        let c = checksum_incr(old_csum, &[(old_id, new_id)]);
+        frame[cko..cko + 2].copy_from_slice(&c.to_be_bytes());
+        frame[l4 + 4..l4 + 6].copy_from_slice(&new_id.to_be_bytes());
+    } else {
+        let old_hi = u16::from_be_bytes([frame[ETH + 12], frame[ETH + 13]]);
+        let old_lo = u16::from_be_bytes([frame[ETH + 14], frame[ETH + 15]]);
+        let new_hi = u16::from_be_bytes([new_ip[0], new_ip[1]]);
+        let new_lo = u16::from_be_bytes([new_ip[2], new_ip[3]]);
+        let old_port = u16::from_be_bytes([frame[l4], frame[l4 + 1]]);
+        if !(proto == 17 && old_csum == 0) {
+            let c =
+                checksum_incr(old_csum, &[(old_hi, new_hi), (old_lo, new_lo), (old_port, new_id)]);
+            frame[cko..cko + 2].copy_from_slice(&c.to_be_bytes());
+        }
+        frame[l4..l4 + 2].copy_from_slice(&new_id.to_be_bytes());
+    }
+    frame[ETH + 12..ETH + 16].copy_from_slice(&new_ip);
+}
+
+fn rewrite_dst(frame: &mut [u8], new_ip: [u8; 4], new_id: u16) {
+    let (l4, _, proto, cko) = l4_bounds(frame);
+    let old_csum = u16::from_be_bytes([frame[cko], frame[cko + 1]]);
+    if proto == 1 {
+        let old_id = u16::from_be_bytes([frame[l4 + 4], frame[l4 + 5]]);
+        let c = checksum_incr(old_csum, &[(old_id, new_id)]);
+        frame[cko..cko + 2].copy_from_slice(&c.to_be_bytes());
+        frame[l4 + 4..l4 + 6].copy_from_slice(&new_id.to_be_bytes());
+    } else {
+        let old_hi = u16::from_be_bytes([frame[ETH + 16], frame[ETH + 17]]);
+        let old_lo = u16::from_be_bytes([frame[ETH + 18], frame[ETH + 19]]);
+        let new_hi = u16::from_be_bytes([new_ip[0], new_ip[1]]);
+        let new_lo = u16::from_be_bytes([new_ip[2], new_ip[3]]);
+        let old_port = u16::from_be_bytes([frame[l4 + 2], frame[l4 + 3]]);
+        if !(proto == 17 && old_csum == 0) {
+            let c =
+                checksum_incr(old_csum, &[(old_hi, new_hi), (old_lo, new_lo), (old_port, new_id)]);
+            frame[cko..cko + 2].copy_from_slice(&c.to_be_bytes());
+        }
+        frame[l4 + 2..l4 + 4].copy_from_slice(&new_id.to_be_bytes());
+    }
+    frame[ETH + 16..ETH + 20].copy_from_slice(&new_ip);
+}
+
+fn build(proto: u8, payload: usize) -> Vec<u8> {
+    let ihl = 20usize;
+    let l4hdr = match proto {
+        6 => 20,
+        17 => 8,
+        1 => 8,
+        _ => 0,
+    };
+    let ip_total = ihl + l4hdr + payload;
+    let mut f = vec![0u8; ETH + ip_total];
+    f[12] = 0x08;
+    f[13] = 0x00; // ethertype IPv4
+    f[ETH] = 0x45; // version 4, IHL 5
+    f[ETH + 2..ETH + 4].copy_from_slice(&(ip_total as u16).to_be_bytes());
+    f[ETH + 8] = 64; // TTL
+    f[ETH + 9] = proto;
+    f[ETH + 12..ETH + 16].copy_from_slice(&[192, 168, 4, 10]); // src
+    f[ETH + 16..ETH + 20].copy_from_slice(&[8, 8, 8, 8]); // dst
+    let l4 = ETH + ihl;
+    match proto {
+        6 => {
+            f[l4..l4 + 2].copy_from_slice(&51000u16.to_be_bytes());
+            f[l4 + 2..l4 + 4].copy_from_slice(&443u16.to_be_bytes());
+            f[l4 + 12] = 0x50; // data offset 5
+            f[l4 + 13] = 0x18; // PSH+ACK
+        }
+        17 => {
+            f[l4..l4 + 2].copy_from_slice(&51000u16.to_be_bytes());
+            f[l4 + 2..l4 + 4].copy_from_slice(&53u16.to_be_bytes());
+            f[l4 + 4..l4 + 6].copy_from_slice(&((l4hdr + payload) as u16).to_be_bytes());
+        }
+        1 => {
+            f[l4] = 8; // echo request
+            f[l4 + 4..l4 + 6].copy_from_slice(&0x1234u16.to_be_bytes()); // id
+            f[l4 + 6..l4 + 8].copy_from_slice(&1u16.to_be_bytes()); // seq
+        }
+        _ => {}
+    }
+    for i in 0..payload {
+        f[ETH + ihl + l4hdr + i] = (i as u8).wrapping_mul(7).wrapping_add(1);
+    }
+    f
+}
+
+fn test_rewrite() {
+    let mut fails = 0u32;
+    for &(proto, name) in &[(6u8, "TCP"), (17u8, "UDP"), (1u8, "ICMP")] {
+        // Outbound: src 192.168.4.10:51000 → 192.168.37.129:50000 (NAPT).
+        let mut f = build(proto, 6);
+        set_l4_checksum(&mut f);
+        if !l4_valid(&f) {
+            println!("  {} initial checksum INVALID", name);
+            fails += 1;
+        }
+        rewrite_src(&mut f, [192, 168, 37, 129], 50000);
+        if !l4_valid(&f) {
+            println!("  {} post src-rewrite checksum INVALID", name);
+            fails += 1;
+        }
+        if f[ETH + 12..ETH + 16] != [192u8, 168, 37, 129] {
+            println!("  {} IP src not rewritten", name);
+            fails += 1;
+        }
+
+        // Inbound reply: src 8.8.8.8 → dst 192.168.37.129:50000, rewritten back to
+        // the LAN client 192.168.4.10:51000.
+        let mut r = build(proto, 6);
+        r[ETH + 12..ETH + 16].copy_from_slice(&[8, 8, 8, 8]);
+        r[ETH + 16..ETH + 20].copy_from_slice(&[192, 168, 37, 129]);
+        let l4 = ETH + 20;
+        match proto {
+            6 | 17 => {
+                r[l4..l4 + 2].copy_from_slice(&443u16.to_be_bytes()); // remote src port
+                r[l4 + 2..l4 + 4].copy_from_slice(&50000u16.to_be_bytes()); // our wan port
+            }
+            1 => {
+                r[l4] = 0; // echo reply
+                r[l4 + 4..l4 + 6].copy_from_slice(&50000u16.to_be_bytes()); // id = wan id
+            }
+            _ => {}
+        }
+        set_l4_checksum(&mut r);
+        rewrite_dst(&mut r, [192, 168, 4, 10], 51000);
+        if !l4_valid(&r) {
+            println!("  {} post dst-rewrite checksum INVALID", name);
+            fails += 1;
+        }
+        if r[ETH + 16..ETH + 20] != [192u8, 168, 4, 10] {
+            println!("  {} IP dst not rewritten", name);
+            fails += 1;
+        }
+    }
+    println!(
+        "test_rewrite: {}",
+        if fails == 0 { "PASS (TCP/UDP/ICMP src+dst rewrite → checksum valid)" } else { "FAIL" }
+    );
+    assert_eq!(fails, 0);
+}
+
 fn main() {
     test_checksum();
     test_allocator();
     test_eviction();
+    test_rewrite();
     println!("\nALL CONNTRACK SELF-TESTS PASSED");
 }

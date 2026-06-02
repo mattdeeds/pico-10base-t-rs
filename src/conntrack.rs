@@ -16,8 +16,6 @@
 //! offline against full recompute (known IPv4 vector + 250k random rewrites +
 //! one's-complement carry edges) before landing — see `docs/r17-plan.md` §5.
 
-#![allow(dead_code)] // wired into forward.rs in the next R17 step; remove then.
-
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use smoltcp::wire::Ipv4Address;
