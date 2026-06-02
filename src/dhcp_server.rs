@@ -8,7 +8,8 @@
 //! It runs as a UDP socket on port 67 inside the wireless `net_task`'s
 //! `SocketSet`: each poll we drain the socket, answer DISCOVER with OFFER and
 //! REQUEST with ACK, handing out a fixed `192.168.4.0/24` pool with the Pico's
-//! LAN IP (`192.168.4.1`) as gateway + DNS. Replies are broadcast to
+//! LAN IP (`192.168.4.1`) as gateway and a DNS server (R18 — see
+//! [`LAN_DNS_OFFER`]). Replies are broadcast to
 //! `255.255.255.255:68` (the client has no IP/ARP entry yet). Leases are keyed
 //! by client MAC so a given client keeps its address across DISCOVER→REQUEST and
 //! reconnects; the table is fixed-size (no alloc).
@@ -17,8 +18,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use smoltcp::socket::udp;
 use smoltcp::wire::{
-    DhcpMessageType, DhcpPacket, DhcpRepr, IpAddress, IpEndpoint, Ipv4Address, DHCP_CLIENT_PORT,
-    DHCP_SERVER_PORT,
+    DhcpMessageType, DhcpOption, DhcpPacket, DhcpRepr, IpAddress, IpEndpoint, Ipv4Address,
+    DHCP_CLIENT_PORT, DHCP_SERVER_PORT,
 };
 
 /// The Pico's LAN address — gateway, DNS, and DHCP server identifier.
@@ -29,9 +30,21 @@ const POOL_BASE: u8 = 10;
 const POOL_LEN: usize = 32;
 /// Lease time handed to clients (1 hour).
 const LEASE_SECS: u32 = 3600;
+/// DHCP option code for "Domain Name Server" (RFC 2132 §3.8).
+const OPT_DNS_SERVER: u8 = 6;
 
 /// Count of DHCP replies (OFFER + ACK) emitted — surfaced in the `[Cyw43]` line.
 pub static DHCP_TX: AtomicU32 = AtomicU32::new(0);
+
+/// The DNS server advertised to LAN clients in every OFFER/ACK, stored as its
+/// four IPv4 octets packed big-endian (R18). Defaults to a public resolver
+/// (`8.8.8.8`) so name resolution works before the WAN lease lands; `wan_task`
+/// overwrites it with the upstream resolver learned from the WAN DHCP lease.
+///
+/// No DNS *relay* is needed: R17 NAPT already forwards LAN→WAN UDP, so a client's
+/// query to this address is NAT'd out the WAN and the reply NAT'd back like any
+/// other flow (router-plan §6.4 — "just NAT port 53 through").
+pub static LAN_DNS_OFFER: AtomicU32 = AtomicU32::new(u32::from_be_bytes([8, 8, 8, 8]));
 
 /// Fixed MAC→IP lease allocator. `leases[i] == Some(mac)` means
 /// `192.168.4.(POOL_BASE+i)` is held by `mac`.
@@ -44,6 +57,14 @@ impl DhcpServer {
         Self {
             leases: [None; POOL_LEN],
         }
+    }
+
+    /// Iterate the currently-held leases as `(ip, mac)` — for the R18 mgmt page.
+    pub fn active_leases(&self) -> impl Iterator<Item = (Ipv4Address, [u8; 6])> + '_ {
+        self.leases
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| slot.map(|mac| (ip_for(i), mac)))
     }
 
     /// Reuse this MAC's existing lease, else claim the first free slot.
@@ -95,6 +116,17 @@ impl DhcpServer {
 
         let your_ip = self.allocate(req.client_hardware_address.0)?;
 
+        // R18: advertise a DNS server (RFC 2132 option 6). We emit it as a raw
+        // option via `additional_options` rather than `DhcpRepr.dns_servers` —
+        // that typed field is a smoltcp-internal heapless-0.9 `Vec` we can't
+        // name from our heapless 0.8. `dns_octets`/`extra_opts` must outlive the
+        // `reply.emit` below (they do — both are locals).
+        let dns_octets = LAN_DNS_OFFER.load(Ordering::Relaxed).to_be_bytes();
+        let extra_opts = [DhcpOption {
+            kind: OPT_DNS_SERVER,
+            data: &dns_octets,
+        }];
+
         let reply = DhcpRepr {
             message_type: reply_type,
             transaction_id: req.transaction_id,
@@ -113,16 +145,14 @@ impl DhcpServer {
             client_identifier: None,
             server_identifier: Some(SERVER_IP),
             parameter_request_list: None,
-            // No DNS option for now — clients get IP + gateway, enough to reach
-            // the LAN gateway. A DNS-server option (and relay) is R18; building
-            // smoltcp's `dns_servers` Vec here also needs its heapless 0.9, not
-            // our 0.8.
+            // DNS is advertised via `additional_options` below (option 6), not
+            // this typed field — see the note on `extra_opts`.
             dns_servers: None,
             max_size: None,
             lease_duration: Some(LEASE_SECS),
             renew_duration: None,
             rebind_duration: None,
-            additional_options: &[],
+            additional_options: &extra_opts,
         };
 
         let blen = reply.buffer_len();

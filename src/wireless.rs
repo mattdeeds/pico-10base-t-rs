@@ -1006,9 +1006,10 @@ async fn net_task(net: cyw43::NetDriver<'static>, mac: [u8; 6]) -> ! {
     let dhcp_handle = sockets.add(dhcp_socket);
     let mut dhcp = DhcpServer::new();
 
-    // R14.5 — a tiny mgmt HTTP server on the LAN gateway IP (192.168.4.1:80).
+    // R14.5/R18 — a tiny mgmt HTTP server on the LAN gateway IP (192.168.4.1:80).
+    // TX sized to hold the whole status page (clients + WAN + NAT) in one send.
     let mut http_rx = [0u8; 1024];
-    let mut http_tx = [0u8; 1024];
+    let mut http_tx = [0u8; 2048];
     let http_socket = tcp::Socket::new(
         tcp::SocketBuffer::new(&mut http_rx[..]),
         tcp::SocketBuffer::new(&mut http_tx[..]),
@@ -1021,7 +1022,7 @@ async fn net_task(net: cyw43::NetDriver<'static>, mac: [u8; 6]) -> ! {
         // Drain + answer DHCP after the iface has delivered inbound datagrams;
         // the queued replies go out on the next poll.
         dhcp.poll(sockets.get_mut::<udp::Socket>(dhcp_handle));
-        serve_status_http(sockets.get_mut::<tcp::Socket>(http_handle));
+        serve_status_http(sockets.get_mut::<tcp::Socket>(http_handle), &dhcp);
         // R16: re-emit frames the WAN side forwarded to a LAN client out the cyw43
         // phy (next-hop = the client, MAC from the LAN neighbor table).
         #[cfg(feature = "router")]
@@ -1032,11 +1033,13 @@ async fn net_task(net: cyw43::NetDriver<'static>, mac: [u8; 6]) -> ! {
     }
 }
 
-/// R14.5 — a one-shot HTTP/1.0 status page on `192.168.4.1:80`. Re-listens after
-/// each closed connection; ignores the request line (every GET gets the same
-/// page). Shows the AP + LAN config and the live `[Cyw43]` counters so a joined
-/// client can confirm it's talking to the Pico router.
-fn serve_status_http(socket: &mut tcp::Socket) {
+/// R14.5/R18 — a one-shot HTTP/1.0 status page on `192.168.4.1:80`. Re-listens
+/// after each closed connection; ignores the request line (every GET gets the
+/// same page). Shows the AP + LAN config, the DNS handed out, the connected
+/// clients (active DHCP leases), and — in the router build — the WAN link state
+/// plus the NAPT/forwarding counters, so a joined client can confirm and inspect
+/// the router from the LAN side.
+fn serve_status_http(socket: &mut tcp::Socket, dhcp: &DhcpServer) {
     if !socket.is_open() {
         let _ = socket.listen(80);
     }
@@ -1045,18 +1048,69 @@ fn serve_status_http(socket: &mut tcp::Socket) {
     }
     if socket.can_send() {
         let uptime_s = embassy_time::Instant::now().as_secs();
-        let mut body: String<320> = String::new();
+        let dns = Ipv4Address::from(
+            crate::dhcp_server::LAN_DNS_OFFER
+                .load(Ordering::Relaxed)
+                .to_be_bytes(),
+        );
+        // Body holds the header block + up to POOL_LEN (32) lease lines (~38 B
+        // each) + the WAN/NAT block — worst case ~1.7 KB, so 1792 fits it whole
+        // and head+body stays under the 2 KB TX buffer; `write!` truncates
+        // gracefully as a backstop.
+        let mut body: String<1792> = String::new();
         let _ = write!(
             body,
             "Pico RP2350 Wireless Router (Rust)\r\n\
              AP SSID:     {AP_SSID}\r\n\
              LAN gateway: 192.168.4.1/24\r\n\
+             DNS offered: {dns}\r\n\
              uptime:      {uptime_s}s\r\n\
              DHCP replies:{}\r\n\
              LAN rx:      {}\r\n",
             crate::dhcp_server::DHCP_TX.load(Ordering::Relaxed),
             crate::cyw43_phy::CYW43_RX_FRAMES.load(Ordering::Relaxed),
         );
+
+        // Connected clients — the active DHCP leases (IP + MAC).
+        let _ = write!(body, "Clients:\r\n");
+        let mut nclients = 0u32;
+        for (ip, mac) in dhcp.active_leases() {
+            nclients += 1;
+            let _ = write!(
+                body,
+                "  {ip}  {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\r\n",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+            );
+        }
+        if nclients == 0 {
+            let _ = write!(body, "  (none)\r\n");
+        }
+
+        // WAN link + NAPT — router build only (the WAN/conntrack subsystems
+        // don't exist in the wireless-only image).
+        #[cfg(feature = "router")]
+        {
+            let _ = write!(body, "WAN:         ");
+            match critical_section::with(|cs| WAN_PUB.borrow(cs).get()) {
+                Some(w) => w.write_status(&mut body),
+                None => {
+                    let _ = write!(body, "(no lease)");
+                }
+            }
+            let _ = write!(
+                body,
+                "\r\nNAT:         ct={}/{} out={} in={} drop={}\r\n\
+                 Forward:     sent={} drop={}\r\n",
+                crate::conntrack::live_count(),
+                crate::conntrack::CT_CAP,
+                crate::conntrack::NAT_OUT.load(Ordering::Relaxed),
+                crate::conntrack::NAT_IN.load(Ordering::Relaxed),
+                crate::conntrack::NAT_DROP.load(Ordering::Relaxed),
+                crate::forward::FWD_SENT.load(Ordering::Relaxed),
+                crate::forward::FWD_DROP.load(Ordering::Relaxed),
+            );
+        }
+
         let mut head: String<128> = String::new();
         let _ = write!(
             head,
@@ -1257,6 +1311,14 @@ async fn wan_task(mut mac: crate::eth_mac::EthMac) -> ! {
         // lease (this also enables WAN-side forwarding once the lease lands).
         if let Some(cidr) = wan.addr {
             device.set_lease(cidr, wan.gw);
+        }
+        // R18: hand the WAN-learned upstream resolver to LAN DHCP clients. With
+        // R17 NAPT forwarding their port-53 UDP, no DNS relay is needed — they
+        // query it directly through our NAT. Until a lease provides one, the
+        // 8.8.8.8 default in `LAN_DNS_OFFER` stands.
+        if let Some(dns) = wan.dns0 {
+            crate::dhcp_server::LAN_DNS_OFFER
+                .store(u32::from_be_bytes(dns.octets()), Ordering::Relaxed);
         }
         crate::wan::ping_drain(&mut sockets, icmp_handle, &mut wan, &dev_checksum);
         crate::wan::dns_harvest(&mut sockets, dns_handle, &mut wan);
