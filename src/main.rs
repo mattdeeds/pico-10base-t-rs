@@ -46,6 +46,10 @@ mod dhcp_server;
 // `wan_task` (R15b, `router`).
 #[cfg(any(feature = "wan-dhcp", feature = "router"))]
 mod wan;
+// R16 — L3 forwarding (LAN↔WAN transit, no NAT): the ForwardingDevice phy
+// wrapper + cross-interface queues + neighbor learning. Router build only.
+#[cfg(feature = "router")]
+mod forward;
 
 use panic_halt as _;
 

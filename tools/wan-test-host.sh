@@ -42,9 +42,22 @@ LEASE="1h"
 UPSTREAM_DNS=(8.8.8.8 1.1.1.1)
 NFT_TABLE="pico_wan"   # our own nft table — deleted wholesale on teardown
 
+# ── R16 forwarding: the LAN subnet behind the Pico + the route back ─────────
+# For L3 forwarding (no NAT) the upstream must know how to return packets to the
+# LAN — add a route to it via the Pico's WAN IP, and loosen reverse-path filter
+# (192.168.4.x arriving on the WAN NIC looks asymmetric). PICO_WAN_IP is the
+# Pico's DHCP lease (deterministic for its fixed MAC); override if it differs.
+LAN_SUBNET="192.168.4.0/24"
+PICO_WAN_IP="${PICO_WAN_IP:-192.168.37.129}"
+# NAT_LAN=1 also masquerades the LAN subnet out the uplink, so a LAN client can
+# reach the *internet* via the host's NAT (the Pico itself still does NOT NAT —
+# that's R17). Leave 0 for the pure no-NAT forwarding test.
+NAT_LAN="${NAT_LAN:-0}"
+
 # ── State files (so `down` can revert a previous run) ──────────────────────
 FWSTATE="/tmp/pico-wan-ipforward.save"
 ADDRFLAG="/tmp/pico-wan-added-addr"
+RPSTATE="/tmp/pico-wan-rpfilter.save"
 
 log()  { printf '\033[36m[wan-host]\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m[wan-host] WARN:\033[0m %s\n' "$*" >&2; }
@@ -57,11 +70,15 @@ command -v dnsmasq >/dev/null || die "missing command: dnsmasq — install with:
 
 # ── nftables NAT/forward (a dedicated table; delete-all on teardown) ────────
 nft_up() {
+    # NAT_LAN=1 adds a masquerade for the LAN subnet (internet-via-host demo).
+    local lan_nat=""
+    [ "$NAT_LAN" = "1" ] && lan_nat="        ip saddr ${LAN_SUBNET} oifname \"${UPLINK_IF}\" masquerade"
     nft -f - <<EOF
 table ip ${NFT_TABLE} {
     chain postrouting {
         type nat hook postrouting priority srcnat;
         ip saddr ${SUBNET} oifname "${UPLINK_IF}" masquerade
+${lan_nat}
     }
     chain forward {
         type filter hook forward priority filter;
@@ -86,6 +103,12 @@ teardown() {
     if [ -f "$ADDRFLAG" ]; then
         ip addr del "$HOST_CIDR" dev "$WAN_IF" 2>/dev/null || true
         rm -f "$ADDRFLAG"
+    fi
+    # R16: remove the LAN route-back + restore reverse-path filter.
+    ip route del "$LAN_SUBNET" via "$PICO_WAN_IP" dev "$WAN_IF" 2>/dev/null || true
+    if [ -f "$RPSTATE" ]; then
+        sysctl -wq "net.ipv4.conf.${WAN_IF}.rp_filter=$(cat "$RPSTATE")" 2>/dev/null || true
+        rm -f "$RPSTATE"
     fi
     log "done — host restored (NIC link/autoneg left as-is)."
 }
@@ -126,6 +149,15 @@ fi
 
 cat /proc/sys/net/ipv4/ip_forward > "$FWSTATE"
 sysctl -wq net.ipv4.ip_forward=1
+
+# R16: route LAN-subnet replies back via the Pico, and loosen reverse-path filter
+# on the WAN NIC (192.168.4.x arriving there is asymmetric-looking). Inert for the
+# R15 client tests; required for forwarding. The route's next-hop resolves once
+# the Pico is up at PICO_WAN_IP.
+ip route replace "$LAN_SUBNET" via "$PICO_WAN_IP" dev "$WAN_IF"
+cat "/proc/sys/net/ipv4/conf/${WAN_IF}/rp_filter" > "$RPSTATE" 2>/dev/null || true
+sysctl -wq "net.ipv4.conf.${WAN_IF}.rp_filter=2" 2>/dev/null || true
+log "R16 route-back: $LAN_SUBNET via $PICO_WAN_IP (NAT_LAN=$NAT_LAN)"
 
 nft_down            # clear any stale table from a prior run
 nft_up || die "failed to install nft NAT/forward table."

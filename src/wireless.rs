@@ -34,7 +34,7 @@ use rp235x_hal as hal;
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
 use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 use usb_device::{class_prelude::*, prelude::*};
 use usbd_serial::SerialPort;
 
@@ -831,6 +831,32 @@ fn build_usb(
 // 3. Async runtime entry (R14.1 — persistent executor, continuous Runner)
 // =====================================================================
 
+/// Write a full byte slice to the CDC, polling the USB device between chunks so
+/// the ~128 B `usbd-serial` IN buffer is flushed to the host as it fills. The
+/// bare `serial.write()` writes only what currently fits and returns a partial
+/// count; ignoring that count silently drops the tail (R16: the longer `[Wan]`
+/// line overflowed it, truncating the `w2l`/`sent`/`drop` counters — and it was
+/// the long-standing "CDC drops bytes under load" limitation generally). The
+/// `guard` bounds the loop so a host that isn't reading (no DTR) can't hang us.
+fn cdc_write_all(
+    usb_dev: &mut UsbDevice<'static, hal::usb::UsbBus>,
+    serial: &mut SerialPort<'static, hal::usb::UsbBus>,
+    reset_iface: &mut crate::pico_reset::PicoResetInterface,
+    bytes: &[u8],
+) {
+    let mut rest = bytes;
+    let mut guard = 0u32;
+    while !rest.is_empty() && guard < 64 {
+        match serial.write(rest) {
+            Ok(n) => rest = &rest[n..],
+            Err(usb_device::UsbError::WouldBlock) => {}
+            Err(_) => break,
+        }
+        usb_dev.poll(&mut [&mut *serial, &mut *reset_iface]); // flush the IN buffer
+        guard += 1;
+    }
+}
+
 /// USB poll loop, in the executor. Keeps CDC + the picotool reset interface
 /// serviced while the executor owns core 0 (so `cargo run`/`picotool -f` still
 /// reboot us into BOOTSEL), and emits a 1 Hz `[Cyw43]` status line so the cyw43
@@ -865,7 +891,7 @@ async fn usb_task(
                 crate::dhcp_server::DHCP_TX.load(Ordering::Relaxed),
                 n / 1000,
             );
-            let _ = serial.write(line.as_bytes());
+            cdc_write_all(&mut usb_dev, &mut serial, &mut reset_iface, line.as_bytes());
 
             // R15b — the WAN (10BASE-T) side, when the router build is active.
             // wan_task publishes a snapshot we format here, so all CDC output
@@ -873,7 +899,7 @@ async fn usb_task(
             #[cfg(feature = "router")]
             {
                 let snap = critical_section::with(|cs| WAN_PUB.borrow(cs).get());
-                let mut wline: String<128> = String::new();
+                let mut wline: String<160> = String::new();
                 let _ = write!(
                     wline,
                     "[Wan] core1={} ",
@@ -886,7 +912,21 @@ async fn usb_task(
                     }
                 }
                 let _ = write!(wline, "\r\n");
-                let _ = serial.write(wline.as_bytes());
+                cdc_write_all(&mut usb_dev, &mut serial, &mut reset_iface, wline.as_bytes());
+
+                // R16 forwarding counters on their own line, so they can't be
+                // truncated mid-counter by CDC framing (they live past the point
+                // where the combined line used to overflow the IN buffer).
+                let mut fline: String<96> = String::new();
+                let _ = write!(
+                    fline,
+                    "[Fwd] l2w={} w2l={} sent={} drop={}\r\n",
+                    crate::forward::FWD_L2W.load(Ordering::Relaxed),
+                    crate::forward::FWD_W2L.load(Ordering::Relaxed),
+                    crate::forward::FWD_SENT.load(Ordering::Relaxed),
+                    crate::forward::FWD_DROP.load(Ordering::Relaxed),
+                );
+                cdc_write_all(&mut usb_dev, &mut serial, &mut reset_iface, fline.as_bytes());
             }
         }
         Timer::after(Duration::from_millis(1)).await;
@@ -908,7 +948,25 @@ async fn cyw43_runner_task(runner: CywRunner) -> ! {
 /// configured as `192.168.4.2/24` (after joining the AP) pings `192.168.4.1`.
 #[embassy_executor::task]
 async fn net_task(net: cyw43::NetDriver<'static>, mac: [u8; 6]) -> ! {
+    // R16: in the router build, wrap the LAN phy so transit frames (a client's
+    // off-LAN traffic) are diverted to the WAN via LAN_TO_WAN; smoltcp still gets
+    // ARP / DHCP / mgmt / ICMP-to-us. `accept_dst: None` ⇒ forward any off-local
+    // dst. The LAN gateway IP is static, so forwarding is enabled immediately.
+    #[cfg(not(feature = "router"))]
     let mut device = Cyw43Phy::new(net);
+    #[cfg(feature = "router")]
+    let mut device = crate::forward::ForwardingDevice::new(
+        Cyw43Phy::new(net),
+        crate::forward::IfaceCfg {
+            iface: crate::forward::Iface::Lan,
+            our_mac: mac,
+            our_ip: LAN_IP,
+            subnet: Ipv4Cidr::new(LAN_IP, LAN_PREFIX),
+            gateway: None,
+            accept_dst: None,
+        },
+        &crate::forward::LAN_TO_WAN,
+    );
 
     let now = || Instant::from_micros(embassy_time::Instant::now().as_micros() as i64);
     let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
@@ -949,6 +1007,12 @@ async fn net_task(net: cyw43::NetDriver<'static>, mac: [u8; 6]) -> ! {
         // the queued replies go out on the next poll.
         dhcp.poll(sockets.get_mut::<udp::Socket>(dhcp_handle));
         serve_status_http(sockets.get_mut::<tcp::Socket>(http_handle));
+        // R16: re-emit frames the WAN side forwarded to a LAN client out the cyw43
+        // phy (next-hop = the client, MAC from the LAN neighbor table).
+        #[cfg(feature = "router")]
+        while let Ok(mut frame) = crate::forward::WAN_TO_LAN.try_receive() {
+            device.egress(&mut frame, now());
+        }
         Timer::after(Duration::from_millis(5)).await;
     }
 }
@@ -1128,10 +1192,27 @@ async fn wan_task(mut mac: crate::eth_mac::EthMac) -> ! {
     // computes L3/L4 checksums on egress, no offload).
     let dev_checksum = mac.capabilities().checksum;
 
+    // R16: wrap the 10BT phy so transit frames (replies destined to a LAN client)
+    // are diverted to the LAN via WAN_TO_LAN. `accept_dst` restricts forwarding to
+    // the LAN subnet; `our_ip`/`subnet`/`gateway` are UNSPECIFIED until the DHCP
+    // lease lands (forwarding stays disabled until then — see set_lease below).
+    let mut device = crate::forward::ForwardingDevice::new(
+        mac,
+        crate::forward::IfaceCfg {
+            iface: crate::forward::Iface::Wan,
+            our_mac: crate::OUR_MAC,
+            our_ip: Ipv4Address::UNSPECIFIED,
+            subnet: Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0),
+            gateway: None,
+            accept_dst: Some(Ipv4Cidr::new(LAN_IP, LAN_PREFIX)),
+        },
+        &crate::forward::WAN_TO_LAN,
+    );
+
     let now = || Instant::from_micros(embassy_time::Instant::now().as_micros() as i64);
     let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(crate::OUR_MAC)));
     config.random_seed = embassy_time::Instant::now().as_ticks();
-    let mut iface = Interface::new(config, &mut mac, now());
+    let mut iface = Interface::new(config, &mut device, now());
     // No static IP — the dhcpv4 client installs address + default route on lease.
 
     let mut sockets_storage: [SocketStorage; 4] = [SocketStorage::EMPTY; 4];
@@ -1155,8 +1236,13 @@ async fn wan_task(mut mac: crate::eth_mac::EthMac) -> ! {
     let mut next_nlp = embassy_time::Instant::now();
     let mut next_ping = embassy_time::Instant::now();
     loop {
-        iface.poll(now(), &mut mac, &mut sockets);
+        iface.poll(now(), &mut device, &mut sockets);
         crate::wan::dhcp_apply(&mut iface, &mut sockets, dhcp_handle, dns_handle, &mut wan);
+        // R16: keep the forwarder's WAN address/subnet/gateway in step with the
+        // lease (this also enables WAN-side forwarding once the lease lands).
+        if let Some(cidr) = wan.addr {
+            device.set_lease(cidr, wan.gw);
+        }
         crate::wan::ping_drain(&mut sockets, icmp_handle, &mut wan, &dev_checksum);
         crate::wan::dns_harvest(&mut sockets, dns_handle, &mut wan);
 
@@ -1164,7 +1250,7 @@ async fn wan_task(mut mac: crate::eth_mac::EthMac) -> ! {
         // NLP keepalive every 16 ms — IEEE 802.3 link integrity (gotcha #9).
         if nowt >= next_nlp {
             next_nlp = nowt + Duration::from_millis(16);
-            mac.send_nlp();
+            device.inner_mut().send_nlp();
         }
         // Ping 8.8.8.8 + (re)start a DNS query once a second, once we hold a lease.
         if nowt >= next_ping {
@@ -1173,6 +1259,12 @@ async fn wan_task(mut mac: crate::eth_mac::EthMac) -> ! {
                 crate::wan::ping_send(&mut sockets, icmp_handle, &mut wan, &dev_checksum);
                 crate::wan::dns_start(&mut iface, &mut sockets, dns_handle, &mut wan);
             }
+        }
+        // R16: re-emit frames the LAN side forwarded toward the WAN out the 10BT
+        // phy (next-hop = the WAN gateway for off-subnet dsts, MAC from the WAN
+        // neighbor table; EthMac TX adds FCS/IFG/CSMA).
+        while let Ok(mut frame) = crate::forward::LAN_TO_WAN.try_receive() {
+            device.egress(&mut frame, now());
         }
         // Publish a snapshot for usb_task's [Wan] line.
         critical_section::with(|cs| WAN_PUB.borrow(cs).set(Some(wan)));

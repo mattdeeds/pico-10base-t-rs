@@ -300,20 +300,28 @@ Read the device counters over CDC (`/dev/ttyACM1`, 0666) as before — `fwd_l2w`
 
 ## 11. Step checklist
 
-- [ ] Prototype `ForwardingDevice<D>` token plumbing against both `Cyw43Phy` and
-      `EthMac` (Risk 1) — get `receive` (divert loop + ReplayRx) + delegated
-      `transmit` compiling for both before building the rest.
-- [ ] `src/forward.rs`: the two `Channel` statics + per-interface `NeighborTable`
+- [x] Prototype `ForwardingDevice<D>` token plumbing against both `Cyw43Phy` and
+      `EthMac` (Risk 1) — `receive` (divert loop + owned `ReplayRxToken`) + delegated
+      `D::TxToken<'a>` compile for both. (Risk 1 keystone cleared.)
+- [x] `src/forward.rs`: the two `Channel` statics + per-interface `NeighborTable`
       (passive on-subnet learning) + `classify` + `nexthop` + egress L2/TTL rewrite.
-- [ ] Wrap the LAN device in `net_task`; divert transit → `LAN_TO_WAN`; drain
+- [x] Wrap the LAN device in `net_task`; divert transit → `LAN_TO_WAN`; drain
       `WAN_TO_LAN` → egress out cyw43.
-- [ ] Wrap the WAN device in `wan_task`; divert transit (dst ∈ LAN/24) → `WAN_TO_LAN`;
-      drain `LAN_TO_WAN` → egress out EthMac (next-hop via `WanState.gw`).
-- [ ] `fwd_l2w`/`fwd_w2l`/`fwd_drop` counters in the `[Wan]`/`[Cyw43]` telemetry.
-- [ ] Extend `tools/wan-test-host.sh` with the LAN route-back (+ `rp_filter`), and an
-      optional wider-masquerade for the internet demo.
-- [ ] Validate: LAN client ↔ `192.168.37.19` (no NAT, source preserved per tcpdump);
-      LAN intact; WAN client (Pico's own ping/DNS) still works; core 1 up.
-- [ ] Build all configs clean; commit; update `RESUME.md` + this checklist; fix the
-      stale `router-plan.md` §12 "unification is R16's" wording (now R15b) while here.
+- [x] Wrap the WAN device in `wan_task`; divert transit (dst ∈ LAN/24) → `WAN_TO_LAN`;
+      drain `LAN_TO_WAN` → egress out EthMac (next-hop via the lease's `gw`).
+- [x] `l2w`/`w2l`/`sent`/`drop` counters — on their own `[Fwd]` CDC line (split off the
+      `[Wan]` line + `cdc_write_all` flush, so the counters survive CDC framing).
+- [x] Extend `tools/wan-test-host.sh` with the LAN route-back (+ `rp_filter`) and the
+      optional `NAT_LAN=1` wider-masquerade for the internet demo.
+- [~] Validate (2026-06-02, `--features router`, SWD-flashed): **LAN→WAN DONE** — phone
+      on the AP, off-LAN traffic forwarded, `fwd l2w==sent` >1400 / `drop≈0`, host
+      `tcpdump` shows source `192.168.4.x` preserved (no NAT); LAN intact; WAN's own
+      ping/DNS work; core 1 up. **WAN→LAN code-complete but NOT observed** — the iOS test
+      client wouldn't route over the no-internet Wi-Fi (cellular fallback); host
+      `tcpdump 'dst host 192.168.4.10'` saw 0 return frames → Pico exonerated. Closing it
+      needs a deterministic non-iOS client (laptop pinging `192.168.37.19`).
+- [x] Build all 4 configs clean + clippy clean (only the 2 pre-existing warnings); commit;
+      update `RESUME.md` + this checklist.
+- [ ] (carry-over) fix the stale `router-plan.md` §12 "unification is R16's" wording
+      (now R15b); finish the WAN→LAN observation with a non-iOS client.
 ```
