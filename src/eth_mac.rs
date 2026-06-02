@@ -339,7 +339,7 @@ fn DMA_IRQ_0() {
 
 pub struct EthMac {
     tx: EthTx,
-    tx_buf: [u8; MTU],
+    tx_buf: [u8; MAX_FRAME_BYTES],
     /// TX-side diagnostic counters surfaced to the main loop log.
     pub stats: EthMacStats,
 }
@@ -381,7 +381,7 @@ impl EthMac {
     pub fn new(tx: EthTx) -> Self {
         Self {
             tx,
-            tx_buf: [0; MTU],
+            tx_buf: [0; MAX_FRAME_BYTES],
             stats: EthMacStats::default(),
         }
     }
@@ -460,7 +460,7 @@ impl phy::RxToken for EthRxToken {
 /// preamble+SFD and appends the FCS.
 pub struct EthTxToken<'a> {
     tx: &'a mut EthTx,
-    buf: &'a mut [u8; MTU],
+    buf: &'a mut [u8; MAX_FRAME_BYTES],
     stats: &'a mut EthMacStats,
 }
 
@@ -469,7 +469,14 @@ impl<'a> phy::TxToken for EthTxToken<'a> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        debug_assert!(len <= MTU, "smoltcp asked for {len} bytes > MTU {MTU}");
+        // `len` can be a full Ethernet frame: smoltcp's own egress is capped at the
+        // IP MTU, but *forwarded* frames (R17 NAPT) pass the raw frame length here,
+        // up to MAX_FRAME_BYTES. The buffer is sized to MAX_FRAME_BYTES, and the
+        // forwarding `Frame` is `Vec<_, FRAME_CAP=MAX_FRAME_BYTES>`, so this never
+        // exceeds bounds — but clamp defensively so an oversized `len` can never
+        // panic the router (vs. the old `[u8; MTU]` buffer, which a 1514 B forwarded
+        // frame overflowed → halt).
+        let len = len.min(self.buf.len());
         let slice = &mut self.buf[..len];
         let result = f(slice);
         // Categorize: ARP, ICMP (IPv4 proto 1), UDP (IPv4 proto 17), other.

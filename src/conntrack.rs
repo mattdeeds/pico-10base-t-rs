@@ -25,7 +25,7 @@ pub static NAT_OUT: AtomicU32 = AtomicU32::new(0); // outbound packets NAPT-rewr
 pub static NAT_IN: AtomicU32 = AtomicU32::new(0); // inbound replies matched + rewritten
 pub static NAT_NEW: AtomicU32 = AtomicU32::new(0); // new conntrack entries created
 pub static NAT_EVICT: AtomicU32 = AtomicU32::new(0); // entries reclaimed (timeout/LRU)
-pub static NAT_DROP: AtomicU32 = AtomicU32::new(0); // port exhaustion / unmatched inbound
+pub static NAT_DROP: AtomicU32 = AtomicU32::new(0); // real drops: outbound port/id exhaustion
 
 /// Live conntrack entry count (for the `ct=<n>/<cap>` readout).
 pub fn live_count() -> usize {
@@ -187,7 +187,13 @@ impl Conntrack {
         }
 
         // New flow: allocate a WAN id + a slot.
-        let wan_id = self.alloc_id()?;
+        let wan_id = match self.alloc_id() {
+            Some(id) => id,
+            None => {
+                NAT_DROP.fetch_add(1, Ordering::Relaxed); // port/id space exhausted
+                return None;
+            }
+        };
         let idx = self.pick_slot(now_ms);
         if !self.slots[idx].used {
             NAT_LIVE.fetch_add(1, Ordering::Relaxed);
@@ -237,7 +243,8 @@ impl Conntrack {
                 return Some((s.lan_ip, s.lan_id));
             }
         }
-        NAT_DROP.fetch_add(1, Ordering::Relaxed);
+        // A miss is the *normal* path for the Pico's own inbound (ping/DNS replies
+        // to our WAN IP) — the caller falls through to `Local`. NOT a drop.
         None
     }
 
