@@ -803,10 +803,9 @@ fn log_status<B: UsbBus>(
     line.clear();
     let _ = writeln!(
         line,
-        "[Rx] dec={} ok={} fail={} filt={} dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        "[Rx] dec={} ok={} fail={} filt={} dst={}",
         rx.frames_decoded, rx.fcs_ok, rx.fcs_fail, rx.frames_filtered,
-        last_dst_mac[0], last_dst_mac[1], last_dst_mac[2],
-        last_dst_mac[3], last_dst_mac[4], last_dst_mac[5]
+        mac_str(last_dst_mac)
     );
     let _ = serial.write(line.as_bytes());
 
@@ -847,11 +846,11 @@ fn log_status<B: UsbBus>(
             line.clear();
             let _ = writeln!(
                 line,
-                "[Rx] frame {} bytes, FCS {} - dst {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} src {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} type={:04x}",
+                "[Rx] frame {} bytes, FCS {} - dst {} src {} type={:04x}",
                 rx.last_frame_len,
                 if rx.last_frame_was_ok { "OK" } else { "FAIL" },
-                f[0], f[1], f[2], f[3], f[4], f[5],
-                f[6], f[7], f[8], f[9], f[10], f[11],
+                mac_str([f[0], f[1], f[2], f[3], f[4], f[5]]),
+                mac_str([f[6], f[7], f[8], f[9], f[10], f[11]]),
                 etype,
             );
             let _ = serial.write(line.as_bytes());
@@ -859,6 +858,20 @@ fn log_status<B: UsbBus>(
             hex_dump(serial, line, "", &f[..dump_n]);
         }
     }
+}
+
+/// Format a MAC as `aa:bb:cc:dd:ee:ff` (lowercase hex) into a small stack
+/// string, so it drops into a `write!` like any `Display` value. Shared by the
+/// `[Rx]` log lines below and the wireless mgmt page
+/// (`wireless::serve_status_http`).
+pub fn mac_str(mac: [u8; 6]) -> String<17> {
+    let mut s = String::new();
+    let _ = write!(
+        s,
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    );
+    s
 }
 
 /// Write a 16-bytes-per-row hex dump of `data` to the USB CDC serial port,

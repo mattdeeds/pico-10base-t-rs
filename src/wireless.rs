@@ -1053,11 +1053,12 @@ fn serve_status_http(socket: &mut tcp::Socket, dhcp: &DhcpServer) {
                 .load(Ordering::Relaxed)
                 .to_be_bytes(),
         );
-        // Body holds the header block + up to POOL_LEN (32) lease lines (~38 B
-        // each) + the WAN/NAT block — worst case ~1.7 KB, so 1792 fits it whole
-        // and head+body stays under the 2 KB TX buffer; `write!` truncates
-        // gracefully as a backstop.
-        let mut body: String<1792> = String::new();
+        // Body = header block + one line per possible lease + the WAN/NAT block,
+        // sized from POOL_LEN (~40 B/lease) so it can't silently undersize if the
+        // pool grows. head + body stays under the 2 KB TX buffer; `write!`
+        // truncation is a graceful backstop.
+        const STATUS_BODY_CAP: usize = 256 + crate::dhcp_server::POOL_LEN * 40 + 320;
+        let mut body: String<STATUS_BODY_CAP> = String::new();
         let _ = write!(
             body,
             "Pico RP2350 Wireless Router (Rust)\r\n\
@@ -1076,11 +1077,7 @@ fn serve_status_http(socket: &mut tcp::Socket, dhcp: &DhcpServer) {
         let mut nclients = 0u32;
         for (ip, mac) in dhcp.active_leases() {
             nclients += 1;
-            let _ = write!(
-                body,
-                "  {ip}  {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\r\n",
-                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-            );
+            let _ = write!(body, "  {ip}  {}\r\n", crate::mac_str(mac));
         }
         if nclients == 0 {
             let _ = write!(body, "  (none)\r\n");

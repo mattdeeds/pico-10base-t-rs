@@ -27,7 +27,9 @@ const SERVER_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
 const SUBNET_MASK: Ipv4Address = Ipv4Address::new(255, 255, 255, 0);
 /// Lease pool: `192.168.4.{POOL_BASE .. POOL_BASE+POOL_LEN}` (slot i ↔ that IP).
 const POOL_BASE: u8 = 10;
-const POOL_LEN: usize = 32;
+/// Lease pool size. `pub` so the mgmt page can size its body to fit one line per
+/// possible lease (R18) without a magic number that silently undersizes.
+pub const POOL_LEN: usize = 32;
 /// Lease time handed to clients (1 hour).
 const LEASE_SECS: u32 = 3600;
 /// DHCP option code for "Domain Name Server" (RFC 2132 §3.8).

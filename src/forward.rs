@@ -151,6 +151,10 @@ enum Class {
 
 const ETHERTYPE_IPV4: u16 = 0x0800;
 const ETHERTYPE_ARP: u16 = 0x0806;
+/// Fixed Ethernet/IPv4 ARP header prefix: htype=1 (Ethernet), ptype=0x0800
+/// (IPv4), hlen=6, plen=4. `build_arp_request` writes it; `learn` matches it —
+/// the single source keeps the writer and parser in lockstep.
+const ARP_ETH_IPV4_PREFIX: [u8; 6] = [0x00, 0x01, 0x08, 0x00, 0x06, 0x04];
 
 /// IPv4 dst address of an Ethernet frame, if it is a long-enough IPv4 frame.
 fn ipv4_dst(frame: &[u8]) -> Option<Ipv4Address> {
@@ -202,8 +206,7 @@ fn learn(cfg: &IfaceCfg, frame: &[u8]) {
         // Ethernet/IPv4 ARP (fixed layout): htype=1 ptype=0x0800 hlen=6 plen=4,
         // then oper(2), sha(6)=frame[22..28], spa(4)=frame[28..32].
         ETHERTYPE_ARP
-            if frame.len() >= 14 + 28
-                && frame[14..20] == [0x00, 0x01, 0x08, 0x00, 0x06, 0x04] =>
+            if frame.len() >= 14 + 28 && frame[14..20] == ARP_ETH_IPV4_PREFIX =>
         {
             (
                 Ipv4Address::new(frame[28], frame[29], frame[30], frame[31]),
@@ -247,7 +250,7 @@ fn build_arp_request(our_mac: [u8; 6], spa: Ipv4Address, tpa: Ipv4Address) -> [u
     f[0..6].copy_from_slice(&[0xff; 6]); // dst MAC = broadcast
     f[6..12].copy_from_slice(&our_mac); // src MAC
     f[12..14].copy_from_slice(&ETHERTYPE_ARP.to_be_bytes());
-    f[14..20].copy_from_slice(&[0x00, 0x01, 0x08, 0x00, 0x06, 0x04]); // htype/ptype/hlen/plen
+    f[14..20].copy_from_slice(&ARP_ETH_IPV4_PREFIX); // htype/ptype/hlen/plen
     f[20..22].copy_from_slice(&1u16.to_be_bytes()); // oper = request
     f[22..28].copy_from_slice(&our_mac); // sha
     f[28..32].copy_from_slice(&spa.octets()); // spa (sender = us)
