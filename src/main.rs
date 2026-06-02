@@ -50,6 +50,10 @@ mod wan;
 // wrapper + cross-interface queues + neighbor learning. Router build only.
 #[cfg(feature = "router")]
 mod forward;
+// R17 — NAPT connection tracking (heapless conntrack table + incremental
+// checksum helpers). Wired into the WAN ForwardingDevice. Router build only.
+#[cfg(feature = "router")]
+mod conntrack;
 
 use panic_halt as _;
 
