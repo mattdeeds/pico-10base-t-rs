@@ -34,16 +34,49 @@ pub static CORE1_BUSY: AtomicU32 = AtomicU32::new(0);
 /// Cumulative cycles spent in core 0's forwarding fast-path (written by core 0).
 pub static FWD_BUSY: AtomicU32 = AtomicU32::new(0);
 
+/// LAN-isolation perf step 4 (`docs/perf-characterization-plan.md` §3.5) —
+/// core-0 cost split for the cyw43 LAN, since [`FWD_BUSY`] only brackets the
+/// forwarding fast-path (≈0 in a LAN-only test where traffic terminates on the
+/// Pico). Both are written on core 0 (the executor's hart). `spi0 + net0` ≈
+/// core-0 utilisation under a LAN test.
+///
+/// [`CYW43_SPI_BUSY`] = cycles inside the busy-poll gSPI transport
+/// (`PioSpiCyw43::cmd_read`/`cmd_write`), driven by the cyw43 `Runner` task —
+/// the Runner's real CPU cost, the prime "core 0 pinned by the busy-poll SPI
+/// transport" suspect (decision-matrix row 3 → gSPI DMA, §4-G).
+pub static CYW43_SPI_BUSY: AtomicU32 = AtomicU32::new(0);
+/// [`LAN_NET_BUSY`] = cycles in `net_task`'s per-poll body (smoltcp `iface.poll`,
+/// the DHCP/HTTP/sink handlers, the `Cyw43Phy` channel ops) — the stack/app cost
+/// *excluding* the gSPI (that's the Runner's, decoupled via the NetDriver
+/// channel).
+pub static LAN_NET_BUSY: AtomicU32 = AtomicU32::new(0);
+
 /// Latest sampled utilisation, per-mille (0..=1000 ≈ 0.0..=100.0 %). Published by
 /// `usb_task` each second; read by the `[Perf]` line and the mgmt page.
 pub static CPU1_PERMILLE: AtomicU32 = AtomicU32::new(0);
 pub static CPU0_PERMILLE: AtomicU32 = AtomicU32::new(0);
+/// Latest LAN-isolation core-0 split, per-mille (see [`CYW43_SPI_BUSY`] /
+/// [`LAN_NET_BUSY`]). Published by `usb_task`; read by the `[Lan]` line + mgmt.
+pub static SPI0_PERMILLE: AtomicU32 = AtomicU32::new(0);
+pub static NET0_PERMILLE: AtomicU32 = AtomicU32::new(0);
 
-/// Per-mille utilisation from a one-second busy-cycle delta: `delta / SYS_CLK_HZ`
-/// scaled to thousandths. u64 math — `delta * 1000` overflows u32 near 100 %.
+/// Per-mille utilisation over a *measured* window: `busy_delta` cycles divided by
+/// the wall-clock cycles in `elapsed_us` (= `elapsed_us * SYS_CLK_HZ / 1e6`),
+/// scaled to thousandths (0..=1000 ≈ 0.0..=100.0 %).
+///
+/// We can't assume the sample window is exactly 1 s: the sampler (`usb_task`, a
+/// 1 ms poll cadence) keeps up only while core 0 is idle. Under heavy LAN load
+/// core 0 saturates (the busy-poll gSPI Runner), `Timer::after(1ms)` slips, and
+/// the `n % 1000` window stretches to *several* seconds — a fixed-1 s divisor
+/// would over-read (>100 %, observed on the first LAN run). Dividing by the
+/// measured µs keeps every rate/% correct regardless of cadence slip.
 #[inline]
-pub fn permille(busy_delta: u32) -> u32 {
-    (busy_delta as u64 * 1000 / SYS_CLK_HZ as u64) as u32
+pub fn permille_over(busy_delta: u32, elapsed_us: u64) -> u32 {
+    if elapsed_us == 0 {
+        return 0;
+    }
+    // busy_delta·1e9 ≤ ~1.2e18 (a few s at 240 MHz) fits u64; denom ≈ 1e14.
+    (busy_delta as u64 * 1_000 * 1_000_000 / (elapsed_us * SYS_CLK_HZ as u64)) as u32
 }
 
 /// Clear `mcountinhibit` (CSR `0x320`) so `mcycle` advances. Hazard3 boots with

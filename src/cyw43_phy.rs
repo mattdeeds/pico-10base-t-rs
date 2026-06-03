@@ -47,6 +47,24 @@ fn noop_waker() -> Waker {
 /// path through cyw43 + this adapter works (reported in the `[Cyw43]` line).
 pub static CYW43_RX_FRAMES: AtomicU32 = AtomicU32::new(0);
 
+/// LAN-isolation perf step 3 (`docs/perf-characterization-plan.md` §3.5): cyw43
+/// **TX-backpressure** events — `transmit()` returning `None` because the cyw43
+/// NetDriver's TX channel has no free buffer (the producer-side Runner hasn't
+/// drained it onto the air yet). This is the *genuine, observable* cyw43 TX-drop
+/// signal: a high count under the `/bulk` download test (Pico→client) means
+/// cyw43 TX buffering / the gSPI Runner is the wall (software-fixable, §4-G),
+/// not the radio. Near-zero TX-busy + low download throughput points at the air.
+///
+/// NB there is deliberately **no RX-drop counter here**: cyw43 drops inbound
+/// frames *internally* when its RX channel backs up (`cyw43`'s `runner.rs` does a
+/// silent `try_rx_buf()→None ⇒ drop` with only a defmt `warn!` we don't capture),
+/// and at this smoltcp-`phy` boundary `receive()→None` just means "no frame this
+/// poll" (the idle case, ~hundreds/sec) — *not* a drop. So RX-side loss is
+/// inferred from the sink throughput vs the air baseline vs **core-0 CPU** (step
+/// 4): low sink kB/s + low `net0`/`spi0` ⇒ the radio; low sink kB/s + pinned
+/// core 0 ⇒ we can't drain fast enough and cyw43 drops upstream of us.
+pub static CYW43_TX_BUSY: AtomicU32 = AtomicU32::new(0);
+
 // The cyw43 `NetDriver`'s own token types, named via the trait projection so we
 // don't have to depend on `embassy-net-driver-channel` directly.
 type NetRx<'a> = <NetDriver<'static> as embassy_net_driver::Driver>::RxToken<'a>;
@@ -85,7 +103,15 @@ impl Device for Cyw43Phy {
     fn transmit(&mut self, _ts: Instant) -> Option<Self::TxToken<'_>> {
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
-        embassy_net_driver::Driver::transmit(&mut self.net, &mut cx).map(Cyw43TxToken)
+        match embassy_net_driver::Driver::transmit(&mut self.net, &mut cx) {
+            Some(tx) => Some(Cyw43TxToken(tx)),
+            None => {
+                // cyw43 TX channel full → backpressure. smoltcp will retry, but
+                // a climbing count under load means cyw43 TX is the bottleneck.
+                CYW43_TX_BUSY.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
     }
 
     fn capabilities(&self) -> DeviceCapabilities {

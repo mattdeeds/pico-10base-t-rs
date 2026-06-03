@@ -288,8 +288,15 @@ fn build_gspi_sm(
     );
     let installed = pio.install(&program.program).unwrap();
 
-    // ~2 MHz gSPI clock (2 PIO cycles/bit) — slow + safe for bring-up.
-    let (div_int, div_frac) = crate::pio_util::clock_divider(sys_clk_hz, 4_000_000.0);
+    // gSPI bit clock = GSPI_PIO_HZ / 2 (the program is 2 PIO cycles/bit). Bring-up
+    // ran at 2 MHz (PIO 4 MHz), "slow + safe"; the LAN-isolation run (§3.5) proved
+    // that 2 MHz bus — not the 2.4 GHz radio — was the throughput ceiling (≈250 KB/s
+    // raw; download landed at 168 KB/s right under it). 30 MHz PIO → 15 MHz gSPI
+    // (÷8 at 240 MHz, ÷5 at 150 MHz; ~7.5× the bus). embassy's cyw43-pio runs this
+    // same 2-cycle program at ~33 MHz, so the chip is fine — the only unknown is
+    // this board's off-header CLK/DATA wiring, validated on-device after the bump.
+    const GSPI_PIO_HZ: f32 = 30_000_000.0;
+    let (div_int, div_frac) = crate::pio_util::clock_divider(sys_clk_hz, GSPI_PIO_HZ);
     let (mut sm, rx, tx) = PIOBuilder::from_installed_program(installed)
         .out_pins(PIN_DATA as u8, 1)
         .set_pins(PIN_DATA as u8, 1)
@@ -641,6 +648,11 @@ impl cyw43::SpiBusCyw43 for PioSpiCyw43 {
     /// Clock `write` out MSB-first, then read back the gSPI status word.
     /// X = write.len()*32 - 1 (write bits); Y = 31 (read one status word).
     async fn cmd_write(&mut self, write: &[u32]) -> u32 {
+        // Perf §3.5 step 4: this transport is synchronous busy-poll (no await in
+        // the body), so a CycleSpan over it measures the gSPI cost the cyw43
+        // Runner pays on core 0 — the `spi0%` readout.
+        #[cfg(feature = "router")]
+        let _span = crate::cycles::CycleSpan::new(&crate::cycles::CYW43_SPI_BUSY);
         self.drain_rx();
         gpio_clr(PIN_CS); // CS low
         let wbits = (write.len() as u32).saturating_mul(32).saturating_sub(1);
@@ -659,6 +671,8 @@ impl cyw43::SpiBusCyw43 for PioSpiCyw43 {
     /// (The backplane's extra leading word is already counted in `read.len()` by
     /// cyw43's caller — see the trait docs.) Matches embassy cyw43-pio.
     async fn cmd_read(&mut self, write: u32, read: &mut [u32]) -> u32 {
+        #[cfg(feature = "router")]
+        let _span = crate::cycles::CycleSpan::new(&crate::cycles::CYW43_SPI_BUSY);
         self.drain_rx();
         gpio_clr(PIN_CS); // CS low
         self.push(31); // write 32 cmd bits
@@ -710,6 +724,46 @@ pub static CYW43_NET_UP: AtomicU32 = AtomicU32::new(0);
 /// LAN gateway IP (the Pico's address on the wireless subnet, R14.3).
 const LAN_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
 const LAN_PREFIX: u8 = 24;
+
+// =====================================================================
+// LAN-isolation perf instrumentation (docs/perf-characterization-plan.md §3.5)
+// =====================================================================
+//
+// Terminate traffic *on the Pico* to isolate the cyw43 LAN link from the
+// forward + 10BT WAN path (which the routed test conflates). The source/sink
+// + their byte counters are LAN-only (no router deps), so they exist in both
+// the `wireless` and `router` builds; only the `spi0/net0` CPU% (step 4) needs
+// the router-only `cycles` module.
+
+/// /bulk download body size (Pico→client, pure cyw43 TX). Large enough to reach
+/// steady state; the rig reads the per-second `[Lan] tx=` rate and Ctrl-C's curl
+/// once it settles (it need not run to completion).
+const LAN_BULK_BYTES: usize = 8 * 1024 * 1024;
+
+/// TCP port of the upload sink (client→Pico, pure cyw43 RX). Read-drains +
+/// counts, no echo. Drive with `nc`/`curl -T`/a socket script (iperf3-free).
+const LAN_SINK_PORT: u16 = 9999;
+
+/// Cumulative bytes streamed out the `/bulk` source (cyw43 TX throughput; the
+/// per-second delta is `[Lan] tx=`). Perf §3.5 step 1.
+pub static LAN_BULK_TX_BYTES: AtomicU32 = AtomicU32::new(0);
+/// Cumulative bytes drained at the upload sink (cyw43 RX throughput; the
+/// per-second delta is `[Lan] rx=`). Perf §3.5 step 2.
+pub static LAN_SINK_RX_BYTES: AtomicU32 = AtomicU32::new(0);
+
+/// LAN mgmt-HTTP connection state — lets the `/bulk` source stream a multi-MB
+/// body across many `net_task` poll iterations (the status page `/` is still a
+/// one-shot). Mirrors `main.rs`'s `HttpBulkState` for the 10BT `http-bulk-test`.
+enum LanHttp {
+    /// Listening / the request hasn't been routed yet.
+    Idle,
+    /// A `/bulk` response is in flight: send the header (once `header_sent`) then
+    /// stream the body, `remaining` bytes still to go. Carrying `header_sent` in
+    /// the state (rather than sending the header inline when the request arrives)
+    /// keeps the transfer robust if the socket can't accept the header on the
+    /// same poll the request is read.
+    Bulk { remaining: usize, header_sent: bool },
+}
 
 // R14.2 AP parameters (dev defaults for the LAN-side bring-up). WPA2 passphrase
 // must be 8..=63 bytes. 2.4 GHz channel 6. These become configurable later.
@@ -869,6 +923,17 @@ async fn usb_task(
     mut reset_iface: crate::pico_reset::PicoResetInterface,
 ) -> ! {
     let mut n: u32 = 0;
+    // Per-second rates are normalised by the *measured* elapsed µs since the last
+    // emission, not an assumed 1 s — under load core 0 saturates and this task's
+    // 1 ms cadence slips, stretching the `n % 1000` window to several seconds
+    // (without this, all rates/% over-read, e.g. spi0 > 100%). See `permille_over`.
+    let mut last_emit_us = embassy_time::Instant::now().as_micros();
+    // [Lan] rate state (perf §3.5): previous cumulative cyw43 TX/RX byte counters
+    // for per-second deltas (all wireless builds), plus (router) the core-0
+    // busy-cycle accumulators behind spi0/net0.
+    let (mut prev_lan_tx, mut prev_lan_rx) = (0u32, 0u32);
+    #[cfg(feature = "router")]
+    let (mut prev_spi, mut prev_net) = (0u32, 0u32);
     // [Perf] rate state: previous cumulative counters (for per-second deltas) +
     // the conntrack live high-water. Router build only.
     #[cfg(feature = "router")]
@@ -881,8 +946,13 @@ async fn usb_task(
             hal::reboot::reboot(kind, crate::pico_reset::RebootArch::Normal);
         }
         n = n.wrapping_add(1);
-        // ~1 Hz at the 1 ms poll cadence.
+        // ~1 Hz at the 1 ms poll cadence (slower under load — normalised below).
         if n % 1000 == 0 {
+            // Measured window for all per-second rates (see last_emit_us above).
+            let now_us = embassy_time::Instant::now().as_micros();
+            let elapsed_us = now_us.wrapping_sub(last_emit_us).max(1);
+            last_emit_us = now_us;
+
             let mut line: String<96> = String::new();
             let _ = write!(
                 line,
@@ -897,6 +967,52 @@ async fn usb_task(
                 n / 1000,
             );
             cdc_write_all(&mut usb_dev, &mut serial, &mut reset_iface, line.as_bytes());
+
+            // [Lan] — LAN-isolation perf (§3.5): pure cyw43 TX (/bulk download) +
+            // RX (sink :9999) throughput as per-second deltas, the TX-backpressure
+            // count, and (router) the core-0 CPU split (spi0 = gSPI transport /
+            // Runner, net0 = net_task stack). Its own line so CDC framing can't
+            // truncate a counter. Available in both the wireless + router builds.
+            {
+                let tx = LAN_BULK_TX_BYTES.load(Ordering::Relaxed);
+                let rx = LAN_SINK_RX_BYTES.load(Ordering::Relaxed);
+                let tx_kbs =
+                    (tx.wrapping_sub(prev_lan_tx) as u64 * 1_000_000 / elapsed_us / 1024) as u32;
+                let rx_kbs =
+                    (rx.wrapping_sub(prev_lan_rx) as u64 * 1_000_000 / elapsed_us / 1024) as u32;
+                prev_lan_tx = tx;
+                prev_lan_rx = rx;
+                let mut lline: String<160> = String::new();
+                let _ = write!(
+                    lline,
+                    "[Lan] tx={}KB/s rx={}KB/s txbusy={} rxframes={}",
+                    tx_kbs,
+                    rx_kbs,
+                    crate::cyw43_phy::CYW43_TX_BUSY.load(Ordering::Relaxed),
+                    crate::cyw43_phy::CYW43_RX_FRAMES.load(Ordering::Relaxed),
+                );
+                #[cfg(feature = "router")]
+                {
+                    let spi = crate::cycles::CYW43_SPI_BUSY.load(Ordering::Relaxed);
+                    let net = crate::cycles::LAN_NET_BUSY.load(Ordering::Relaxed);
+                    let spi0 = crate::cycles::permille_over(spi.wrapping_sub(prev_spi), elapsed_us);
+                    let net0 = crate::cycles::permille_over(net.wrapping_sub(prev_net), elapsed_us);
+                    prev_spi = spi;
+                    prev_net = net;
+                    crate::cycles::SPI0_PERMILLE.store(spi0, Ordering::Relaxed);
+                    crate::cycles::NET0_PERMILLE.store(net0, Ordering::Relaxed);
+                    let _ = write!(
+                        lline,
+                        " spi0={}.{}% net0={}.{}%",
+                        spi0 / 10,
+                        spi0 % 10,
+                        net0 / 10,
+                        net0 % 10,
+                    );
+                }
+                let _ = write!(lline, "\r\n");
+                cdc_write_all(&mut usb_dev, &mut serial, &mut reset_iface, lline.as_bytes());
+            }
 
             // R15b — the WAN (10BASE-T) side, when the router build is active.
             // wan_task publishes a snapshot we format here, so all CDC output
@@ -949,14 +1065,16 @@ async fn usb_task(
                 cdc_write_all(&mut usb_dev, &mut serial, &mut reset_iface, nline.as_bytes());
 
                 // [Perf] — per-second routed throughput + saturation/drop diagnostics.
-                // up = LAN→WAN (client upload), dn = WAN→LAN (download); rates are the
-                // 1 Hz delta of the cumulative byte/frame counters.
+                // up = LAN→WAN (client upload), dn = WAN→LAN (download); rates are
+                // the byte/frame deltas over the measured window (elapsed_us).
                 let to_wan = crate::forward::FWD_BYTES_TO_WAN.load(Ordering::Relaxed);
                 let to_lan = crate::forward::FWD_BYTES_TO_LAN.load(Ordering::Relaxed);
                 let sent = crate::forward::FWD_SENT.load(Ordering::Relaxed);
-                let up_kbs = to_wan.wrapping_sub(prev_to_wan) / 1024;
-                let dn_kbs = to_lan.wrapping_sub(prev_to_lan) / 1024;
-                let pps = sent.wrapping_sub(prev_sent);
+                let up_kbs =
+                    (to_wan.wrapping_sub(prev_to_wan) as u64 * 1_000_000 / elapsed_us / 1024) as u32;
+                let dn_kbs =
+                    (to_lan.wrapping_sub(prev_to_lan) as u64 * 1_000_000 / elapsed_us / 1024) as u32;
+                let pps = (sent.wrapping_sub(prev_sent) as u64 * 1_000_000 / elapsed_us) as u32;
                 prev_to_wan = to_wan;
                 prev_to_lan = to_lan;
                 prev_sent = sent;
@@ -964,14 +1082,14 @@ async fn usb_task(
                 if ct > ct_hwm {
                     ct_hwm = ct;
                 }
-                // CPU utilisation (perf step 2): per-second busy-cycle deltas → %.
-                // cpu1 ≈ core-1 RX-decode load; cpu0 = the share of core-0
-                // wall-clock spent in the forwarding fast-path (NOT total core-0
-                // load). Published to atomics so the mgmt page reflects them too.
+                // CPU utilisation (perf step 2): busy-cycle deltas over the measured
+                // window → %. cpu1 ≈ core-1 RX-decode load; cpu0 = the share of
+                // core-0 wall-clock spent in the forwarding fast-path (NOT total
+                // core-0 load). Published to atomics so the mgmt page reflects them.
                 let c1 = crate::cycles::CORE1_BUSY.load(Ordering::Relaxed);
                 let fwd = crate::cycles::FWD_BUSY.load(Ordering::Relaxed);
-                let cpu1 = crate::cycles::permille(c1.wrapping_sub(prev_c1));
-                let cpu0 = crate::cycles::permille(fwd.wrapping_sub(prev_fwd));
+                let cpu1 = crate::cycles::permille_over(c1.wrapping_sub(prev_c1), elapsed_us);
+                let cpu0 = crate::cycles::permille_over(fwd.wrapping_sub(prev_fwd), elapsed_us);
                 prev_c1 = c1;
                 prev_fwd = fwd;
                 crate::cycles::CPU1_PERMILLE.store(cpu1, Ordering::Relaxed);
@@ -1049,9 +1167,10 @@ async fn net_task(net: cyw43::NetDriver<'static>, mac: [u8; 6]) -> ! {
         let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(LAN_IP), LAN_PREFIX));
     });
 
-    // ARP + ICMP echo are answered by the Interface itself; the one socket is
-    // the R14.4 DHCP server on UDP :67. Buffers sized for a few BOOTP packets.
-    let mut sockets_storage: [SocketStorage; 2] = [SocketStorage::EMPTY; 2];
+    // Sockets: the R14.4 DHCP server (UDP :67), the R14.5/R18 mgmt HTTP server
+    // (TCP :80, also the perf §3.5 /bulk download source), and the perf §3.5
+    // upload sink (TCP :9999).
+    let mut sockets_storage: [SocketStorage; 3] = [SocketStorage::EMPTY; 3];
     let mut sockets = SocketSet::new(&mut sockets_storage[..]);
     let mut dhcp_rx_meta = [udp::PacketMetadata::EMPTY; 4];
     let mut dhcp_rx_payload = [0u8; 1536];
@@ -1064,46 +1183,168 @@ async fn net_task(net: cyw43::NetDriver<'static>, mac: [u8; 6]) -> ! {
     let dhcp_handle = sockets.add(dhcp_socket);
     let mut dhcp = DhcpServer::new();
 
-    // R14.5/R18 — a tiny mgmt HTTP server on the LAN gateway IP (192.168.4.1:80).
-    // TX sized to hold the whole status page (clients + WAN + NAT + perf) in one send.
+    // R14.5/R18 — mgmt HTTP server on the LAN gateway IP (192.168.4.1:80), also
+    // the perf §3.5 /bulk download source. RX is tiny (requests are short); TX
+    // is large so the /bulk stream stays cyw43-TX-limited, not net_task-cadence-
+    // limited (32 KB / 5 ms poll ≈ 6.4 MB/s ceiling, well above any 2.4 GHz rate;
+    // mirrors the 10BT http-bulk-test's 32 KB window).
     let mut http_rx = [0u8; 1024];
-    let mut http_tx = [0u8; 2560];
+    let mut http_tx = [0u8; 32 * 1024];
     let http_socket = tcp::Socket::new(
         tcp::SocketBuffer::new(&mut http_rx[..]),
         tcp::SocketBuffer::new(&mut http_tx[..]),
     );
     let http_handle = sockets.add(http_socket);
+    let mut lan_http = LanHttp::Idle;
+
+    // Perf §3.5 step 2 — upload sink (client→Pico, pure cyw43 RX). Large RX
+    // buffer so the advertised TCP window doesn't throttle the upload; TX is just
+    // ACKs. Read-drained + counted (no echo) by `serve_lan_sink`.
+    let mut sink_rx = [0u8; 32 * 1024];
+    let mut sink_tx = [0u8; 2048];
+    let sink_socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(&mut sink_rx[..]),
+        tcp::SocketBuffer::new(&mut sink_tx[..]),
+    );
+    let sink_handle = sockets.add(sink_socket);
 
     CYW43_NET_UP.store(1, Ordering::Relaxed);
     loop {
-        iface.poll(now(), &mut device, &mut sockets);
-        // Drain + answer DHCP after the iface has delivered inbound datagrams;
-        // the queued replies go out on the next poll.
-        dhcp.poll(sockets.get_mut::<udp::Socket>(dhcp_handle));
-        serve_status_http(sockets.get_mut::<tcp::Socket>(http_handle), &dhcp);
-        // R16: re-emit frames the WAN side forwarded to a LAN client out the cyw43
-        // phy (next-hop = the client, MAC from the LAN neighbor table).
-        #[cfg(feature = "router")]
-        while let Ok(mut frame) = crate::forward::WAN_TO_LAN.try_receive() {
-            device.egress(&mut frame, now());
+        {
+            // Perf §3.5 step 4: bracket net_task's per-poll work (smoltcp +
+            // handlers + Cyw43Phy channel ops) on core 0 → the `net0%` readout.
+            // The gSPI cost is the Runner's, measured separately (CYW43_SPI_BUSY).
+            #[cfg(feature = "router")]
+            let _span = crate::cycles::CycleSpan::new(&crate::cycles::LAN_NET_BUSY);
+            iface.poll(now(), &mut device, &mut sockets);
+            // Drain + answer DHCP after the iface has delivered inbound datagrams;
+            // the queued replies go out on the next poll.
+            dhcp.poll(sockets.get_mut::<udp::Socket>(dhcp_handle));
+            serve_status_http(sockets.get_mut::<tcp::Socket>(http_handle), &dhcp, &mut lan_http);
+            serve_lan_sink(sockets.get_mut::<tcp::Socket>(sink_handle));
+            // R16: re-emit frames the WAN side forwarded to a LAN client out the
+            // cyw43 phy (next-hop = the client, MAC from the LAN neighbor table).
+            #[cfg(feature = "router")]
+            while let Ok(mut frame) = crate::forward::WAN_TO_LAN.try_receive() {
+                device.egress(&mut frame, now());
+            }
         }
         Timer::after(Duration::from_millis(5)).await;
     }
 }
 
-/// R14.5/R18 — a one-shot HTTP/1.0 status page on `192.168.4.1:80`. Re-listens
-/// after each closed connection; ignores the request line (every GET gets the
-/// same page). Shows the AP + LAN config, the DNS handed out, the connected
-/// clients (active DHCP leases), and — in the router build — the WAN link state
-/// plus the NAPT/forwarding counters, so a joined client can confirm and inspect
-/// the router from the LAN side.
-fn serve_status_http(socket: &mut tcp::Socket, dhcp: &DhcpServer) {
+/// Perf §3.5 step 2 — the upload sink: a TCP listener on [`LAN_SINK_PORT`] that
+/// read-drains every byte a client uploads (no echo) and accumulates the total
+/// into [`LAN_SINK_RX_BYTES`], so the per-second delta is the *pure cyw43 RX*
+/// throughput. Re-listens after the client closes. Drive it with
+/// `head -c 64M /dev/zero | nc 192.168.4.1 9999` (or `curl -T`).
+fn serve_lan_sink(socket: &mut tcp::Socket) {
     if !socket.is_open() {
+        let _ = socket.listen(LAN_SINK_PORT);
+        return;
+    }
+    // Drain all available RX, counting it. recv consumes what the closure returns.
+    while socket.can_recv() {
+        match socket.recv(|buf| {
+            let n = buf.len();
+            (n, n)
+        }) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                LAN_SINK_RX_BYTES.fetch_add(n as u32, Ordering::Relaxed);
+            }
+        }
+    }
+    // Peer sent FIN and we've drained it (CLOSE_WAIT) → close so we re-listen.
+    if !socket.may_recv() && socket.may_send() {
+        socket.close();
+    }
+}
+
+/// R14.5/R18 — the LAN mgmt HTTP server on `192.168.4.1:80`, route-aware:
+/// - `GET /bulk` → perf §3.5 step 1: stream [`LAN_BULK_BYTES`] of filler (pure
+///   cyw43 TX, the download-throughput test). State persists in `state` across
+///   polls; mirrors `main.rs`'s `serve_http_bulk`.
+/// - anything else (`GET /`) → the one-shot status page: AP + LAN config, the
+///   DNS handed out, connected clients (active DHCP leases), and — in the router
+///   build — the WAN link state + NAPT/forwarding counters + the LAN-isolation
+///   perf readout.
+///
+/// Re-listens after each closed connection.
+fn serve_status_http(socket: &mut tcp::Socket, dhcp: &DhcpServer, state: &mut LanHttp) {
+    // Perf §3.5 step 1 — 1 KB filler (matches the UDP-blast 0x55 payload basis).
+    const BULK_CHUNK: [u8; 1024] = [0x55; 1024];
+
+    if !socket.is_open() {
+        *state = LanHttp::Idle;
         let _ = socket.listen(80);
+        return;
     }
+
+    // Continue an in-flight /bulk stream — send the header (once), then top the
+    // TX buffer up each poll until the body is sent (or the socket can't take
+    // more this cycle, i.e. cyw43 TX is the limiter, which is what we measure).
+    if let LanHttp::Bulk {
+        remaining,
+        header_sent,
+    } = state
+    {
+        if !*header_sent {
+            if !socket.can_send() {
+                return; // retry next poll
+            }
+            let mut head: String<128> = String::new();
+            let _ = write!(
+                head,
+                "HTTP/1.0 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                 Content-Length: {LAN_BULK_BYTES}\r\nConnection: close\r\n\r\n",
+            );
+            let _ = socket.send_slice(head.as_bytes());
+            *header_sent = true;
+        }
+        while *remaining > 0 && socket.can_send() {
+            let n = (*remaining).min(BULK_CHUNK.len());
+            match socket.send_slice(&BULK_CHUNK[..n]) {
+                Ok(0) | Err(_) => break,
+                Ok(sent) => {
+                    *remaining -= sent;
+                    LAN_BULK_TX_BYTES.fetch_add(sent as u32, Ordering::Relaxed);
+                }
+            }
+        }
+        if *remaining == 0 {
+            socket.close();
+            *state = LanHttp::Idle;
+        }
+        return;
+    }
+
+    // Idle: wait for the request line so we can route it, then dispatch. (The
+    // request is short — "GET /bulk HTTP/1.1\r\n" — so it arrives in one segment.)
+    let mut route_bulk = false;
+    let mut have_req = false;
     if socket.may_recv() {
-        let _ = socket.recv(|buf| (buf.len(), ()));
+        let _ = socket.recv(|buf| {
+            have_req = !buf.is_empty();
+            route_bulk = buf.starts_with(b"GET /bulk");
+            (buf.len(), ())
+        });
     }
+    if !have_req {
+        return; // respond only once the request has arrived
+    }
+
+    if route_bulk {
+        // Transition unconditionally; the Bulk branch sends the header next poll
+        // (or this one isn't reachable again until then) — robust to can_send.
+        *state = LanHttp::Bulk {
+            remaining: LAN_BULK_BYTES,
+            header_sent: false,
+        };
+        return;
+    }
+
+    // Default route `/` — the one-shot status page.
     if socket.can_send() {
         let uptime_s = embassy_time::Instant::now().as_secs();
         let dns = Ipv4Address::from(
@@ -1115,7 +1356,7 @@ fn serve_status_http(socket: &mut tcp::Socket, dhcp: &DhcpServer) {
         // block, sized from POOL_LEN (~40 B/lease) so it can't silently undersize
         // if the pool grows. head + body stays under the TX buffer; `write!`
         // truncation is a graceful backstop.
-        const STATUS_BODY_CAP: usize = 256 + crate::dhcp_server::POOL_LEN * 40 + 512;
+        const STATUS_BODY_CAP: usize = 256 + crate::dhcp_server::POOL_LEN * 40 + 768;
         let mut body: String<STATUS_BODY_CAP> = String::new();
         let _ = write!(
             body,
@@ -1140,6 +1381,17 @@ fn serve_status_http(socket: &mut tcp::Socket, dhcp: &DhcpServer) {
         if nclients == 0 {
             let _ = write!(body, "  (none)\r\n");
         }
+
+        // LAN-isolation perf (§3.5): cumulative cyw43 TX (/bulk) + RX (sink :9999)
+        // bytes + the TX-backpressure count. Per-second rates + CPU% are on the
+        // `[Lan]` CDC line; the spi0/net0 CPU% are added in the router block below.
+        let _ = write!(
+            body,
+            "LAN perf:    tx={}B rx={}B txbusy={}\r\n",
+            LAN_BULK_TX_BYTES.load(Ordering::Relaxed),
+            LAN_SINK_RX_BYTES.load(Ordering::Relaxed),
+            crate::cyw43_phy::CYW43_TX_BUSY.load(Ordering::Relaxed),
+        );
 
         // WAN link + NAPT — router build only (the WAN/conntrack subsystems
         // don't exist in the wireless-only image).
@@ -1188,6 +1440,18 @@ fn serve_status_http(socket: &mut tcp::Socket, dhcp: &DhcpServer) {
                 c1 % 10,
                 c0 / 10,
                 c0 % 10,
+            );
+            // LAN-isolation core-0 split (perf §3.5 step 4): spi0 = the busy-poll
+            // gSPI transport (cyw43 Runner); net0 = net_task's smoltcp/handler poll.
+            let spi0 = crate::cycles::SPI0_PERMILLE.load(Ordering::Relaxed);
+            let net0 = crate::cycles::NET0_PERMILLE.load(Ordering::Relaxed);
+            let _ = write!(
+                body,
+                "LAN cpu0:    spi0(gspi)={}.{}% net0(stack)={}.{}%\r\n",
+                spi0 / 10,
+                spi0 % 10,
+                net0 / 10,
+                net0 % 10,
             );
         }
 

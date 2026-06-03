@@ -132,37 +132,119 @@ ceiling" from "a loss/buffering bug under burst." **The LAN-only rig is far
 simpler than §3:** no WAN host, no `$SRV`, no `/32`, no NAPT — just `wlx` ↔ the
 Pico AP, traffic terminating *on the Pico* (none of the loop/double-NAT fragility).
 
-**Instrumentation to add (router/feature-gated, like steps 1–2):**
-1. **LAN bulk *source*** (download = Pico→client, cyw43 TX): a `/bulk` route in
-   `wireless::serve_status_http` that streams a fixed N-MB body — mirror
-   `main.rs`'s `serve_http_bulk`/`HttpBulkState` (the 10BT `http-bulk-test`
-   endpoint). `curl http://192.168.4.1/bulk >/dev/null` ⇒ pure cyw43 TX kB/s.
-2. **LAN *sink*** (upload = client→Pico, cyw43 RX): a TCP socket on a dedicated
-   port in `net_task` that read-drains + counts bytes (no echo). ⇒ pure cyw43 RX
-   kB/s. Drive with `nc`/`curl -T`/a socket script (iperf3-free).
-3. **cyw43 RX/TX drop counters** in `src/cyw43_phy.rs` (`Cyw43Phy`): count
-   `receive()` yielding `None` under backlog and `transmit()` yielding `None`
-   (TX-not-ready / backpressure), surfaced on `[Perf]`/mgmt. **The key
-   discriminator** — high RX-drop under upload ⇒ cyw43 RX buffering is the wall
-   (software-fixable); near-zero drops + low CPU + low throughput ⇒ the air/radio
-   is the real ceiling.
-4. **CPU during LAN-only load:** read `cpu0` (cyw43 Runner + busy-poll SPI
-   transport + `net_task` all live on core 0). Step-2 `FWD_BUSY` only brackets
-   forwarding (zero here) — add a span around the cyw43 poll/Runner, or a
-   total-core-0 span, to catch the driver's cost.
+**Instrumentation — BUILT 2026-06-03** (compiles all 4 configs + clippy clean,
+only the 2 pre-existing warnings; production NIC build byte-unchanged — the new
+code lives only in the `wireless`/`router` modules; the per-core CPU% (step 4) is
+router-gated since it uses the router-only `cycles`). New readouts: a **`[Lan]`
+CDC line** (`tx=KB/s rx=KB/s txbusy=N rxframes=N` + router `spi0=% net0=%`) and
+mgmt-page rows (`LAN perf:` totals + `LAN cpu0:` split). **The device must be
+reflashed with this router build** before the rig run (it's the current
+`release/` ELF; the [[flash-wrong-feature-build-gotcha]] verify = `strings <ELF> |
+grep -F "[Lan]"`).
+1. **LAN bulk *source*** (download = Pico→client, cyw43 TX) — DONE: a `GET /bulk`
+   route in `wireless::serve_status_http` streams `LAN_BULK_BYTES` (8 MB) of 0x55
+   filler via a persistent `LanHttp::Bulk{remaining, header_sent}` state (mirrors
+   `main.rs`'s `serve_http_bulk`). The `:80` TX buffer was bumped 2.5→32 KB so the
+   stream stays cyw43-TX-limited, not net_task-5ms-cadence-limited (32 KB/5 ms ≈
+   6.4 MB/s ceiling). Counts `LAN_BULK_TX_BYTES`. Drive:
+   `curl http://192.168.4.1/bulk >/dev/null` and read the steady-state `[Lan] tx=`
+   (Ctrl-C once it settles — 8 MB needn't finish).
+2. **LAN *sink*** (upload = client→Pico, cyw43 RX) — DONE: a TCP listener on
+   **port 9999** in `net_task` (`serve_lan_sink`) read-drains + counts every byte
+   (no echo) into `LAN_SINK_RX_BYTES`, re-listening per connection. 32 KB RX
+   buffer so the advertised window doesn't throttle. Drive (iperf3-free):
+   `head -c 64M /dev/zero | nc 192.168.4.1 9999` and read `[Lan] rx=`.
+3. **cyw43 TX-backpressure counter** — DONE (`CYW43_TX_BUSY` in `src/cyw43_phy.rs`,
+   incremented on `transmit()→None`). ⚠️ **Reframed after reading the cyw43
+   source:** there is **no observable RX-drop counter**. `Cyw43Phy::receive()→None`
+   is dominated by *idle polls* (the cyw43 `NetDriver::receive` returns `None`
+   whenever no RX frame is ready — hundreds/sec — and *also* when the TX half is
+   full; it can't be decomposed at the `phy` boundary), so counting it would be
+   noise, not drops. The *real* cyw43 RX drop happens **inside** cyw43's `Runner`
+   (`runner.rs`: `try_rx_buf()→None ⇒ silently drop + a defmt warn!` we don't
+   capture) — upstream of us, uncounted. So `transmit()→None` is the one genuine
+   TX-backpressure signal (high under `/bulk` ⇒ cyw43 TX is the wall), and the
+   **RX-side discriminator is sink-throughput-vs-`spi0`/`net0`** (step 4), not a
+   device counter: low sink kB/s + low core-0 ⇒ the air/radio; low sink kB/s +
+   pinned core 0 ⇒ we can't drain fast enough and cyw43 drops upstream. (This
+   replaces the "high RX-drop counter ⇒ buffering bug" matrix row with a
+   throughput+CPU read — same decision, different evidence.)
+4. **CPU during LAN-only load** — DONE: two router-gated `CycleSpan`s on core 0,
+   since step-2 `FWD_BUSY` only brackets forwarding (≈0 here). `CYW43_SPI_BUSY`
+   wraps the busy-poll gSPI transport (`PioSpiCyw43::cmd_read`/`cmd_write`, the
+   cyw43 Runner's real cost) → `spi0%`; `LAN_NET_BUSY` wraps `net_task`'s per-poll
+   body (smoltcp + handlers + `Cyw43Phy` channel ops) → `net0%`. `spi0+net0` ≈
+   core-0 utilisation under a LAN test; `spi0` high ⇒ the busy-poll transport is
+   CPU-bound (matrix row 3 → gSPI DMA, §4-G).
 
-**Independent baseline (rules out the `wlx` adapter / air):** iperf3 the host's
-`wlx` against a *known-good* AP (a normal router, same channel/distance). If the
-Pico's cyw43 LAN is far below that, the cyw43 (not the adapter/air) is the limit.
+**LAN-isolation run — RESULTS (2026-06-03, `--features router`, SWD-flashed; host
+`wlx` joined the AP, source-bound to the lease IP `192.168.4.10` so traffic takes
+table-100 → `wlx`, i.e. the cyw43 LAN, NOT the 10BT WAN):**
+
+| Direction | Throughput (client-measured) | core-0 `spi0` | `net0` | `cpu1` | notes |
+|---|---|---|---|---|---|
+| **idle** (no traffic) | — | **80–98%** | ~0.4% | ~40% (ambient 10BT) | `spi0` pegged *with zero traffic* |
+| **download** (`/bulk`, cyw43 **TX**) | **~168 KB/s** | ~90–95% | ~2% | ~40% | `txbusy` climbing (real TX backpressure) |
+| **upload** (`:9999` sink, cyw43 **RX**) | **~30 KB/s** | ~90% | ~1% | ~40% | `txbusy` frozen (RX-heavy; Pico only ACKs) |
+
+**Verdict — the ceiling is our gSPI TRANSPORT, not the 2.4 GHz radio (matrix row
+3 → §4-G, NOT radio modularization §4-B):**
+- **`spi0`≈80–98% even at idle** — the cyw43 `Runner` *active-polls* the chip over
+  gSPI continuously (its `wait_for_event` uses the default poll impl; the
+  host-wake IRQ line is **not wired** — see `PioSpiCyw43`). Core 0 is near-pegged
+  by the transport before any data moves.
+- **The gSPI clock is ~2 MHz** (`build_gspi_sm`, "slow + safe for bring-up", never
+  raised; embassy's `cyw43-pio` runs ~33 MHz). 2 MHz half-duplex = **~250 KB/s raw
+  bus ceiling** — and download (168 KB/s) sits right under it. The radio was never
+  the limiter; the bus was.
+- **Asymmetry (TX 168 ≫ RX 30):** inbound frames wait for the active-poll cycle to
+  notice them (no host-wake IRQ ⇒ RX latency), and each TCP ACK is a half-duplex
+  gSPI write stealing from reads. Both point back at the transport.
+- **Measurement-bug found + fixed mid-run:** the 1 Hz telemetry assumed each
+  `n%1000` window = 1.000 s, but core-0 saturation slips `usb_task`'s cadence, so
+  the first run over-read (`spi0=607%`, `cpu1=249%`, `tx=1137KB/s`). Fixed by
+  normalising every rate/% to the **measured** elapsed µs (`cycles::permille_over`);
+  re-run device `tx=174KB/s` now agrees with client `168KB/s`. (Also fixes the
+  pre-existing step-2 `cpu1/cpu0` under load.)
+
+**▶ The actionable lever is §4-G transport work, in priority order:** (1) **raise
+the gSPI clock** 2 MHz → toward ~33 MHz (≈16×, the single biggest win — lifts the
+raw ceiling), (2) **wire the cyw43 host-wake IRQ** so the Runner stops active-polling
+(frees core 0 + cuts RX latency), (3) **gSPI DMA** (offload the busy-poll). Radio
+modularization (§4-B) is **NOT** justified by this data — the air was never reached.
+
+**gSPI clock bump — CONFIRMED 2026-06-03** (`build_gspi_sm` `GSPI_PIO_HZ`
+4 MHz → 30 MHz, i.e. gSPI **2 → 15 MHz**, ÷8 at 240 MHz; cyw43 handshake still
+passes — `new=1 init=1 ap=1 net=1`, WAN/ping healthy, no instability):
+
+| Direction | 2 MHz gSPI | **15 MHz gSPI** | gain |
+|---|---|---|---|
+| download (cyw43 TX) | 168 KB/s | **909 KB/s** | **5.4×** |
+| upload (cyw43 RX) | 30 KB/s | **716 KB/s** | **24×** |
+| idle `spi0` | ~90% | ~72% | — |
+
+Both directions now ~700–900 KB/s — on par with the bare 10BT NIC (596–987 KB/s)
+and within the WAN's ~1.1 MB/s envelope, so **the cyw43 LAN is no longer the router
+bottleneck.** Proof-positive that the *transport clock* (not the radio) was the
+ceiling. Headroom remains: 15 MHz raw = 1.875 MB/s, so we're at ~48% (TX) / ~38%
+(RX) of raw — the rest is the active-polling overhead + half-duplex ACKs. Next
+levers: push gSPI → 30 MHz (÷4, optional — already beats the WAN), then **wire the
+host-wake IRQ** to reclaim the idle `spi0`≈72% (the Runner still active-polls — a
+core-0 + low-power win, no longer throughput-limiting). Uncommitted working tree.
+
+**Independent baseline (would further rule out the `wlx` adapter / air):** iperf3
+the host's `wlx` against a *known-good* AP (a normal router, same channel/distance).
+Not yet run — but the idle `spi0`≈90% + the 2 MHz bus ceiling already pin the limit
+on the transport regardless, so this is now confirmatory, not load-bearing.
 
 **Decision matrix (the radio-modularization gate, §4-B):**
 
 | Isolated LAN result | Interpretation | Action |
 |---|---|---|
-| ≫ 44 KB/s (multi-Mbit), low drops | routed slowness is the LAN↔WAN *interaction* (10BT half-duplex backpressure / MSS), not the radio | don't swap the radio; chase the interaction (MSS clamp §4-E, core balance §4-G) |
-| ≈ 44 KB/s, **high cyw43 RX/TX drops**, core 0 not pinned | cyw43 RX/TX *buffering/backpressure* is the wall | software fix (bigger RX queue / gSPI DMA §4-G) before any hardware |
-| ≈ 44 KB/s, low drops, **core 0 pinned** | the busy-poll cyw43 SPI transport is CPU-bound | gSPI DMA (§4-G) / core rebalance |
-| ≈ 44 KB/s, low drops, core 0 idle, ≈ the wlx-vs-good-AP ceiling too | the 2.4 GHz radio / air link is the real ceiling | **radio modularization (§4-B) is justified** |
+| ≫ 44 KB/s (multi-Mbit), low txbusy | routed slowness is the LAN↔WAN *interaction* (10BT half-duplex backpressure / MSS), not the radio | don't swap the radio; chase the interaction (MSS clamp §4-E, core balance §4-G) |
+| download (`/bulk`) ≈ low, **high `txbusy`**, core 0 not pinned | cyw43 *TX* buffering/backpressure is the wall | software fix (bigger TX queue / gSPI DMA §4-G) before any hardware |
+| up/down ≈ low, low txbusy, **core 0 pinned (`spi0`/`net0` high)** | the busy-poll cyw43 SPI transport is CPU-bound (can't drain fast enough → cyw43 drops RX upstream) | gSPI DMA (§4-G) / core rebalance |
+| up/down ≈ low, low txbusy, **core 0 idle**, ≈ the wlx-vs-good-AP ceiling too | the 2.4 GHz radio / air link is the real ceiling | **radio modularization (§4-B) is justified** |
 
 **Also characterize the download-wedge** (WAN→LAN bulk stalled + dropped the AP):
 cyw43 TX backpressure (the `transmit()`→`None` ⇒ drop-the-RX-frame path in
@@ -228,10 +310,25 @@ conntrack-pressure). The "real product" track (D) is independent + parallelizabl
   took the first numbers (§3.5). Headline: **routed TCP up ≈ 44 KB/s, Pico CPU
   idle (`core0=0.2%`) ⇒ link-limited, not CPU/forward-limited.** The bottleneck is
   the cyw43 LAN or the 10BT link.
-- **▶ NEXT:** §3.5 — **isolate the cyw43 LAN link** (LAN-only rig: no WAN/`$SRV`/
-  NAPT). Add the LAN bulk source + sink + cyw43 RX/TX drop counters, run the
-  decision matrix to tell "radio is the ceiling" (→ modularization §4-B) from "a
-  cyw43 RX/TX buffering bug" (→ software fix). Also root-cause the download-wedge.
+- **Step 4 — LAN-isolation instrumentation: BUILT + RUN 2026-06-03** (uncommitted
+  working tree). `/bulk` source + `:9999` sink + `CYW43_TX_BUSY` + `spi0`/`net0`
+  core-0 spans → a `[Lan]` CDC line + mgmt rows; all 4 configs + clippy clean.
+  **Flashed + measured** (§3.5 results table): download **168 KB/s**, upload **30
+  KB/s**, core-0 `spi0`≈90% (even ~90% at idle). **Verdict: the ceiling is the
+  ~2 MHz busy-poll gSPI transport, NOT the radio** → §4-G (raise gSPI clock / wire
+  host-wake IRQ / gSPI DMA), **not** radio modularization §4-B. Also fixed a
+  rate-normalisation bug (1 Hz window stretches under core-0 load → over-read;
+  now normalised to measured µs via `cycles::permille_over`).
+- **gSPI clock bump — DONE + CONFIRMED 2026-06-03** (`GSPI_PIO_HZ` 4→30 MHz =
+  gSPI 2→15 MHz): download **168→909 KB/s** (5.4×), upload **30→716 KB/s** (24×);
+  handshake/WAN/ping all healthy. The cyw43 LAN is no longer the router bottleneck
+  (now ~on par with the bare 10BT NIC). See the §3.5 results table.
+- **▶ NEXT:** (a) optional — push gSPI 15→30 MHz (÷4) for more headroom (already
+  beats the WAN, so low urgency); (b) **wire the cyw43 host-wake IRQ** so the
+  Runner stops active-polling — idle `spi0` is still ~72% (wasted core 0 + a
+  low-power cost), no longer throughput-limiting; (c) commit the LAN-isolation
+  instrumentation + the gSPI bump + the rate-normalisation fix (held for the
+  user). Optional confirmatory: iperf3 `wlx` vs a known-good AP — not load-bearing.
 - **Push held at the user's request.** Per git, local `main` is 2 ahead of
   `origin/main` (`1d1a1a1`): `a58d51f` (instr step 2) + the rig-split tooling
   (this). The older "`b32042d`/`0285e31` unpushed" note looks stale — `origin/main`
