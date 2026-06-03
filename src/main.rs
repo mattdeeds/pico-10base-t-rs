@@ -380,8 +380,11 @@ fn main_10bt(
 
     // Default: UDP echo + HTTP = 2 sockets (5 slots of headroom). The wan-dhcp
     // build adds 3 more (dhcpv4 + icmp + dns), so size for 8.
-    #[cfg(not(feature = "wan-dhcp"))]
+    #[cfg(all(not(feature = "wan-dhcp"), not(feature = "fd-bench")))]
     let mut sockets_storage: [SocketStorage; 5] = [SocketStorage::EMPTY; 5];
+    // fd-bench adds the port-9999 upload sink → one more socket slot.
+    #[cfg(all(not(feature = "wan-dhcp"), feature = "fd-bench"))]
+    let mut sockets_storage: [SocketStorage; 6] = [SocketStorage::EMPTY; 6];
     #[cfg(feature = "wan-dhcp")]
     let mut sockets_storage: [SocketStorage; 8] = [SocketStorage::EMPTY; 8];
     let mut sockets = SocketSet::new(&mut sockets_storage[..]);
@@ -418,6 +421,20 @@ fn main_10bt(
     let tcp_tx_buffer = tcp::SocketBuffer::new(&mut tcp_tx_storage[..]);
     let tcp_socket = tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer);
     let tcp_handle: SocketHandle = sockets.add(tcp_socket);
+
+    // fd-bench (full-duplex Tier-2): TCP upload sink on port 9999 — the host
+    // pushes bulk data INTO the device here while `http-bulk-test` streams OUT
+    // on :80, exercising the 10BT link in both directions at once. A big RX
+    // buffer keeps the receive window open so the host can fill the pipe.
+    #[cfg(feature = "fd-bench")]
+    let mut sink_rx_storage = [0u8; 32 * 1024];
+    #[cfg(feature = "fd-bench")]
+    let mut sink_tx_storage = [0u8; 2048];
+    #[cfg(feature = "fd-bench")]
+    let sink_handle: SocketHandle = sockets.add(tcp::Socket::new(
+        tcp::SocketBuffer::new(&mut sink_rx_storage[..]),
+        tcp::SocketBuffer::new(&mut sink_tx_storage[..]),
+    ));
 
     // R15a — WAN-as-DHCP-client sockets. Buffers live in this never-returning
     // fn's stack (same pattern as the udp/tcp buffers above), so the borrows the
@@ -526,6 +543,14 @@ fn main_10bt(
     #[cfg(feature = "http-bulk-test")]
     let mut http_bulk_state = HttpBulkState::Idle;
 
+    // fd-bench: per-second deltas for the [Sink] upload-RX-rate line. (The
+    // decode-ceiling signal under bidir load is the always-printed [Rx] fail/dec
+    // line; the mcycle cpu1 counters are router-gated and not worth un-gating.)
+    #[cfg(feature = "fd-bench")]
+    let mut fd_prev_sink: u32 = 0;
+    #[cfg(feature = "fd-bench")]
+    let mut fd_last_us: u64 = now0;
+
     loop {
         usb_dev.poll(&mut [&mut serial, &mut reset_iface]);
         // If a USB control transfer requested a reboot (e.g. picotool -f),
@@ -561,6 +586,9 @@ fn main_10bt(
         serve_http(&mut sockets, tcp_handle, log_tick, nlps_sent, udp_sent);
         #[cfg(feature = "http-bulk-test")]
         serve_http_bulk(&mut sockets, tcp_handle, &mut http_bulk_state);
+        // fd-bench: drain the port-9999 upload sink (counts bytes, re-listens).
+        #[cfg(feature = "fd-bench")]
+        serve_fd_sink(&mut sockets, sink_handle);
 
         // NLP every 16 ms — IEEE 802.3 link-integrity keepalive.
         if now >= next_nlp {
@@ -609,6 +637,21 @@ fn main_10bt(
             );
             #[cfg(feature = "wan-dhcp")]
             log_wan(&mut serial, &mut line, &wan);
+            // fd-bench: [Sink] upload RX rate, normalised to the measured window
+            // (the loop cadence can slip under load — same lesson as the cyw43
+            // [Lan] line). Pair with the [Rx] fail/dec line for the decode signal.
+            #[cfg(feature = "fd-bench")]
+            {
+                let elapsed_us = now.wrapping_sub(fd_last_us).max(1);
+                fd_last_us = now;
+                let sink_now = FD_SINK_RX.load(Ordering::Relaxed);
+                let d_sink = sink_now.wrapping_sub(fd_prev_sink);
+                fd_prev_sink = sink_now;
+                let rx_kbps = (d_sink as u64 * 1_000 / elapsed_us) as u32;
+                line.clear();
+                let _ = writeln!(line, "[Sink] rx={}KB/s total={}KB", rx_kbps, sink_now / 1024);
+                let _ = serial.write(line.as_bytes());
+            }
             nlps_sent = 0; // [R2b] reports nlps as a per-second rate
         }
     }
@@ -754,6 +797,34 @@ fn serve_http_bulk(
                 *state = HttpBulkState::Idle;
             }
         }
+    }
+}
+
+/// fd-bench (full-duplex Tier-2): cumulative bytes sunk on the port-9999 upload
+/// socket. Read once per second by the `[Sink]` heartbeat to derive an RX rate.
+#[cfg(feature = "fd-bench")]
+static FD_SINK_RX: AtomicU32 = AtomicU32::new(0);
+
+/// fd-bench: drain the TCP upload sink on port 9999 — discard + count the
+/// inbound bytes (no echo), and close on the peer's FIN so we re-listen for the
+/// next connection. The host pushes bulk here (`nc`/`dd`) concurrently with the
+/// :80 download, driving the 10BT link in both directions at once.
+#[cfg(feature = "fd-bench")]
+fn serve_fd_sink(sockets: &mut SocketSet, handle: SocketHandle) {
+    let socket = sockets.get_mut::<tcp::Socket>(handle);
+    if !socket.is_open() {
+        let _ = socket.listen(9999);
+        return;
+    }
+    if socket.may_recv() {
+        let n = socket.recv(|buf| (buf.len(), buf.len())).unwrap_or(0);
+        if n > 0 {
+            FD_SINK_RX.fetch_add(n as u32, Ordering::Relaxed);
+        }
+    }
+    // Peer finished sending (FIN) but our half is still open → close to re-listen.
+    if !socket.may_recv() && socket.may_send() {
+        socket.close();
     }
 }
 

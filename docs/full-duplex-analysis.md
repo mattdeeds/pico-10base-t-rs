@@ -175,18 +175,175 @@ drift or full-MTU decode reliability.
 
 ---
 
-## 7. Implementation sketch (if pursued)
+## 7. Forced-FD experiment spec
 
-1. **Prove it cheaply.** Add `full-duplex` feature flag → no-op the carrier-sense
-   + CSMA path (§4.2). Force the peer to 10M-FD via `ethtool` (§4.1 path 1). Run a
-   bidirectional TCP test; confirm FCS-OK stays clean and the gotcha-#10 collisions
-   in `/proc/net/dev` go to zero. **This validates the whole premise before any
-   negotiation work.**
-2. **Measure the real ceiling.** With collisions gone, characterize concurrent
-   TX+RX throughput and core-1 decode CPU under sustained bidirectional load —
-   confirm RX decode (not FD) is the limiter.
-3. **If worth productizing:** implement FLP auto-negotiation (§4.1 path 2) so it
-   works against an unconfigured switch without manual forcing.
+Prove §2 (half-duplex is policy, not a hardware wall) and quantify the gain by
+forcing both ends to 10M-FD and flipping a firmware FD mode that disables
+carrier-sense/CSMA. Grounded in the default-NIC build (static `192.168.37.24/24`;
+`http-bulk-test` already provides the download source; `CORE1_BUSY` already
+accumulates at `eth_mac.rs:342`; RX `fcs_fail` is the device-side collision proxy).
+Two tiers so the core hypothesis costs near-zero new code.
+
+### 7.0 Hypotheses
+
+| # | Hypothesis | Pass signal |
+|---|---|---|
+| **H1** | Collisions are MAC-policy, not physical | FD build → host `colls` ≈ 0, device `fcs_fail` drops to no-collision floor |
+| **H2** | FD removes turnaround/backoff on a single flow | FD download kB/s ≥ HD, no RTO variance |
+| **H3** | FD enables concurrent bidirectional throughput | FD (down+up at once) aggregate ≫ HD aggregate |
+| **H4** | The real ceiling is core-1 decode, not FD | `cpu1` saturates / `fcs_fail` climbs under sustained RX before line rate |
+
+### 7.1 Topology & prerequisites
+
+```
+[Linux host NIC] ──RJ45 (10BASE-T)── [HR911105A] ── ISL3177E ── Pico 2 (GP13/14)
+   192.168.37.x                                                  192.168.37.24
+```
+
+- **Use the NIC that the R4–R8 recipes already link at 10BASE-T.** Verify it
+  advertises full: `ethtool <if> | grep -A2 "Supported link modes"` lists
+  `10baseT/Full`.
+- **Top risk / hard prerequisite:** many modern NICs won't go to 10M at all.
+  Confirm a working 10M-FD-capable port (known-good NIC, USB-100M dongle, or a
+  managed switch port set "10 full") *before writing firmware.*
+- Forcing autoneg **off** can disable auto-MDIX — if link won't come up, try a
+  crossover cable or `ethtool -s <if> mdix on`.
+
+### 7.2 Firmware — Tier 1 (the MAC-mode gate; only variable under test)
+
+`Cargo.toml [features]`:
+```toml
+full-duplex = []   # disables carrier-sense + CSMA/CA; ONLY safe vs a forced-10-FD
+                   # peer (mismatch = worse than HD); default off → NIC binary byte-identical
+```
+Three gates in `src/eth_tx.rs` (transmit unconditionally in FD mode):
+- `csma_acquire()` in `send_raw_frame` → `#[cfg(not(feature = "full-duplex"))]`
+- `wait_carrier_idle()` in `send_udp_broadcast` → same gate
+- `wait_carrier_idle()` in `send_nlp` → same gate
+
+**Keep** NLPs (link integrity for the forced-10 link), IFG/TP_IDL padding, and the
+carrier-detect SM2 (harmless; leave it to minimize diff). Total Tier-1 delta ≈ 3
+one-line `cfg` gates.
+
+### 7.3 Firmware — Tier 2 (concurrent-bidirectional measurement, gated)
+
+Behind `full-duplex` (or an `fd-bench` sub-feature) so production stays untouched:
+- **Upload sink:** TCP listener on **port 9999**, read-drains + counts into a
+  `FD_SINK_RX` static, re-listens per connection — copy the wifi `serve_lan_sink`
+  pattern. Needs +1 `SocketStorage` (5→6) + a `[0u8; 32*1024]` rx buffer.
+- **Download source:** reuse existing `http-bulk-test` (1 MB on :80, 32 KB TX win).
+- **Telemetry on the NIC heartbeat:** add `cpu1=` via
+  `cycles::permille_over(CORE1_BUSY delta, elapsed_us)` + a `last_emit_us` (the
+  measured-window normalization from the [Lan] fix — do **not** assume a 1 s
+  window), plus `tx/rx KB/s` from the byte counters and `fcs_ok/fcs_fail`.
+
+### 7.4 Build matrix (duplex MUST match the build)
+
+| Run | Firmware | Host duplex | Tests |
+|---|---|---|---|
+| **A — HD control** | `--features http-bulk-test` | `autoneg on` (or forced 10-HD) | baseline |
+| **B — FD treatment** | `--features "http-bulk-test full-duplex"` | forced 10-FD | H1, H2 |
+| **C — FD bidir** (Tier 2) | B + sink | forced 10-FD | H3, H4 |
+
+A duplex mismatch (FD firmware ↔ HD host) is garbage, not a result. **Flash
+gotcha:** build the variant you flash *last* and verify the binary before each run.
+
+### 7.5 Host setup
+
+```bash
+IF=enpXsY
+sudo ip addr flush dev $IF; sudo ip addr add 192.168.37.1/24 dev $IF; sudo ip link set $IF up
+# Run A (HD):  sudo ethtool -s $IF autoneg on
+# Run B/C (FD): sudo ethtool -s $IF speed 10 duplex full autoneg off
+ethtool $IF | grep -E "Speed|Duplex|Link"   # expect 10Mb/s, Full, Link detected: yes
+```
+
+### 7.6 Measurement
+
+Proven `/proc/net/dev` method (gotcha-#10 work logged ~30 colls/curl in HD):
+```bash
+read_ctr(){ grep "$IF:" /proc/net/dev; ethtool -S $IF 2>/dev/null | grep -iE "colli|crc|abort|carrier"; }
+# H2 single flow (data down + ACKs up):
+read_ctr; curl -s -o /dev/null -w "down=%{speed_download}\n" http://192.168.37.24/; read_ctr
+# H3 concurrent bidir (Tier 2):
+curl -s -o /dev/null -w "down=%{speed_download}\n" http://192.168.37.24/ &
+dd if=/dev/zero bs=64k count=512 2>/dev/null | pv -b | nc -q1 192.168.37.24 9999; wait
+```
+Device side (CDC): `fcs_ok`/`fcs_fail` deltas (H1, H4), `cpu1=` under load (H4).
+Always cross-check device `tx/rx KB/s` against the host number (the [Lan]-fix lesson).
+
+### 7.7 Acceptance / decision gate
+
+- **H1 confirmed** (host colls→0, device fcs_fail→floor) ⇒ §2 proven on-wire; the
+  headline result on its own.
+- **H3 large** ⇒ **justifies building FLP auto-negotiation** (§4.1 path 2).
+- **H3 marginal** (decode-capped per H4, or unidirectional workload) ⇒ FD stays a
+  documented option; **do not** build auto-neg. Record numbers and stop.
+
+### 7.8 Risks & gotchas
+
+1. Host NIC can't do 10M-FD — the gating risk; verify first (§7.1).
+2. Link won't come up with autoneg off — MDIX/crossover fallback.
+3. Duplex mismatch — strictly pair build↔host; mismatch is garbage.
+4. Production byte-drift — `full-duplex` off by default; confirm the default NIC
+   binary is unchanged.
+5. `fcs_fail` has two sources — collisions *and* the clock-drift full-MTU tail.
+   Separate them: idle fcs_fail (drift only) vs under-contention (drift +
+   collisions); FD should null only the contention delta.
+
+**Effort:** Tier 1 ≈ ½ day (3 gates + host recipe; tests H1/H2 with no new
+measurement code). Tier 2 ≈ +½ day (sink + cpu1 telemetry; tests H3/H4).
+
+### 7.9 Results — RAN IT (2026-06-03)
+
+Ran Tier 1 + Tier 2 on-device: `enp1s0f0` (supports `10baseT/Full`) ↔ Pico 10BT,
+host duplex forced via `ethtool` to match the firmware mode each run. Builds:
+`http-bulk-test [+ fd-bench] [+ full-duplex]`, SWD-flashed; download = host `curl`
+of the 1 MB `/bulk`, upload = host `dd | nc … :9999` into the sink, collisions =
+`/proc/net/dev` deltas, device RX from the `[Rx]`/`[Sink]` CDC lines.
+
+**Single flow (download, ~unidirectional), per 10 MB:**
+
+| | HD (host Half) | FD (host Full) |
+|---|---|---|
+| download avg (range) | 619 (341–998) | 567 (335–981) |
+| host TX collisions | 5 | **0** |
+| device RX `fcs_fail` | ~5–6 /s | ~2–10 /s (**unchanged**) |
+
+**Concurrent bidirectional (download + bulk upload at once):**
+
+| | HD (host Half) | FD (host Full) |
+|---|---|---|
+| download avg (range) | **434** (147–917) | **736** (204–1004) |
+| host TX collisions | 8 | **0** |
+| upload solo ceiling | — | ~102 KB/s (steady, `dec≈140/s`) |
+
+**Verdict:**
+- **H1 ✅ confirmed on-wire** — forcing both ends to 10-Full drove host collisions
+  to **0** and carried full transfers. The board IS full-duplex-capable; HD was a
+  MAC policy. §2 validated empirically.
+- **H2 ❌ no single-flow gain** — 619→567 (noise). With CSMA/CA already in the HD
+  build, collisions were already rare (~0.5/MB), so removing them moves nothing on
+  a ~unidirectional flow.
+- **H3 ✅ qualified — FD helps the *contended* case** — under concurrent up+down,
+  FD download **736 vs 434 (+70 %)** with **0 vs 8** collisions: in HD the heavy
+  upload collides with the download and craters it; FD avoids that (this is §6's
+  predicted win, invisible to the single-flow H2). **But bounded:** the upload
+  (device RX of bulk) is **RX-decode-capped at ~102 KB/s regardless of duplex** and
+  stalls under concurrency in *both* modes, so FD protects the download from
+  collision-collapse rather than unlocking a 2× aggregate.
+- **H4 ✅✅ strongly — RX decode is THE ceiling.** Device `fcs_fail` is identical
+  HD↔FD (~5/s → it's clock-drift, not collisions), and **device RX-of-bulk tops out
+  ~102 KB/s — ~9× below device TX (~970)**. That TX/RX asymmetry is a notable
+  standalone characterization finding (the upload path, never measured before).
+
+**Decision (§7.7 gate): do NOT build FLP auto-negotiation now.** FD's throughput
+value is real but confined to the contended / multi-client case, requires FLP
+auto-neg (a real new subsystem) to be practical, and is bounded by the RX-decode
+ceiling. The higher-leverage move is **fixing RX decode** (the existing CPU-DPLL
+track) — it lifts the ~102 KB/s upload ceiling *and* helps every case. Keep FD
+documented as a contended-case lever; the experiment harness (`full-duplex` +
+`fd-bench` features) stays in-tree, off by default, for re-running later.
 
 ---
 
@@ -202,9 +359,18 @@ drift or full-MTU decode reliability.
 
 ## 9. Where it sits on the value/effort curve
 
-**Re-ranked upward** after the hardware correction: this is firmware + negotiation,
-not a board respin. The cheap proof (step 1) is a day of work and directly attacks
-the documented bidirectional-TCP limiter. Versus radio modularization (§4-B, now
-*not* justified — the cyw43 LAN ceiling was the gSPI transport clock, since fixed)
-and the other §4-G levers, a forced-FD proof-of-concept is high-information for low
-cost. Full FLP auto-negotiation is the larger, optional follow-on.
+**Settled by the §7.9 experiment.** The forced-FD proof-of-concept was the
+high-information / low-cost move, and it ran: FD is real (H1) and helps the
+contended bidirectional case (H3, +70 % download under concurrent load, zero
+collisions) — but it gives nothing on single flows (H2) and is bounded by the
+RX-decode ceiling (H4: device RX-of-bulk ~102 KB/s, ~9× below TX).
+
+**Net: FD is a *secondary* lever, not the next move.** Pursuing it for throughput
+would mean building FLP auto-negotiation (a real subsystem) for a win that only
+materialises under concurrent/multi-client load and is still capped by RX decode.
+The **primary lever is RX decode** (the existing CPU-DPLL track): it lifts the
+~102 KB/s upload ceiling *and* improves every case, FD or not. Radio
+modularization (§4-B) remains *not* justified (the cyw43 LAN ceiling was the gSPI
+clock, since fixed). Keep the `full-duplex` + `fd-bench` experiment harness in-tree
+(off by default) so FD can be revisited cheaply once RX decode is faster — at which
+point FD's contended-case win would actually have headroom to matter.

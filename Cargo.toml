@@ -46,6 +46,26 @@ clock-150mhz = []
 # silent SFD-lock failures) is confirmed and the gap is paper-only.
 http-bulk-test = []
 
+# Experiment: 10BASE-T full-duplex MAC mode (docs/full-duplex-analysis.md §7).
+# The board's ISL3177E transceiver is full-duplex-capable; half-duplex is a MAC
+# *policy*. This flag disables that policy — the carrier-sense (Phase 3d) +
+# CSMA/CA backoff (Phase 3e) in eth_tx.rs — so TX no longer defers to RX carrier.
+# ONLY safe when the link partner is also forced to 10M full-duplex
+# (`ethtool -s <if> speed 10 duplex full autoneg off`); a duplex mismatch is
+# WORSE than half-duplex. OFF by default → the production NIC binary is unchanged.
+full-duplex = []
+
+# Experiment harness for the full-duplex Tier-2 measurement
+# (docs/full-duplex-analysis.md §7.3): adds a TCP *upload sink* on port 9999
+# (read-drains + counts bytes, re-listens per connection) so a host can push
+# bulk data INTO the device while `http-bulk-test` streams bulk OUT — i.e. drive
+# the 10BT link hard in BOTH directions at once to measure the concurrent
+# (H3) aggregate + the core-1 decode ceiling (H4). Also emits a `[Sink]` CDC
+# line (bytes sunk + core-1 `cpu1`). Enable for BOTH the HD-bidir control and
+# the FD-bidir run; combine with `full-duplex` only for the FD run. Default off
+# → production NIC binary unchanged.
+fd-bench = []
+
 # R15a — make the 10BASE-T (WAN) side a DHCP *client* (instead of the static
 # 192.168.37.24): smoltcp's dhcpv4 client gets us an upstream IP + default route
 # + DNS, and the device originates a ping to 8.8.8.8 + resolves a name to prove

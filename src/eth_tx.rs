@@ -37,6 +37,7 @@ const MAX_TX_FRAME: usize = 1526;
 /// active. Flags 0–3 are readable by the CPU; we don't enable its system
 /// interrupt, so it's purely a status bit the TX path polls. See
 /// `carrier_present` / `wait_carrier_idle`.
+#[cfg_attr(feature = "full-duplex", allow(dead_code))] // HD-only MAC; unused in FD mode
 const CARRIER_IRQ_FLAG: u8 = 0;
 
 /// Upper bound on how long a `send_*` call will defer for carrier (Phase 3d).
@@ -44,6 +45,7 @@ const CARRIER_IRQ_FLAG: u8 = 0;
 /// bounded so a stuck-busy flag (RO noise / detector bug) degrades to
 /// "no carrier-sense" rather than wedging TX entirely. Counted in poll
 /// iterations of the PIO IRQ register, not wall-clock — rough by design.
+#[cfg_attr(feature = "full-duplex", allow(dead_code))] // HD-only MAC; unused in FD mode
 const CARRIER_WAIT_SPINS: u32 = 200_000;
 
 /// Phase 3e — CSMA/CA randomized backoff (collision *avoidance*).
@@ -56,11 +58,14 @@ const CARRIER_WAIT_SPINS: u32 = 200_000;
 /// each TCP frame desyncs us from the host so one clearly wins the wire.
 ///
 /// One backoff "slot" in CPU spin cycles (~1 µs @ 240 MHz / ~1.6 µs @ 150).
+#[cfg_attr(feature = "full-duplex", allow(dead_code))] // HD-only MAC; unused in FD mode
 const CSMA_SLOT_CYCLES: u32 = 240;
 /// Backoff window mask: random 0..=15 slots (~0–15 µs) per attempt.
+#[cfg_attr(feature = "full-duplex", allow(dead_code))] // HD-only MAC; unused in FD mode
 const CSMA_BACKOFF_MASK: u32 = 0x0F;
 /// Bounded CSMA attempts before transmitting anyway (so a persistently busy
 /// wire can't wedge TX — same safety stance as `CARRIER_WAIT_SPINS`).
+#[cfg_attr(feature = "full-duplex", allow(dead_code))] // HD-only MAC; unused in FD mode
 const CSMA_MAX_ATTEMPTS: u32 = 10;
 
 /// PIO TX state machine handle. We hold onto the running StateMachine so that
@@ -75,6 +80,7 @@ pub struct EthTx {
     /// xorshift32 state for the Phase-3e CSMA/CA random backoff. Seeded to a
     /// fixed nonzero constant — the absolute sequence doesn't matter, only
     /// that our backoffs vary independently of the host's frame timing.
+    #[cfg_attr(feature = "full-duplex", allow(dead_code))] // unused in FD mode (no CSMA)
     lfsr: u32,
     /// Scratch buffer the UDP broadcast builder assembles into before the
     /// per-byte Manchester FIFO writes. Owned here (was a `static mut`) so
@@ -82,6 +88,11 @@ pub struct EthTx {
     raw_frame: [u8; MAX_TX_FRAME],
 }
 
+// In `full-duplex` mode the half-duplex MAC helpers (`wait_carrier_idle`,
+// `csma_acquire`, `carrier_present`, `next_rand`) are uncalled — the carrier-sense
+// + CSMA/CA gates are `#[cfg]`-disabled (see the call sites). Allow them to remain
+// defined (HD is still the default build) without a dead-code warning under FD.
+#[cfg_attr(feature = "full-duplex", allow(dead_code))]
 impl EthTx {
     /// Initialize the TX PIO program (PIO0 SM0) + the carrier-detect SM
     /// (PIO0 SM2, Phase 3d). `tx_pin_id` drives the ISL3177E DI input
@@ -261,7 +272,11 @@ impl EthTx {
     /// FIFO availability and so could be preempted mid-loop).
     pub fn send_nlp(&mut self) {
         // Carrier-sense before transmitting (Phase 3d) — don't drive an NLP
-        // on top of an in-flight host frame.
+        // on top of an in-flight host frame. Skipped in `full-duplex` mode:
+        // on a forced-10-FD link RX carrier is the peer's traffic on a
+        // separate pair, so there's nothing to defer to (see
+        // docs/full-duplex-analysis.md §7).
+        #[cfg(not(feature = "full-duplex"))]
         Self::wait_carrier_idle();
         critical_section::with(|_| {
             let _ = self.tx.write(0x0000_000A_u32);
@@ -305,6 +320,13 @@ impl EthTx {
         // interrupts enabled. This is the path the curl's TCP segments take, so
         // it's where the gotcha-#10 collisions concentrate; the random backoff
         // desyncs us from the host's ACKs after the wire frees.
+        //
+        // Skipped in `full-duplex` mode: with both ends forced to 10M-FD there
+        // is no shared collision domain, so we transmit immediately regardless
+        // of RX carrier — the whole point of the experiment
+        // (docs/full-duplex-analysis.md §7). ONLY correct against a forced-FD
+        // peer; a duplex mismatch corrupts both directions.
+        #[cfg(not(feature = "full-duplex"))]
         self.csma_acquire();
 
         critical_section::with(|_| {
@@ -353,7 +375,9 @@ impl EthTx {
             build_eth_ipv4_udp_frame(ep, payload, &mut self.raw_frame, self.ip_identifier);
         self.ip_identifier = self.ip_identifier.wrapping_add(1);
 
-        // Carrier-sense before grabbing the wire (Phase 3d).
+        // Carrier-sense before grabbing the wire (Phase 3d). Skipped in
+        // `full-duplex` mode (docs/full-duplex-analysis.md §7).
+        #[cfg(not(feature = "full-duplex"))]
         Self::wait_carrier_idle();
 
         // Critical section: same reason as send_raw_frame — keep the
