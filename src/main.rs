@@ -550,8 +550,16 @@ fn main_10bt(
     let mut fd_prev_sink: u32 = 0;
     #[cfg(feature = "fd-bench")]
     let mut fd_last_us: u64 = now0;
+    // fd-bench: main-loop iteration counter — discriminates a loop/max_burst rate
+    // cap (iters/s ≈ frames/s) from a TCP-level cap (loop fast, frames/s low).
+    #[cfg(feature = "fd-bench")]
+    let mut fd_loop_iters: u32 = 0;
 
     loop {
+        #[cfg(feature = "fd-bench")]
+        {
+            fd_loop_iters = fd_loop_iters.wrapping_add(1);
+        }
         usb_dev.poll(&mut [&mut serial, &mut reset_iface]);
         // If a USB control transfer requested a reboot (e.g. picotool -f),
         // honor it from clean main-loop context so the STATUS stage of
@@ -648,8 +656,14 @@ fn main_10bt(
                 let d_sink = sink_now.wrapping_sub(fd_prev_sink);
                 fd_prev_sink = sink_now;
                 let rx_kbps = (d_sink as u64 * 1_000 / elapsed_us) as u32;
+                let iters_per_s = (fd_loop_iters as u64 * 1_000_000 / elapsed_us) as u32;
+                fd_loop_iters = 0;
                 line.clear();
-                let _ = writeln!(line, "[Sink] rx={}KB/s total={}KB", rx_kbps, sink_now / 1024);
+                let _ = writeln!(
+                    line,
+                    "[Sink] rx={}KB/s total={}KB loop={}/s",
+                    rx_kbps, sink_now / 1024, iters_per_s
+                );
                 let _ = serial.write(line.as_bytes());
             }
             nlps_sent = 0; // [R2b] reports nlps as a per-second rate
