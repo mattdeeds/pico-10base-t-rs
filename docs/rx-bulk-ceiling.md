@@ -9,11 +9,12 @@ A **secondary receive-window ceiling** (~1–2 segments in flight) surfaces once
 is removed. **The intuitive MSS-clamp fix was tested and REFUTED** (§5) — small
 frames decode clean but hit the window ceiling at *lower* throughput (34 KB/s).
 
-**Status:** characterization + MSS-clamp + frame-rate-ceiling experiments done
-(2026-06-03). Follow-on from the full-duplex experiment
+**Status:** characterization + MSS-clamp + frame-rate-ceiling + decode-fix
+experiments done (2026-06-03). Follow-on from the full-duplex experiment
 (`docs/full-duplex-analysis.md` §7.9 / H4), which surfaced the ~102 KB/s figure.
-**Primary fix = the CPU-DPLL decoder** (`docs/clock-recovery-decoder-plan.md`,
-`docs/cpu-dpll-plan.md`); then the receive-window depth (§5).
+**The decode loss is PHY-limited (§8) — the firmware decoder is near its floor;
+the durable fix is a hardware PHY**, not more decoder work
+(`docs/cpu-dpll-plan.md` §9d).
 
 ---
 
@@ -118,10 +119,12 @@ Clamping removes decode loss but trades it for the receive-window ceiling at *lo
 absolute throughput (smaller frames). **Conclusion: do not clamp MSS.**
 
 Real levers, in priority order:
-1. **Fix full-MTU decode (the primary lever).** Eliminating the 32 % FCS loss stops
-   the cwnd collapse → throughput rises toward the window ceiling. The CPU-DPLL
-   clock-recovery track (`docs/cpu-dpll-plan.md`). This is the one that matters for
-   real (full-MTU) bulk.
+1. **Fix full-MTU decode — but it's PHY-limited (firmware near-exhausted; see §8).**
+   Eliminating the FCS loss would stop the cwnd collapse, but `cpu-dpll-plan.md` §9d
+   already showed the residual is **analog PHY noise** (flat per-byte error profile,
+   ~5.8e-5/bit), and the §8 offline experiment confirms a noise-robust (matched-
+   filter) bit decision gives no net gain. **The durable fix is hardware** (a real
+   Ethernet PHY / better analog front-end), not the firmware decoder.
 2. **Then raise the receive-window / in-flight depth.** Once loss is gone, the
    ~1–2-segment in-flight cap (rwnd or app pacing) becomes the limit — investigate
    smoltcp's advertised window vs the 32 KB sink buffer (and whether window scaling
@@ -144,13 +147,39 @@ this matters.
 
 ## 7. Next steps
 
-- **Fix full-MTU decode (the primary lever).** Removing the 32 % FCS loss stops the
-  cwnd collapse → throughput rises toward the window ceiling. CPU-DPLL clock
-  recovery (`docs/cpu-dpll-plan.md`). Re-measure RX-of-bulk + the §3 curve + `ss`
-  cwnd/retrans after.
-- **Then raise receive-window / in-flight depth** (§4) — once loss is gone the
-  ~1–2-segment cap bites; check smoltcp's advertised window vs the 32 KB sink buffer
-  and whether window scaling is off.
+- **Decode is PHY-limited (§8) — the durable fix is HARDWARE** (a real Ethernet PHY
+  / better analog front-end). The firmware edge-track decoder is near its floor.
+- **One rigorous check before fully closing the firmware door:** the on-device fail
+  rate varies (≈50 % at light load §9d vs 28–72 % this session) — if part is
+  *load-dependent* (not pure PHY) it'd be firmware-addressable. Confirm by re-running
+  the §9d per-byte-error dump **under sustained bulk load** (instrumentation
+  recoverable from commits `ab72c89..f0253c8`); a flat profile = pure PHY, a
+  ramp/cliff = a firmware-fixable load component.
+- **Receive-window / in-flight depth** (§4) — secondary; only matters once loss is
+  gone (i.e. after a PHY fix). Cheap to check smoltcp's window vs the 32 KB buffer.
 - **Repro + root-cause the sustained-full-MTU hang** (§6); add the RP2350 watchdog.
 - **Ruled out, don't pursue:** `max_burst_size`/main-loop (107 K iters/s), RTT
-  (3 ms), and MSS clamp (refuted, §5).
+  (3 ms), MSS clamp (§5), and a naive matched-filter decision (§8).
+
+## 8. Decode-fix investigation — PHY-limited (firmware near-exhausted)
+
+The full-MTU FCS loss that drives the §4 cwnd collapse is **analog PHY noise**, not
+a decoder bug:
+
+- **Prior (`cpu-dpll-plan.md` §9d):** the edge-track DPLL is offline-validated
+  perfect (FCS N/N on the corpus) and fits the IRQ budget. On-device it gets ~50 %
+  full-MTU; a failed-frame **per-byte error dump was FLAT** (~0.1–1.1 %, ~5.8e-5/bit),
+  matching iid noise statistics — verdict *"as good as it can get against this PHY."*
+- **This session (offline `tools/clock-recovery/noise_compare.py`):** tested the one
+  untried firmware lever — a **matched-filter (integrate-both-half-bits) bit
+  decision** vs the current single-sample (`tr-1`) — by injecting per-sample noise
+  into the corpus. At the operating point it gives **no net gain** (p=3e-4: edge 33 %
+  vs MF 31 %) and is *worse* on clean for some frames (66 % vs 100 %) because half-bit
+  integration needs precise half-bit phase that varies frame-to-frame, while `tr-1`
+  sits robustly at the half-bit centre. (iid noise is an upper bound — real
+  correlated/baseline-wander noise helps the MF even less.)
+
+**Conclusion:** firmware decode is near its floor. The remaining firmware avenue (a
+full NCO-phase-tracked matched filter) is complex and §9d predicts marginal returns.
+The high-value lever for full-MTU RX is a **hardware PHY** — ties to the
+`docs/full-duplex-analysis.md` "real PHY" option and any board respin.
