@@ -16,6 +16,7 @@ set -u
 cd "$(dirname "$0")"; . ./rig-env.sh
 
 [ "$(id -u)" = 0 ] || { echo "must run as root (sudo tools/router-rig-up.sh)"; exit 1; }
+[ "$SRV" = CHANGE_ME ] && { echo "set SRV to the separate WAN host's IP, e.g.:  SRV=192.168.0.50 tools/router-rig-up.sh"; exit 1; }
 
 echo "== associate + lease the Wi-Fi client ($WLAN -> $AP_SSID) =="
 pkill -f "wpa_supplicant.*$WLAN" 2>/dev/null; sleep 0.3
@@ -33,12 +34,23 @@ LEASE_IP=$(grep -oP 'fixed-address \K[0-9.]+' /tmp/rt.leases | tail -1); LEASE_I
 ip addr add "$LEASE_IP/24" dev "$WLAN" 2>/dev/null
 echo "  client IP = $LEASE_IP"
 
-# Route ONLY the iperf server through the Pico (more-specific than the eno1
-# default). `replace` is idempotent across re-runs.
-ip route replace "$SRV/32" via "$GW" dev "$WLAN"
-echo "  route: $SRV/32 via $GW dev $WLAN"
+# Route the iperf server through the Pico, but ONLY for traffic this host
+# *originates* as the client (src = $LEASE_IP). A plain main-table /32 also
+# catches the packets this host *forwards* as the WAN gateway — the Pico's
+# NAT'd frames (src = the Pico's WAN IP) — and bounces them back to the Pico to
+# be re-NAT'd, an infinite loop (this one host is BOTH the client and the
+# gateway). Source policy routing scopes the /32 to client-originated traffic;
+# forwarded traffic falls through to `main` (→ out eno1 to the real server).
+RT_TABLE="${RT_TABLE:-100}"
+ip route del "$SRV/32" 2>/dev/null || true                      # drop any stale main-table /32
+ip rule del from "$LEASE_IP" lookup "$RT_TABLE" 2>/dev/null || true   # idempotent re-run
+ip rule add from "$LEASE_IP" lookup "$RT_TABLE"
+ip route replace "${GW%.*}.0/24" dev "$WLAN" table "$RT_TABLE"  # on-link, so the nexthop resolves
+ip route replace "$SRV/32" via "$GW" dev "$WLAN" table "$RT_TABLE"
+echo "  route: $SRV/32 via $GW dev $WLAN (table $RT_TABLE, from $LEASE_IP only — no gateway-forward loop)"
 
-# Hand the leased client IP to the (non-root) measurement step, world-readable.
-printf 'LEASE_IP=%s\n' "$LEASE_IP" > "$RIG_ENV_FILE"
+# Hand the leased client IP + the resolved server to the (non-root) measurement
+# step, world-readable, so it uses the same values without re-deriving them.
+{ printf 'LEASE_IP=%s\n' "$LEASE_IP"; printf 'SRV=%s\n' "$SRV"; printf 'RT_TABLE=%s\n' "$RT_TABLE"; } > "$RIG_ENV_FILE"
 chmod 0644 "$RIG_ENV_FILE"
-echo "wrote $RIG_ENV_FILE -- now run (NO root):  tools/router-measure.sh"
+echo "wrote $RIG_ENV_FILE (LEASE_IP=$LEASE_IP SRV=$SRV RT_TABLE=$RT_TABLE) -- now run (NO root):  tools/router-measure.sh"

@@ -6,10 +6,14 @@
 #   sudo tools/router-rig-down.sh
 set -u
 cd "$(dirname "$0")"; . ./rig-env.sh
+[ -f "$RIG_ENV_FILE" ] && . "$RIG_ENV_FILE"   # pulls LEASE_IP + RT_TABLE from rig-up
 
 [ "$(id -u)" = 0 ] || { echo "must run as root (sudo tools/router-rig-down.sh)"; exit 1; }
 
-ip route del "$SRV/32" via "$GW" dev "$WLAN" 2>/dev/null || true
+RT_TABLE="${RT_TABLE:-100}"
+ip rule del from "${LEASE_IP:-192.168.4.10}" lookup "$RT_TABLE" 2>/dev/null || true
+ip route flush table "$RT_TABLE" 2>/dev/null || true
+ip route del "$SRV/32" 2>/dev/null || true   # belt-and-suspenders if a main-table /32 lingers
 pkill -f "wpa_supplicant.*$WLAN" 2>/dev/null || true
 ip addr flush dev "$WLAN" 2>/dev/null || true
 ip link set "$WLAN" down 2>/dev/null || true
