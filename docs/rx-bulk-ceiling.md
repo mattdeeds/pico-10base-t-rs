@@ -16,6 +16,14 @@ experiments done (2026-06-03). Follow-on from the full-duplex experiment
 the durable fix is a hardware PHY**, not more decoder work
 (`docs/cpu-dpll-plan.md` §9d).
 
+> **DECISION (2026-06-03): ACCEPTED — track closed.** RX-of-bulk stays ~100 KB/s;
+> this is a PHY limit, not a firmware bug worth more decoder effort. The device is
+> solid for low-rate / small-frame traffic; bulk RX is the documented ceiling. The
+> durable fix (a real Ethernet PHY) is **deferred to a future board revision**, not
+> scheduled. Still open (firmware, separate): the sustained-full-MTU **hang** (§6) →
+> add the RP2350 watchdog. The optional load-dependence re-check (§7) was not run —
+> we accepted the PHY-limited verdict on the existing §9d + §8 evidence.
+
 ---
 
 ## 1. Why this matters
