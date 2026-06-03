@@ -336,6 +336,8 @@ of the 1 MB `/bulk`, upload = host `dd | nc … :9999` into the sink, collisions
   HD↔FD (~5/s → it's clock-drift, not collisions), and **device RX-of-bulk tops out
   ~102 KB/s — ~9× below device TX (~970)**. That TX/RX asymmetry is a notable
   standalone characterization finding (the upload path, never measured before).
+  **Now characterized in `docs/rx-bulk-ceiling.md`:** cause is full-MTU FCS-fail
+  (clock drift) — clean ≤512 B, cliff to ~72 % at 1472 B; not inbox/DMA/window.
 
 **Decision (§7.7 gate): do NOT build FLP auto-negotiation now.** FD's throughput
 value is real but confined to the contended / multi-client case, requires FLP
