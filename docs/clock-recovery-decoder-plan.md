@@ -46,7 +46,10 @@ a bit (3 samples → 50% errors) is reached at `k ≈ 3/(6δ)` bits. The observe
 at ~byte 1050 (≈8400 bits) ⇒ **δ ≈ 60 ppm** — squarely inside 10BASE-T's
 ±100 ppm spec. So this is a *normal* clock offset, not a defect: the decoder
 fundamentally needs clock recovery. **Firmware-fixable; not the analog PHY, and
-full-duplex hardware would not address it.**
+orthogonal to duplex mode — drift would persist on a full-duplex link too** (the
+board's ISL3177E transceiver is full-duplex-*capable*; FD is a MAC/negotiation
+choice, not a hardware swap, and doesn't address clock recovery — see
+`docs/full-duplex-analysis.md`).
 
 ## 2. Goal & success criteria
 
