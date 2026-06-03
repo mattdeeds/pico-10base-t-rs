@@ -101,6 +101,77 @@ per-client fairness, conntrack pressure (`cthwm` vs `CT_CAP=64`), AP stability.
 
 ---
 
+## 3.5 — Isolating the cyw43 LAN link (NEXT — the first routed run pointed here)
+
+**First routed run, 2026-06-03** (rig = this host as Wi-Fi client `wlx` + WAN
+gateway `enp1s0f0`, iperf3 server on a separate `192.168.0.80` via `eno1`):
+
+- A **rig routing loop** had to be fixed first — the `/32 SRV-via-Pico` route
+  (for the client) also caught the packets this host *forwards as the gateway*
+  (the Pico's NAT'd frames), bouncing them back to the Pico to be re-NAT'd in a
+  loop (this one host is both client AND gateway). Fixed with **source policy
+  routing** (`ip rule from $LEASE_IP lookup 100`) in the rig scripts. See
+  `perf-char-step3-rig-loop` memory. The forwarding code is byte-identical to the
+  validated R19a — it was never the bug.
+- Post-fix the routed path works: ICMP 4/4, clean TCP handshake, `[Nat] out≈in`.
+  **Routed TCP upload ≈ 349 Kbit/s (~44 KB/s)**, lossy (SACK recovery, ~13
+  retr/3s). **TCP download (WAN→LAN bulk) stalls and *wedged* the cyw43 LAN**
+  (client lost the AP; the Pico stayed up `ap=1 net=1`, no panic) — a separate
+  robustness item.
+- **Key: the Pico was nearly idle** — `core0(forward)=0.2%`, `core1≈34%` (the
+  ambient-10BT-decode baseline), forward drops negligible during the clean run
+  (`nh +3 qf +1`; the large `nh`/`macmiss=192.168.4.1` was stale loop-era
+  residue). So the ~13× gap vs the bare-10BT 596–987 kB/s is **NOT** the Hazard3
+  cores or the NAPT/forward path. The loss is in the **cyw43 Wi-Fi LAN or the
+  10BT WAN link**, uncounted by `FWD_DROP`.
+
+**Why isolate the LAN:** the routed path conflates LAN(wifi)+forward+WAN(10BT);
+the 10BT alone does 596–987 kB/s, so the prime suspect is the cyw43 RX/TX path.
+44 KB/s is *suspiciously* low for 2.4 GHz 11n — must distinguish "cyw43's real
+ceiling" from "a loss/buffering bug under burst." **The LAN-only rig is far
+simpler than §3:** no WAN host, no `$SRV`, no `/32`, no NAPT — just `wlx` ↔ the
+Pico AP, traffic terminating *on the Pico* (none of the loop/double-NAT fragility).
+
+**Instrumentation to add (router/feature-gated, like steps 1–2):**
+1. **LAN bulk *source*** (download = Pico→client, cyw43 TX): a `/bulk` route in
+   `wireless::serve_status_http` that streams a fixed N-MB body — mirror
+   `main.rs`'s `serve_http_bulk`/`HttpBulkState` (the 10BT `http-bulk-test`
+   endpoint). `curl http://192.168.4.1/bulk >/dev/null` ⇒ pure cyw43 TX kB/s.
+2. **LAN *sink*** (upload = client→Pico, cyw43 RX): a TCP socket on a dedicated
+   port in `net_task` that read-drains + counts bytes (no echo). ⇒ pure cyw43 RX
+   kB/s. Drive with `nc`/`curl -T`/a socket script (iperf3-free).
+3. **cyw43 RX/TX drop counters** in `src/cyw43_phy.rs` (`Cyw43Phy`): count
+   `receive()` yielding `None` under backlog and `transmit()` yielding `None`
+   (TX-not-ready / backpressure), surfaced on `[Perf]`/mgmt. **The key
+   discriminator** — high RX-drop under upload ⇒ cyw43 RX buffering is the wall
+   (software-fixable); near-zero drops + low CPU + low throughput ⇒ the air/radio
+   is the real ceiling.
+4. **CPU during LAN-only load:** read `cpu0` (cyw43 Runner + busy-poll SPI
+   transport + `net_task` all live on core 0). Step-2 `FWD_BUSY` only brackets
+   forwarding (zero here) — add a span around the cyw43 poll/Runner, or a
+   total-core-0 span, to catch the driver's cost.
+
+**Independent baseline (rules out the `wlx` adapter / air):** iperf3 the host's
+`wlx` against a *known-good* AP (a normal router, same channel/distance). If the
+Pico's cyw43 LAN is far below that, the cyw43 (not the adapter/air) is the limit.
+
+**Decision matrix (the radio-modularization gate, §4-B):**
+
+| Isolated LAN result | Interpretation | Action |
+|---|---|---|
+| ≫ 44 KB/s (multi-Mbit), low drops | routed slowness is the LAN↔WAN *interaction* (10BT half-duplex backpressure / MSS), not the radio | don't swap the radio; chase the interaction (MSS clamp §4-E, core balance §4-G) |
+| ≈ 44 KB/s, **high cyw43 RX/TX drops**, core 0 not pinned | cyw43 RX/TX *buffering/backpressure* is the wall | software fix (bigger RX queue / gSPI DMA §4-G) before any hardware |
+| ≈ 44 KB/s, low drops, **core 0 pinned** | the busy-poll cyw43 SPI transport is CPU-bound | gSPI DMA (§4-G) / core rebalance |
+| ≈ 44 KB/s, low drops, core 0 idle, ≈ the wlx-vs-good-AP ceiling too | the 2.4 GHz radio / air link is the real ceiling | **radio modularization (§4-B) is justified** |
+
+**Also characterize the download-wedge** (WAN→LAN bulk stalled + dropped the AP):
+cyw43 TX backpressure (the `transmit()`→`None` ⇒ drop-the-RX-frame path in
+`forward.rs::receive`), the `WAN_TO_LAN` channel (depth 4) saturating, or the AP
+dropping the client under load? The LAN bulk *source* test (#1) exercises cyw43 TX
+in isolation — if it also stalls/wedges, the TX path is implicated, not the WAN.
+
+---
+
 ## 4. Broader backlog (brainstorm 2026-06-02, with decisions)
 
 The user's three + additions. Decisions captured: **radio-modular is
@@ -152,9 +223,15 @@ conntrack-pressure). The "real product" track (D) is independent + parallelizabl
   clean, SWD-flashed + idle-validated (fields render; `cpu1≈42% cpu0≈0.3%` at idle —
   core 1 already busy decoding ambient 10BT, see the surprise finding above). The
   counters can only be *meaningfully* exercised under load (§3).
-- **▶ NEXT:** bring the rig up (`wan-test-host.sh` + `iperf3`), run
-  `tools/router-throughput.sh`, watch `cpu1`/`cpu0` under routed load, fill in §3,
-  name the bottleneck.
+- **Step 3 (first routed run): DONE 2026-06-03** — fixed the rig loop (source
+  policy routing, in the committed rig scripts), got the routed path working, and
+  took the first numbers (§3.5). Headline: **routed TCP up ≈ 44 KB/s, Pico CPU
+  idle (`core0=0.2%`) ⇒ link-limited, not CPU/forward-limited.** The bottleneck is
+  the cyw43 LAN or the 10BT link.
+- **▶ NEXT:** §3.5 — **isolate the cyw43 LAN link** (LAN-only rig: no WAN/`$SRV`/
+  NAPT). Add the LAN bulk source + sink + cyw43 RX/TX drop counters, run the
+  decision matrix to tell "radio is the ceiling" (→ modularization §4-B) from "a
+  cyw43 RX/TX buffering bug" (→ software fix). Also root-cause the download-wedge.
 - **Push held at the user's request.** Per git, local `main` is 2 ahead of
   `origin/main` (`1d1a1a1`): `a58d51f` (instr step 2) + the rig-split tooling
   (this). The older "`b32042d`/`0285e31` unpushed" note looks stale — `origin/main`
