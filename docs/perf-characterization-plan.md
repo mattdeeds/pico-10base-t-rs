@@ -69,10 +69,21 @@ always `wrapping_sub` deltas.
 
 ## 3. The measurement run (gated on the rig)
 
-Needs: `tools/wan-test-host.sh` up (Pico holds a WAN lease) **+ `apt install
-iperf3`** on the host. Then run **`tools/router-throughput.sh`** (route-safe: only
-the `wlx` iface + a `/32` to the iperf server via the Pico; untested until first
-live run — refine then).
+Needs: `tools/wan-test-host.sh` up (Pico holds a WAN lease); `iperf3` is already
+installed. The rig is split **route-1 style** so the recurring measurement needs
+no root (shared config in `tools/rig-env.sh`):
+- **`sudo tools/router-rig-up.sh`** — *one-time root*: associate this host's Wi-Fi
+  client to the Pico AP, lease an IP, install the `/32` route to `$SRV` via the
+  Pico (route-safe — never touches the eno1 default / SSH). Leaves it associated +
+  writes the client IP to `/tmp/pico-rig.env`.
+- **`tools/router-measure.sh`** — *NO root, repeatable* (Claude can drive this):
+  iperf3 server + client over the routed/NAT'd path (TCP down/up + UDP) + before/
+  after mgmt-page snaps (`Forward|Bytes|Queue|NAT:|CPU:`).
+- **`sudo tools/router-rig-down.sh`** — *root*: remove the route + deassociate.
+
+`tools/router-throughput.sh` remains an all-as-root convenience wrapper
+(rig-up → measure → rig-down). Untested end-to-end until the first live run —
+refine then.
 
 Record, idle vs under each load:
 - routed **TCP** up (client→WAN) + down (WAN→client) kB/s
@@ -144,5 +155,7 @@ conntrack-pressure). The "real product" track (D) is independent + parallelizabl
 - **▶ NEXT:** bring the rig up (`wan-test-host.sh` + `iperf3`), run
   `tools/router-throughput.sh`, watch `cpu1`/`cpu0` under routed load, fill in §3,
   name the bottleneck.
-- **3 commits unpushed on `main`:** `b32042d` (low-power doc) + `0285e31` (instr
-  step 1) + the step-2 commit (this) — push held at the user's request.
+- **Push held at the user's request.** Per git, local `main` is 2 ahead of
+  `origin/main` (`1d1a1a1`): `a58d51f` (instr step 2) + the rig-split tooling
+  (this). The older "`b32042d`/`0285e31` unpushed" note looks stale — `origin/main`
+  already contains both (confirm with `git fetch`).
