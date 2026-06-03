@@ -911,6 +911,19 @@ fn cdc_write_all(
     }
 }
 
+/// RX-hang watchdog feeder (see [`crate::WDT_TIMEOUT_US`]). A dedicated task so a
+/// stalled executor (the observed core-0 hang under sustained full-MTU RX) stops
+/// feeding → the hardware watchdog reboots the chip and it self-recovers. Feeds
+/// every [`crate::WDT_FEED_MS`], well inside the timeout; owns the started
+/// `Watchdog` by value.
+#[embassy_executor::task]
+async fn watchdog_feed_task(wd: hal::Watchdog) -> ! {
+    loop {
+        wd.feed();
+        embassy_time::Timer::after(embassy_time::Duration::from_millis(crate::WDT_FEED_MS)).await;
+    }
+}
+
 /// USB poll loop, in the executor. Keeps CDC + the picotool reset interface
 /// serviced while the executor owns core 0 (so `cargo run`/`picotool -f` still
 /// reboot us into BOOTSEL), and emits a 1 Hz `[Cyw43]` status line so the cyw43
@@ -1537,6 +1550,7 @@ pub fn run(
     usb_dpram: hal::pac::USB_DPRAM,
     usb_clock: hal::clocks::UsbClock,
     resets: &mut hal::pac::RESETS,
+    mut watchdog: hal::Watchdog,
 ) -> ! {
     let (usb_dev, serial, reset_iface) = build_usb(usb, usb_dpram, usb_clock, resets);
 
@@ -1554,9 +1568,15 @@ pub fn run(
         &mut *(*p).as_mut_ptr()
     };
 
+    // RX-hang watchdog: arm before the executor runs (see run_router).
+    watchdog.start(hal::fugit::MicrosDurationU32::micros(crate::WDT_TIMEOUT_US));
+
     executor.run(|spawner| {
         // embassy-executor 0.10's `#[task]` macro returns a `Result` (the task
         // arena slot can be exhausted); spawn the startup tasks.
+        if let Ok(t) = watchdog_feed_task(watchdog) {
+            spawner.spawn(t);
+        }
         if let Ok(t) = usb_task(usb_dev, serial, reset_iface) {
             spawner.spawn(t);
         }
@@ -1731,6 +1751,7 @@ pub fn run_router(
     usb_dpram: hal::pac::USB_DPRAM,
     usb_clock: hal::clocks::UsbClock,
     resets: &mut hal::pac::RESETS,
+    mut watchdog: hal::Watchdog,
 ) -> ! {
     WAN_CORE1_OK.store(core1_ok as u32, Ordering::Relaxed);
     let (usb_dev, serial, reset_iface) = build_usb(usb, usb_dpram, usb_clock, resets);
@@ -1747,7 +1768,15 @@ pub fn run_router(
         &mut *(*p).as_mut_ptr()
     };
 
+    // RX-hang watchdog: arm before the executor runs; the feeder task (first
+    // spawned below) pets it every WDT_FEED_MS. If the executor stops scheduling
+    // (the observed core-0 hang under sustained full-MTU RX) it reboots us.
+    watchdog.start(hal::fugit::MicrosDurationU32::micros(crate::WDT_TIMEOUT_US));
+
     executor.run(|spawner| {
+        if let Ok(t) = watchdog_feed_task(watchdog) {
+            spawner.spawn(t);
+        }
         if let Ok(t) = usb_task(usb_dev, serial, reset_iface) {
             spawner.spawn(t);
         }

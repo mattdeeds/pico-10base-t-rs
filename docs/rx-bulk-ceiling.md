@@ -149,9 +149,21 @@ but USB stayed enumerated and SWD still worked; a reflash/reset recovered it
 cleanly. Rate-limiting (~400 pps UDP) and small frames (the clamp runs) avoided it,
 so it correlates with **sustained full-MTU inbound volume**, not a specific size.
 No `inbox_drop`/`carry_cap` preceded it → the hang is elsewhere (decode/IRQ
-livelock or a panic; no watchdog is enabled). Needs a dedicated repro + the RP2350
-watchdog (backlog §4-F). DoS-shaped, but full-MTU bulk RX is normal traffic, so
-this matters.
+livelock or a panic). DoS-shaped, but full-MTU bulk RX is normal traffic, so this
+matters.
+
+**RECOVERY DONE (2026-06-03): RP2350 hardware watchdog added** (`main.rs`
+`WDT_TIMEOUT_US` = 6 s; fed from the core-0 poll loop on the NIC build and a
+dedicated `watchdog_feed_task` on the router/wireless executor). The device now
+**self-reboots + recovers** if the loop/executor wedges, instead of needing a
+manual SWD reflash. Validated on-device: (a) **no false-trip** — `t`/`hb` climb
+continuously past the timeout under idle + heavy flood/upload stress (NIC and
+router builds); (b) **fires + recovers** — a deliberate-stall test build (stop
+feeding after 15 s) rebooted ~6 s later (USB re-enumerated, `t` reset to 1). The
+intermittent hang itself did **not** reproduce across three flood/upload attempts
+this session, so it wasn't observed being recovered directly — but the watchdog is
+armed and the firing path is proven. **Still OPEN: root-cause the hang** (it's a
+recovery, not a fix) + a reliable repro (backlog §4-F).
 
 ## 7. Next steps
 
@@ -165,7 +177,8 @@ this matters.
   ramp/cliff = a firmware-fixable load component.
 - **Receive-window / in-flight depth** (§4) — secondary; only matters once loss is
   gone (i.e. after a PHY fix). Cheap to check smoltcp's window vs the 32 KB buffer.
-- **Repro + root-cause the sustained-full-MTU hang** (§6); add the RP2350 watchdog.
+- **The sustained-full-MTU hang (§6): RP2350 watchdog DONE** (recovery validated).
+  Still open: a reliable repro + root-cause (the watchdog recovers it, doesn't fix it).
 - **Ruled out, don't pursue:** `max_burst_size`/main-loop (107 K iters/s), RTT
   (3 ms), MSS clamp (§5), and a naive matched-filter decision (§8).
 

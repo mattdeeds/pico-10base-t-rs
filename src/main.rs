@@ -113,6 +113,18 @@ pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 /// Pico 2 board has a 12 MHz crystal.
 const XTAL_FREQ_HZ: u32 = 12_000_000u32;
 
+/// RX-hang watchdog (`docs/rx-bulk-ceiling.md` §6): the device has wedged under
+/// sustained full-MTU inbound (link drops / no NLPs, CDC silent, only
+/// SWD-recoverable). The RP2350 hardware watchdog reboots the chip if the main
+/// loop / executor stops feeding it, so the device self-recovers instead of
+/// needing a manual reflash. Fed from the core-0 poll loop (NIC build) or a
+/// dedicated executor task (router/wireless). 6 s timeout (HAL max ~8.38 s), fed
+/// every [`WDT_FEED_MS`] → ~12× margin over any legitimate core-0 stall (TX
+/// critical section ~50 µs, cyw43 gSPI bursts ~ms) so it never false-reboots.
+pub const WDT_TIMEOUT_US: u32 = 6_000_000;
+/// Watchdog feed interval for the executor builds' dedicated feeder task.
+pub const WDT_FEED_MS: u64 = 500;
+
 /// Phase 2d v3 — 240 MHz overclock. VCO 1200 MHz / (5 × 1) = 240 MHz.
 /// Integer PIO dividers at this clock: TX 20 MHz = ÷12, RX 60 MHz = ÷4
 /// (no fractional jitter). Recovery via SWD if flash gets corrupted at the
@@ -251,6 +263,7 @@ fn main() -> ! {
 
         wireless::run_router(
             mac, core1_ok, pwr, spi, pac.USB, pac.USB_DPRAM, clocks.usb_clock, &mut pac.RESETS,
+            watchdog,
         );
     }
 
@@ -268,13 +281,14 @@ fn main() -> ! {
         let sys_clk_hz_w = clocks.system_clock.freq().to_Hz();
         let pwr = pins.gpio23.into_push_pull_output();
         let spi = wireless::PioSpiCyw43::new(&mut pio1, pio1_sm0, sys_clk_hz_w);
-        wireless::run(pwr, spi, pac.USB, pac.USB_DPRAM, clocks.usb_clock, &mut pac.RESETS);
+        wireless::run(pwr, spi, pac.USB, pac.USB_DPRAM, clocks.usb_clock, &mut pac.RESETS, watchdog);
     }
 
     // ── 10BASE-T NIC image (default build). Exactly one arm is compiled per build.
     #[cfg(not(feature = "wireless"))]
     main_10bt(
         pac.PIO0, pac.DMA, pac.PSM, pac.USB, pac.USB_DPRAM, pac.RESETS, sio.fifo, clocks, pins, timer,
+        watchdog,
     );
 }
 
@@ -349,6 +363,7 @@ fn main_10bt(
     clocks: hal::clocks::ClocksManager,
     pins: hal::gpio::Pins,
     timer: hal::Timer<hal::timer::CopyableTimer0>,
+    mut watchdog: hal::Watchdog,
 ) -> ! {
     let mut led = pins.gpio25.into_push_pull_output();
 
@@ -555,7 +570,12 @@ fn main_10bt(
     #[cfg(feature = "fd-bench")]
     let mut fd_loop_iters: u32 = 0;
 
+    // Arm the RX-hang watchdog (see WDT_TIMEOUT_US); fed at the top of every loop
+    // iteration below. If the poll loop wedges, the chip reboots and recovers.
+    watchdog.start(hal::fugit::MicrosDurationU32::micros(WDT_TIMEOUT_US));
+
     loop {
+        watchdog.feed();
         #[cfg(feature = "fd-bench")]
         {
             fd_loop_iters = fd_loop_iters.wrapping_add(1);
