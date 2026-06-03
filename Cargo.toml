@@ -66,6 +66,13 @@ full-duplex = []
 # → production NIC binary unchanged.
 fd-bench = []
 
+# Experiment (docs/rx-bulk-ceiling.md §5): clamp the 10BT IP MTU (eth_mac::MTU)
+# so smoltcp advertises a small TCP MSS → peers send sub-knee segments, keeping
+# inbound frames below the ~600 B on-wire clock-drift decode cliff. Tests whether
+# that lifts RX-of-bulk past the ~100 KB/s ceiling without touching the decoder.
+# Default off → production MTU (1500) unchanged.
+mss-clamp = []
+
 # R15a — make the 10BASE-T (WAN) side a DHCP *client* (instead of the static
 # 192.168.37.24): smoltcp's dhcpv4 client gets us an upstream IP + default route
 # + DNS, and the device originates a ping to 8.8.8.8 + resolves a name to prove

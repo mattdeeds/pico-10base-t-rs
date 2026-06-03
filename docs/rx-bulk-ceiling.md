@@ -1,15 +1,19 @@
 # RX-of-bulk decode ceiling — characterization
 
 **One-liner:** the device receives bulk TCP at only **~100 KB/s** (vs ~970 KB/s
-for TX) because **full-MTU inbound frames fail FCS at a high, clock-drift-driven
-rate** — clean (~3–4 %) up to ~512 B, then a **cliff** to tens-of-% by ~700 B and
-**~72 %** at full-MTU (1472 B). It is **not** inbox/DMA/window-limited. This is the
-documented clock-recovery decoder ceiling, now isolated on the RX-of-bulk path.
+for TX) due to **two stacked limits** (§4): a **primary ~150 good-frames/s rate
+ceiling** (size-independent — prime suspect smoltcp `max_burst_size = Some(1)` /
+the HD ACK-TX path) and a **secondary ~30 % full-MTU FCS-fail tax** from clock
+drift (clean ~3–4 % up to ~512 B, cliff to ~72 % at full-MTU). It is **not**
+inbox/DMA/window-limited. **The intuitive MSS-clamp fix was tested and REFUTED**
+(§5) — smaller frames decode clean but goodput drops 3× because the rate ceiling
+is size-independent.
 
-**Status:** first characterization milestone (2026-06-03). Follow-on from the
-full-duplex experiment (`docs/full-duplex-analysis.md` §7.9 / H4), which surfaced
-the ~102 KB/s figure. Root-cause track = the CPU-DPLL decoder
-(`docs/clock-recovery-decoder-plan.md`, `docs/cpu-dpll-plan.md`).
+**Status:** characterization + MSS-clamp experiment done (2026-06-03). Follow-on
+from the full-duplex experiment (`docs/full-duplex-analysis.md` §7.9 / H4), which
+surfaced the ~102 KB/s figure. Decode-fix track = the CPU-DPLL decoder
+(`docs/clock-recovery-decoder-plan.md`, `docs/cpu-dpll-plan.md`); the bigger lever
+is the rate ceiling (§5).
 
 ---
 
@@ -74,40 +78,71 @@ same mechanism `docs/clock-recovery-decoder-plan.md` §1 models (50 % errors at
   real TCP bulk — tighter inter-frame spacing likely starves the decoder's per-frame
   re-acquire. Both confirm "full-MTU fails badly"; the exact % is size × rate × δ.
 
-## 4. Why this caps RX-of-bulk at ~100 KB/s
+## 4. Why this caps RX-of-bulk at ~100 KB/s — TWO limits (revised)
 
-Real bulk traffic is full-MTU. At ~28–72 % frame loss, TCP can't sustain a window —
-constant retransmits + cwnd collapse — so goodput settles at ~100 KB/s (and the
-"ok" frames at that rate are ~half retransmits). The wire sits mostly idle; the
-limit is purely decode reliability, not bandwidth.
+The MSS-clamp experiment (§5) revised this. There are **two** stacked limits, and
+decode-fail is the *smaller* one:
 
-## 5. Mitigations
+1. **PRIMARY — a ~150 good-frames/s rate ceiling, independent of frame size.**
+   Across MTU 500/1000/1500 the device delivered a near-constant **~136–152 good
+   frames/s** (`[Rx] ok/s`). So goodput ≈ `frame_rate × payload`, and the wire sits
+   ~idle (150 × 1526 B ≈ 230 KB/s ≪ 1.25 MB/s line). The cause is per-frame, not
+   bandwidth — prime suspect `eth_mac.rs:442` **`max_burst_size = Some(1)`**
+   (smoltcp processes one packet per `poll()`, so RX is capped by the main-loop
+   iteration rate), and/or the half-duplex ACK-TX carrier-wait stalling each
+   iteration.
+2. **SECONDARY — a decode-fail tax at full-MTU (~30 %).** The §3 clock-drift cliff
+   costs ~28–32 % of full-MTU frames → retransmits, knocking the full-MTU number
+   from a potential ~140 down to ~99 KB/s.
 
-1. **Fix the decoder (the real fix).** Better clock recovery so full-MTU frames
-   decode — the existing CPU-DPLL-on-core-1 track (`docs/cpu-dpll-plan.md`). Lifts
-   the ceiling for *all* RX, not just bulk.
-2. **TCP MSS clamp (cheap partial mitigation).** Clamp the advertised MSS so on-wire
-   frames stay **below the knee (~512 B)**, where loss is ~3–4 % (TCP-survivable).
-   Trades per-frame efficiency for staying out of the failure region — could lift
-   RX-of-bulk substantially without touching the decoder. Ties to backlog §4-E
-   (`docs/perf-characterization-plan.md`). Caveat: the knee is δ-dependent, so clamp
-   conservatively, and this only helps RX (TX is already fine).
+Goodput model `≈ frame_rate × payload × (1−loss)` fits all three rows in §5.
+
+## 5. Mitigations — MSS clamp TESTED and REFUTED
+
+**TCP MSS clamp (was the leading "cheap fix") does NOT work — it makes throughput
+worse.** Measured on-device (`mss-clamp` feature lowers `eth_mac::MTU` → smoltcp
+advertises a smaller MSS → peer sends sub-knee frames; bulk upload into the :9999
+sink):
+
+| device MTU | on-wire frame | RX FCS-fail | **upload goodput** |
+|---|---|---|---|
+| 500  | ~526 B | **~0 %** | **34 KB/s** |
+| 1000 | ~1026 B | ~1–13 % | **68 KB/s** |
+| 1500 | ~1526 B | ~32 % | **99 KB/s** |
+
+Clamping cleaned decode (32 %→0 %) but **cut throughput 3×** — because the ~150
+frames/s ceiling is size-independent, so smaller frames just carry less. Bigger
+frames win even with loss. **Conclusion: do not clamp MSS.**
+
+Real levers, in priority order:
+1. **Lift the ~150 frames/s ceiling (the big win).** Investigate
+   `max_burst_size = Some(1)` (let smoltcp drain multiple frames per poll), the
+   main-loop per-iteration cost, and the HD ACK-TX carrier-wait. This raises *all*
+   frame sizes proportionally and is independent of decode.
+2. **Fix full-MTU decode (removes the ~30 % tax).** The CPU-DPLL clock-recovery
+   track (`docs/cpu-dpll-plan.md`) — would take the full-MTU number from ~99 toward
+   the frame-rate ceiling (~140+). Complementary to lever 1.
 
 ## 6. Robustness bug found (separate)
 
-A **sustained max-rate full-MTU UDP flood hung the device** — link dropped (no
-NLPs → host `Link detected: no`), CDC went silent, but USB stayed enumerated and
-SWD still worked; a reflash/reset recovered it cleanly. Rate-limiting (~400 pps)
-avoided it, so it's **saturation-related, not size-related**. No `inbox_drop`/
-`carry_cap` preceded it, so the hang is elsewhere (decode/IRQ livelock or a panic
-without the watchdog — none is enabled). Worth a dedicated repro + a hardware
-watchdog (backlog §4-F). Not a normal-traffic risk, but a DoS-shaped one.
+A **sustained full-MTU inbound stream hung the device** — first seen under a
+max-rate UDP flood, then **again during a full-MTU TCP bulk upload** (the MTU-1500
+baseline run): link dropped (no NLPs → host `Link detected: no`), CDC went silent,
+but USB stayed enumerated and SWD still worked; a reflash/reset recovered it
+cleanly. Rate-limiting (~400 pps UDP) and small frames (the clamp runs) avoided it,
+so it correlates with **sustained full-MTU inbound volume**, not a specific size.
+No `inbox_drop`/`carry_cap` preceded it → the hang is elsewhere (decode/IRQ
+livelock or a panic; no watchdog is enabled). Needs a dedicated repro + the RP2350
+watchdog (backlog §4-F). DoS-shaped, but full-MTU bulk RX is normal traffic, so
+this matters.
 
 ## 7. Next steps
 
-- Confirm the MSS-clamp win: clamp to ~512 B and re-measure RX-of-bulk (cheap, could
-  be a big practical lever before the decoder work).
-- Decoder: the CPU-DPLL track is the durable fix — re-measure this curve after.
-- Repro + root-cause the saturation hang (§6); add the RP2350 watchdog.
-- Optional: instrument core-1 decode cycles/frame vs size (the router-gated mcycle
-  `CycleSpan`) to correlate decode cost with the fail cliff.
+- **Chase the ~150 frames/s rate ceiling (highest leverage).** Try
+  `max_burst_size` > 1 (drain several frames per `iface.poll`) and/or profile the
+  main-loop per-iteration cost + the HD ACK-TX carrier-wait; re-measure RX-of-bulk.
+  This is size-independent so it lifts every case.
+- **Decode fix** (CPU-DPLL, `docs/cpu-dpll-plan.md`) — removes the ~30 % full-MTU
+  tax; re-measure the §3 curve after. Complementary to the rate-ceiling work.
+- **Repro + root-cause the sustained-full-MTU hang** (§6); add the RP2350 watchdog.
+- MSS clamp: **done, refuted** (§5) — do not pursue.

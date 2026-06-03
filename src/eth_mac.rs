@@ -35,7 +35,17 @@ use rp235x_hal::sio::Spinlock;
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 
+#[cfg(not(feature = "mss-clamp"))]
 pub const MTU: usize = 1500;
+/// Experiment (`docs/rx-bulk-ceiling.md` §5): clamp the advertised IP MTU so our
+/// SYN/SYN-ACK advertises a small TCP MSS (≈ MTU−40) → peers send sub-knee
+/// segments (on-wire frame ≈ MTU+26 B; the RX decode cliff starts ~600 B on-wire).
+/// Tests whether keeping inbound frames below the clock-drift cliff lifts
+/// RX-of-bulk past the ~100 KB/s ceiling. Only `max_transmission_unit` uses this
+/// const (no buffers), so clamping is safe; default off → production unchanged.
+/// 500 → MSS ≈ 460, on-wire ≈ 526 B (clean ~3-4 % decode region).
+#[cfg(feature = "mss-clamp")]
+pub const MTU: usize = 500;
 /// Slack over 1518-byte max Ethernet frame; decoder allocates this much.
 pub const MAX_FRAME_BYTES: usize = 1600;
 /// How many decoded frames the inbox can hold before back-pressure forces
