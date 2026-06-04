@@ -765,10 +765,15 @@ enum LanHttp {
     Bulk { remaining: usize, header_sent: bool },
 }
 
-// R14.2 AP parameters (dev defaults for the LAN-side bring-up). WPA2 passphrase
-// must be 8..=63 bytes. 2.4 GHz channel 6. These become configurable later.
-const AP_SSID: &str = "pico-rp2350-router";
-const AP_PASSPHRASE: &str = "picorouter2350";
+// AP parameters for the LAN-side cyw43 access point.
+//
+// ⚠️  CHANGE THESE before deploying — they are compiled into the firmware. The
+// passphrase is a PLACEHOLDER; shipping a real default WPA2 passphrase publicly
+// would let anyone join a device flashed with defaults. WPA2 passphrase must be
+// 8..=63 bytes; 2.4 GHz channel. (Runtime/flash config is a future enhancement —
+// for now edit these and rebuild.)
+const AP_SSID: &str = "pico-10bt-router";
+const AP_PASSPHRASE: &str = "change-me-please";
 const AP_CHANNEL: u8 = 6;
 
 /// R13 Step 3 — full cyw43 bring-up via `block_on`: `cyw43::new()` (firmware +

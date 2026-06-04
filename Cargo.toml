@@ -3,7 +3,13 @@ name = "pico-10base-t-rs"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
-description = "10BASE-T Ethernet TX+RX on Pico 2 (RP2350 Hazard3) using ISL3177E + magnetics"
+description = "Software 10BASE-T Ethernet (PIO bit-bang TX + RX) and a wireless router on the Raspberry Pi Pico 2 W (RP2350 Hazard3 RISC-V)"
+authors = ["mattdeeds"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mattdeeds/pico-10base-t-rs"
+readme = "README.md"
+keywords = ["rp2350", "10base-t", "ethernet", "pio", "embedded"]
+categories = ["embedded", "no-std", "network-programming"]
 
 [features]
 # Verbose per-second diagnostics over USB CDC: the [Mac] TX-categorization
