@@ -3,7 +3,8 @@
 **Progress:** Phase 1 ✅ (`b2c8d99`) · Phase 2 ✅ (`f910d0b`) · Phase 3 ✅ (`6ef58b8`) ·
 Phase 4 ✅ (committed `cdc_read.py`/`lan_upload.py` + `tools/README.md`; scrubbed the
 old AP creds from `rig-env.sh`/`r18-lan-validate.sh`; CI deferred — optional) ·
-Phase 5 (publish: fresh-clone build test, tag v0.1.0, flip public).
+Phase 5 ✅ (fresh-clone build of all 4 configs passes; Cargo.lock now committed for
+reproducibility; tagged v0.1.0). **Remaining: owner flips the repo public.**
 
 Wrapping the project for public sharing (2026-06-03). Decisions locked:
 

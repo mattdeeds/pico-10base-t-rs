@@ -1,4 +1,5 @@
 /target
-Cargo.lock
 *.uf2
 *.elf
+# Cargo.lock IS committed — this is an application/binary crate, so pin the exact
+# dependency versions for reproducible builds.
