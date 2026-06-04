@@ -1,7 +1,8 @@
 # Release / open-source prep checklist
 
-**Progress:** Phase 1 ✅ (`b2c8d99`) · Phase 2 ✅ (`docs/performance.md`) · Phase 3
-(README + docs index) next · Phase 4 (tooling) · Phase 5 (publish).
+**Progress:** Phase 1 ✅ (`b2c8d99`) · Phase 2 ✅ (`f910d0b`) · Phase 3 ✅ (README +
+`docs/README.md` index; RESUME.md kept as dev notes) · Phase 4 (tooling) next ·
+Phase 5 (publish: fresh-clone build, tag v0.1.0, flip public).
 
 Wrapping the project for public sharing (2026-06-03). Decisions locked:
 
