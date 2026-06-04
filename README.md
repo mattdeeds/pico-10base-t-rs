@@ -41,6 +41,8 @@ Full detail + method in **[`docs/performance.md`](docs/performance.md)**. Headli
 
 ## Hardware
 
+![The 10BASE-T front-end board (ISL3177E + HR911105A) on a breadboard with a Pico 2, a Pico 2 W alongside, and an Ethernet cable plugged in](hardware/board.jpg)
+
 - **Raspberry Pi Pico 2 W** (RP2350). The plain 10BASE-T NIC build also runs on a
   non-W Pico 2; the Wi-Fi/router builds need the W (cyw43).
 - **External 10BASE-T front end:** an **ISL3177E** transceiver + **HR911105A** RJ45
