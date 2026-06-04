@@ -1,5 +1,8 @@
 # Release / open-source prep checklist
 
+**Progress:** Phase 1 ✅ (`b2c8d99`) · Phase 2 ✅ (`docs/performance.md`) · Phase 3
+(README + docs index) next · Phase 4 (tooling) · Phase 5 (publish).
+
 Wrapping the project for public sharing (2026-06-03). Decisions locked:
 
 - **Structure:** one binary, feature-gated — default build = standalone software
