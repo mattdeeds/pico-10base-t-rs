@@ -6,3 +6,6 @@
 
 # Internal dev checkpoint — kept locally, not published
 /RESUME.md
+
+# Claude Code local config (permission allowlist) — kept locally, not published
+/.claude/settings.json
