@@ -1,22 +1,24 @@
 # pico-10base-t-rs
 
-**Software 10BASE-T Ethernet (PIO bit-bang TX *and* RX) and a working wireless
-router on the Raspberry Pi Pico 2 W** — RP2350, dual **Hazard3 RISC-V** cores,
-pure Rust (`no_std`), no embassy-rp. A `~$5` micro talks 10 Mbit Ethernet to a real
-network with nothing but PIO, DMA, a transceiver, and magnetics.
+**Software 10BASE-T Ethernet (PIO bit-bang TX *and* RX) and wireless
+router on the Raspberry Pi Pico 2 W**. Uses the dual **Hazard3 RISC-V** cores with pure Rust (`no_std`).
+A `~$5` micro talks 10 Mbit Ethernet to a real
+network with PIO, DMA, a RS-485 transceiver, and magnetics.
 
-Rust descendant of [kingyoPiyo/Pico-10BASE-T](https://github.com/kingyoPiyo/Pico-10BASE-T)
-(the original C/PIO TX+RX design), rebuilt on `rp235x-hal` and exposed as a
-[smoltcp](https://github.com/smoltcp-rs/smoltcp) `phy::Device`, then grown into a
-NAPT router with a cyw43 Wi-Fi AP.
+Rust port of [C project](https://github.com/mattdeeds/Pico-10BASE-T), which extended
+[kingyoPiyo/Pico-10BASE-T](https://github.com/kingyoPiyo/Pico-10BASE-T) (the
+original C/PIO Manchester **TX-only** design) with a **RX** path — Manchester
+decode over an RS-485 transceiver. This Rust rewrite runs on `rp235x-hal`, exposes
+the NIC as a [smoltcp](https://github.com/smoltcp-rs/smoltcp) `phy::Device`, then
+grows into a NAPT router with a cyw43 Wi-Fi AP.
 
-## Two things in one repo
+## Two builds
 
 The build features give you either layer with no code changes:
 
-- **A standalone software 10BASE-T NIC** (default build) — the bit-bang PHY +
+- **A standalone software 10BASE-T NIC** (default build): the bit-bang PHY +
   smoltcp. A static-IP host that does ARP / ICMP / UDP / a tiny HTTP server.
-- **A wireless router** (`--features router`) — the same 10BASE-T as the WAN, a
+- **A wireless router** (`--features router`): the same 10BASE-T as the WAN, a
   cyw43 2.4 GHz AP as the LAN, with L3 forwarding + NAPT between them, a DHCP
   server, and a status page.
 
@@ -28,22 +30,21 @@ Full detail + method in **[`docs/performance.md`](docs/performance.md)**. Headli
 | Path | Throughput | Note |
 |---|---|---|
 | 10BASE-T **TX** (device→host, TCP) | best **~0.95–1.0 MB/s**, typical ~0.4–0.7 | near line rate when clean; half-duplex collision variance |
-| 10BASE-T **RX** (host→device, TCP bulk) | **~100 KB/s** | decode/PHY-limited — the binding ceiling |
+| 10BASE-T **RX** (host→device, TCP bulk) | **~100 KB/s** | decode/PHY-limited |
 | 10BASE-T latency | **~2.6 ms**, 0% loss | |
 | Wi-Fi LAN (cyw43 AP) | **~909 down / ~716 up KB/s** | router build |
 
-> **It's a fun, educational software-PHY NIC and a working *small* router — not a
+> **It's a fun software-PHY NIC and a working router, not a
 > fast router.** The bit-bang TX is near line rate; RX bulk is limited by software
-> clock recovery against this analog front end (a PHY noise floor, not a fixable
-> firmware bug — see [`docs/rx-bulk-ceiling.md`](docs/rx-bulk-ceiling.md)). Latency
-> is great; it's ideal for low-rate / IoT-scale traffic.
+> clock recovery against this analog front end. Latency
+> is great; ideal for low-rate / IoT-scale traffic.
 
 ## Hardware
 
 - **Raspberry Pi Pico 2 W** (RP2350). The plain 10BASE-T NIC build also runs on a
   non-W Pico 2; the Wi-Fi/router builds need the W (cyw43).
 - **External 10BASE-T front end:** an **ISL3177E** transceiver + **HR911105A** RJ45
-  magnetics (the same module as the upstream project).
+  magnetics. KiCad board design + gerbers/BOM are in [`hardware/`](hardware/).
 
 | Signal | Pico 2 pin |
 |---|---|
@@ -52,16 +53,12 @@ Full detail + method in **[`docs/performance.md`](docs/performance.md)**. Headli
 | Onboard LED (heartbeat, NIC build) | GP25 |
 | SWD debug probe | SWCLK / SWDIO / GND |
 
-(On the Wi-Fi/router builds GP25 is the cyw43 gSPI CS, so the heartbeat LED is
-driven via the cyw43 chip instead. The cyw43 gSPI lines — WL_ON GP23, DATA GP24,
-CS GP25, CLK GP29 — are on-module.)
-
 ## Toolchain
 
 - Rust ≥ 1.82, target `riscv32imac-unknown-none-elf`
   (`rustup target add riscv32imac-unknown-none-elf`).
 - Flashing: [picotool](https://github.com/raspberrypi/picotool) (USB), or OpenOCD
-  over SWD (recommended — more reliable across resets):
+  over SWD:
   `openocd -f interface/cmsis-dap.cfg -f target/rp2350-riscv.cfg -c "program <elf> verify reset exit"`.
 
 ## Build & flash
@@ -91,11 +88,10 @@ sudo ethtool -s <iface> speed 10 duplex half autoneg off
 sudo ip addr add 192.168.37.19/24 dev <iface>
 ```
 
-### ⚠️ Router credentials
+### Router credentials
 
 The cyw43 AP SSID/passphrase are **compile-time placeholders** in
-`src/wireless.rs` (`AP_SSID` / `AP_PASSPHRASE = "change-me-please"`). **Change them
-before deploying.**
+`src/wireless.rs` (`AP_SSID` / `AP_PASSPHRASE = "change-me-please"`). **They should be changed.**
 
 ## How it works
 
@@ -109,7 +105,7 @@ before deploying.**
 - **core 0** runs smoltcp (the control plane) and, on the router build, an
   **embassy executor** hosting the cyw43 `Runner`, the LAN/WAN net tasks, and the
   custom L3 forwarding + NAPT data path. **PIO1** is a custom gSPI transport to the
-  cyw43 radio (Option-A: keep RISC-V, port the transport — no embassy-rp).
+  cyw43 radio.
 - An **RP2350 hardware watchdog** auto-reboots + recovers the device if the loop
   ever wedges (a known intermittent hang under sustained full-MTU inbound).
 
@@ -126,18 +122,21 @@ before deploying.**
 ## Limitations
 
 Half-duplex (by MAC policy; the transceiver is FD-*capable* but FD only helps
-contended traffic — [`docs/full-duplex-analysis.md`](docs/full-duplex-analysis.md));
+contended traffic;
 no auto-negotiation; RX bulk capped ~100 KB/s by the decode/PHY ceiling; an
-intermittent full-MTU-inbound hang that the watchdog recovers (root-cause open).
-Educational / hobby grade.
+intermittent full-MTU-inbound hang that the watchdog recovers.
+Just an educational project, please don't replace your home router with this.
 
 ## Credits
 
 - [kingyoPiyo/Pico-10BASE-T](https://github.com/kingyoPiyo/Pico-10BASE-T) — the
-  original C/PIO 10BASE-T TX+RX design this is a Rust port of (MIT,
-  Copyright © 2022 kingyo).
-- [Niccle](https://github.com/sebmarchand/niccle) — a reference for the
-  Manchester RX decode approach.
+  original C/PIO 10BASE-T **TX** design (MIT, Copyright © 2022 kingyo). This project
+  is a Rust port of the author's own
+  [C project](https://github.com/mattdeeds/Pico-10BASE-T), which extended
+  kingyoPiyo's work with the **RX** path (Manchester decode over an RS-485
+  transceiver).
+- [Niccle](https://github.com/timonvo/niccle) — a reference for the
+  Manchester RX decode approach and circuit design.
 - [embassy](https://github.com/embassy-rs/embassy) `cyw43` driver + firmware blobs
   (Infineon permissive binary license — see `cyw43-firmware/`).
 - [smoltcp](https://github.com/smoltcp-rs/smoltcp), [rp235x-hal](https://github.com/rp-rs/rp-hal).

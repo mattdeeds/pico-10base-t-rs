@@ -1,0 +1,16 @@
+# KiCad auto-backups and per-user / session state
+*-backups/
+*.kicad_prl
+*.bak
+*~
+_autosave-*
+*.lck
+~*.lck
+fp-info-cache
+
+# Fabrication-toolkit backups
+production/backups/
+
+# Editor / OS cruft
+.history/
+.DS_Store
