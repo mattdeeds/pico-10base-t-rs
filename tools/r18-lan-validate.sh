@@ -13,8 +13,8 @@
 set -u
 
 WLAN=wlx1cbfcefa0796
-AP_SSID=pico-rp2350-router
-AP_PSK=picorouter2350
+AP_SSID=pico-10bt-router    # match src/wireless.rs AP_SSID
+AP_PSK=change-me-please     # match src/wireless.rs AP_PASSPHRASE
 GW=192.168.4.1            # Pico LAN gateway
 DNS_VIA_NAT=1.1.1.1       # off-host resolver, reached only via the Pico's NAT
 NAME=example.com

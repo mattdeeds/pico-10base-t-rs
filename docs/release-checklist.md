@@ -1,8 +1,9 @@
 # Release / open-source prep checklist
 
-**Progress:** Phase 1 ✅ (`b2c8d99`) · Phase 2 ✅ (`f910d0b`) · Phase 3 ✅ (README +
-`docs/README.md` index; RESUME.md kept as dev notes) · Phase 4 (tooling) next ·
-Phase 5 (publish: fresh-clone build, tag v0.1.0, flip public).
+**Progress:** Phase 1 ✅ (`b2c8d99`) · Phase 2 ✅ (`f910d0b`) · Phase 3 ✅ (`6ef58b8`) ·
+Phase 4 ✅ (committed `cdc_read.py`/`lan_upload.py` + `tools/README.md`; scrubbed the
+old AP creds from `rig-env.sh`/`r18-lan-validate.sh`; CI deferred — optional) ·
+Phase 5 (publish: fresh-clone build test, tag v0.1.0, flip public).
 
 Wrapping the project for public sharing (2026-06-03). Decisions locked:
 

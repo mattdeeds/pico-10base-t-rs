@@ -2,8 +2,8 @@
 # (`. ./rig-env.sh`). Override any value from the environment, e.g.:
 #   WLAN=wlp3s0 DUR=20 tools/router-measure.sh
 WLAN="${WLAN:-wlx1cbfcefa0796}"            # this host's Wi-Fi client adapter
-AP_SSID="${AP_SSID:-pico-rp2350-router}"   # the Pico's AP
-AP_PSK="${AP_PSK:-picorouter2350}"
+AP_SSID="${AP_SSID:-pico-10bt-router}"      # the Pico's AP (match src/wireless.rs AP_SSID)
+AP_PSK="${AP_PSK:-change-me-please}"        # match src/wireless.rs AP_PASSPHRASE
 GW="${GW:-192.168.4.1}"                    # Pico LAN gateway (its mgmt page lives here)
 # iperf3 server = a SEPARATE machine reachable ONLY via the Pico's WAN. It must
 # NOT be an IP local to THIS host (a local IP short-circuits via `lo`, never
