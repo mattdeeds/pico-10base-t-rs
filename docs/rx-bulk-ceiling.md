@@ -16,6 +16,14 @@ experiments done (2026-06-03). Follow-on from the full-duplex experiment
 the durable fix is a hardware PHY**, not more decoder work
 (`docs/cpu-dpll-plan.md` §9d).
 
+> **RE-OPENED (2026-06-10): see §9.** The ~100 KB/s ceiling is reproduced almost
+> exactly, at every tested MTU, by a previously-missed smoltcp behaviour:
+> `max_burst_size = Some(1)` clamps the advertised TCP receive window to ONE
+> segment, serializing bulk uploads to one segment per (10 ms delayed-ACK + RTT)
+> cycle. The FCS loss is real but was not the binding constraint. Fixed in
+> `eth_mac.rs` (`max_burst_size = Some(INBOX_SLOTS)`); needs on-hardware
+> re-measurement.
+
 > **DECISION (2026-06-03): ACCEPTED — track closed.** RX-of-bulk stays ~100 KB/s;
 > this is a PHY limit, not a firmware bug worth more decoder effort. The device is
 > solid for low-rate / small-frame traffic; bulk RX is the documented ceiling. The
@@ -204,3 +212,58 @@ a decoder bug:
 full NCO-phase-tracked matched filter) is complex and §9d predicts marginal returns.
 The high-value lever for full-MTU RX is a **hardware PHY** — ties to the
 `docs/full-duplex-analysis.md` "real PHY" option and any board respin.
+
+## 9. RE-OPENED (2026-06-10) — the ceiling is the advertised-window clamp, not loss
+
+The §4/§5 "secondary receive-window ceiling" was never root-caused ("investigate
+smoltcp's advertised window" was lever 2, deferred). Root cause found by reading
+smoltcp 0.13 source:
+
+- **`smoltcp` clamps the advertised TCP window to `max_burst_size × MSS`**
+  (`iface/packet.rs`, TCP dispatch: `window_len = min(window_len,
+  max_burst_size * max_segment_size)`). `EthMac::capabilities()` set
+  `caps.max_burst_size = Some(1)` — so the device advertised a **one-segment
+  receive window on every ACK**, regardless of the 32 KB sink buffer. This is
+  exactly the `ss` signature in §4: host has cwnd headroom (cwnd 10) but keeps
+  only `unacked 1–2` outstanding.
+- **With a 1-MSS window the 10 ms delayed ACK gates every segment.** smoltcp's
+  default `ack_delay` is 10 ms, and its immediate-ACK rule
+  (`immediate_ack_to_transmit`) only fires once *more than* 1 MSS of unACKed
+  data is buffered — impossible when the window admits exactly one segment. So
+  steady state is: host sends 1 segment → device sits the full 10 ms delayed-ACK
+  timer → ACK (+~3 ms RTT) → next segment.
+
+**This model reproduces the §5 measurements at every MTU with no free
+parameters** (payload-per-segment ÷ ~13.5 ms):
+
+| device MTU | payload/segment | predicted | measured (§5) |
+|---|---|---|---|
+| 1500 | 1448 B | ~107 KB/s | ~99 KB/s |
+| 1000 | 960 B  | ~71 KB/s  | 68 KB/s |
+| 500  | 460 B  | ~34 KB/s  | 34 KB/s |
+
+The clamp also explains why the loss looked so expensive: with only 1 segment in
+flight, **fast retransmit is impossible** (no dup-ACKs can ever be generated), so
+every FCS-failed frame costs a host TLP/RTO stall rather than a ~RTT recovery.
+
+**Corrections to earlier verdicts:**
+- §4 "full-MTU is LOSS-limited" — overstated. The 28 % FCS loss is real and does
+  collapse cwnd, but cwnd 1–2 vs rwnd 1 bind at the same point; the *ceiling
+  shape* (and the exact ~100 KB/s figure) is the window clamp + delayed ACK.
+- §5 "MSS clamp TESTED and REFUTED" — the experiment was run *under* the window
+  clamp, so it measured `MSS/13.5 ms` scaling, not the clamp's real effect.
+  Worth re-running after the fix: sub-knee frames (~600–1000 B on-wire) at ~0–5 %
+  decode loss with a real window could plausibly reach several hundred KB/s.
+
+**FIX (this commit):** `caps.max_burst_size = Some(INBOX_SLOTS)` (= 4). Window
+becomes min(socket buffer, 4 × MSS ≈ 5.8 KB), which covers the 10 Mbit
+half-duplex BDP (~3.75 KB @ 3 ms RTT) and matches what the decoded-frame inbox
+can buffer per burst. With ≥2 segments in flight the immediate-ACK rule engages
+(ACK every 2nd segment, no 10 ms stall) and dup-ACKs/fast-retransmit work again.
+
+**To re-measure on hardware** (same method as §2): full-MTU bulk into :9999 —
+expect the ceiling to move well above 100 KB/s until FCS loss binds; then
+optionally re-run the §5 MSS sweep, where the knee (§3.2) says ~600–1000 B
+frames should now win. Watch `inbox_drop`/`inbox_hwm` — if drops appear, bump
+`INBOX_SLOTS` alongside `max_burst_size` (each slot is ~1.6 KB static RAM).
+README throughput table should be updated only after re-measurement.

@@ -449,7 +449,17 @@ impl phy::Device for EthMac {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ethernet;
         caps.max_transmission_unit = MTU;
-        caps.max_burst_size = Some(1);
+        // smoltcp clamps every advertised TCP receive window to
+        // `max_burst_size × MSS` (iface/packet.rs). `Some(1)` therefore
+        // advertised a ONE-segment window no matter how big the socket RX
+        // buffer was, serializing bulk uploads to one segment per
+        // (10 ms delayed-ACK + RTT) cycle — which is the ~100 KB/s
+        // RX-of-bulk ceiling in docs/rx-bulk-ceiling.md (§5 numbers match
+        // payload/13.5 ms at every MTU, see §9). INBOX_SLOTS segments is
+        // what the decoded-frame inbox can actually buffer per burst, and
+        // 4 × MSS ≈ 5.8 KB comfortably covers the 10 Mbit half-duplex
+        // bandwidth-delay product (~3.75 KB at the measured 3 ms RTT).
+        caps.max_burst_size = Some(INBOX_SLOTS);
         caps
     }
 }
