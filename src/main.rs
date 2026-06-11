@@ -19,25 +19,22 @@
     allow(dead_code, unused_variables, unused_mut, unused_imports)
 )]
 
-mod crc;
-mod eth_mac;
-mod eth_rx;
-// Edge-track DPLL Manchester decoder (productized — Phase 3b). Excluded
-// from the openloop A/B build so the dead-code warnings don't fire.
-#[cfg(not(feature = "decoder-openloop"))]
-mod eth_rx_dpll;
-mod eth_tx;
-mod manchester;
-mod multicore_riscv;
-mod pico_reset;
-mod pio_util;
+// The 10BASE-T transport core lives in this package's library crate (see
+// src/lib.rs) so external projects can depend on it. Root-level `use` imports
+// keep every existing `eth_mac::` / `crate::eth_mac::` path in this binary and
+// its submodules working unchanged.
+use pico_10base_t_rs::{eth_mac, eth_rx, eth_tx, multicore_riscv, pico_reset};
+// R14.3 — smoltcp phy::Device adapter over cyw43's NetDriver (wireless LAN).
+// pio_util is consumed by `wireless` (gSPI clock divider), not by this file.
+#[cfg(feature = "wireless")]
+use pico_10base_t_rs::{cyw43_phy, pio_util};
+// Perf characterization — `mcycle`-based per-core CPU counters. Router only.
+#[cfg(feature = "router")]
+use pico_10base_t_rs::cycles;
 // R13 — wireless router scaffolding (Pico 2 W / CYW43). Gated off by default;
 // `--features wireless` compile-checks the cyw43 + async-runtime integration.
 #[cfg(feature = "wireless")]
 mod wireless;
-// R14.3 — smoltcp phy::Device adapter over cyw43's NetDriver (wireless LAN).
-#[cfg(feature = "wireless")]
-mod cyw43_phy;
 // R14.4 — minimal LAN DHCP server (smoltcp UDP :67).
 #[cfg(feature = "wireless")]
 mod dhcp_server;
@@ -54,10 +51,6 @@ mod forward;
 // checksum helpers). Wired into the WAN ForwardingDevice. Router build only.
 #[cfg(feature = "router")]
 mod conntrack;
-// Perf characterization step 2 — `mcycle`-based per-core CPU-utilisation
-// counters (core-1 RX decode + core-0 forwarding fast-path). Router build only.
-#[cfg(feature = "router")]
-mod cycles;
 
 use panic_halt as _;
 

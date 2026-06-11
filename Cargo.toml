@@ -104,12 +104,20 @@ router = [
     "smoltcp/socket-dns",
 ]
 
+# The smoltcp phy::Device adapter over cyw43's NetDriver (src/cyw43_phy.rs) as
+# a narrow *library* feature: just the cyw43 driver + the embassy-net-driver
+# trait, NO executor/time runtime. External consumers (pico-remote-probe's
+# `wifi` build) enable this to reuse the adapter while supplying their own
+# runtime; the in-tree `wireless` build pulls it in below.
+cyw43-phy = ["dep:cyw43", "dep:embassy-net-driver"]
+
 # R13 — wireless router scaffolding (Pico 2 W / CYW43439). Pulls in the cyw43
 # driver + the async runtime (embassy-executor arch-riscv32 + embassy-time on a
 # custom rp235x-hal time-driver). OFF by default so the production 10BASE-T
 # build is unchanged. Architecture = "Option A" (keep Hazard3 RISC-V, port the
 # cyw43 SPI transport) — see docs/router-plan.md §4/§5.
 wireless = [
+    "cyw43-phy",
     "dep:cyw43",
     "dep:embassy-executor",
     "dep:embassy-time",

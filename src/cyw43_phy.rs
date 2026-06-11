@@ -79,6 +79,18 @@ impl Cyw43Phy {
     pub fn new(net: NetDriver<'static>) -> Self {
         Self { net }
     }
+
+    /// Current L2 link state — true once cyw43 reports the station associated and
+    /// (for WPA) the 4-way handshake done, false on deauth / beacon loss. A WiFi
+    /// serve loop can poll this to trigger an auto re-join. Poll-style with a
+    /// no-op waker, exactly like `receive`/`transmit` below. (Folded back from
+    /// pico-remote-probe's copy when this module moved into the library.)
+    pub fn link_up(&mut self) -> bool {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        embassy_net_driver::Driver::link_state(&mut self.net, &mut cx)
+            == embassy_net_driver::LinkState::Up
+    }
 }
 
 impl Device for Cyw43Phy {
