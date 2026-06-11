@@ -7,11 +7,15 @@
 //! ISL3177E RO pin (= GP13). Autopush 32 bits per FIFO word, LSB-first.
 //! 60 MHz = 3 samples per Manchester half-bit, matching the C version.
 //!
-//! Layer 2 (this phase, R3.3): DMA writes the PIO RX FIFO into two
-//! `[u32; BUF_WORDS]` half-buffers in turn, chained so that when one fills the
-//! other automatically starts. `poll_with` returns the just-completed half
-//! to the caller as a `&[u8]` and immediately re-arms it. Caller must poll
-//! at least once per half-fill time (~2.18 ms) or samples drop.
+//! Layer 2: DMA writes the PIO RX FIFO into two `[u32; BUF_WORDS]`
+//! half-buffers in turn, chained so that when one fills the other
+//! automatically starts. `poll_into` captures the completed half into a
+//! caller-provided image slot and re-arms the DMA in bounded time; the
+//! (potentially multi-ms) scan + decode runs from that copy in thread
+//! context, so a long decode can never starve the re-arm. The re-arm must
+//! happen within ~2 half-fill times (~4.4 ms) of a completion or the PIO RX
+//! FIFO (8 words ≈ 4.3 µs) overflows and samples are silently lost — the
+//! `rxstall` counter on the diag log watches for exactly that.
 
 use rp235x_hal as hal;
 use hal::dma::{double_buffer, Channel, SingleChannel, CH0, CH1};
@@ -49,17 +53,15 @@ const HB1_CENTER_OFFSET: usize = 1;
 
 /// Words per half-buffer. 4096 u32 = 16 KB = ~2.18 ms of samples at 60 MHz.
 ///
-/// Sizing trade-off (measured 2026-06-10, see docs/rx-bulk-ceiling.md): the
-/// half-fill time is a fixed latency floor under every RX→response cycle —
-/// a frame can't decode until the half containing its *end* completes — so
-/// smaller halves cut TCP ACK latency. BUT decode runs inline in the
-/// DMA_IRQ_0 handler, so the half-fill time is also the decode deadline:
-/// 2048-word halves (1.09 ms) were tried and a ~1.7 ms mid-size-frame decode
-/// overran the deadline, clipping the next back-to-back segment (50% FCS
-/// fail, net regression). Don't shrink below decode-worst-case (~2.6 ms ≈
-/// this size) without first moving decode out of the re-arm path.
-/// (`poll_with` already handles frames outspanning one half via carry
-/// accumulation, so the carry logic is not the blocker.)
+/// The half-fill time is a fixed latency floor under every RX→response
+/// cycle: a frame can't decode until the half containing its *end*
+/// completes. Since the 2026-06-10 restructure (decode moved out of the
+/// DMA_IRQ_0 handler into core 1's thread loop; the IRQ only captures the
+/// image + re-arms in ~bounded µs), the old decode-deadline coupling is
+/// gone, so smaller halves are now *viable* if the added per-half overhead
+/// is worth the latency cut — `poll_into` handles frames outspanning one
+/// half via carry accumulation. Untested at other sizes since the
+/// restructure; 16 KB is the known-good configuration.
 pub const BUF_WORDS: usize = 4096;
 /// Bytes per half-buffer.
 pub const BUF_BYTES: usize = BUF_WORDS * 4;
@@ -74,8 +76,8 @@ pub const BUF_BYTES: usize = BUF_WORDS * 4;
 /// `carry_capped` on `EthRx`).
 pub const MAX_CARRY_BYTES: usize = 16 * 1024;
 
-/// Stitch buffer = prior half's trailing active tail + the just-finished half.
-/// Caller sees one contiguous slice across the boundary.
+/// Processing-image slot size: worst case carry prefix + a full half.
+/// (`poll_into` writes `carry ++ settled-half` into a caller slot this big.)
 pub const STITCH_BUF_BYTES: usize = BUF_BYTES + MAX_CARRY_BYTES;
 
 /// Upper bound on the SFD search in `decode_frame` — preserves the historical
@@ -89,7 +91,6 @@ const SFD_SEARCH_BITS: usize = 1600;
 type RxFifo = Rx<(PIO0, SM1)>;
 pub type RxBuf = &'static mut [u32; BUF_WORDS];
 pub type CarryBuf = &'static mut [u8; MAX_CARRY_BYTES];
-pub type StitchBuf = &'static mut [u8; STITCH_BUF_BYTES];
 type Xfer = double_buffer::Transfer<
     Channel<CH0>,
     Channel<CH1>,
@@ -179,7 +180,6 @@ pub struct EthRx {
     xfer: Option<Xfer>,
     carry: CarryBuf,
     carry_len: usize,
-    stitch: StitchBuf,
     /// Number of times the trailing-active walkback in `poll_with` hit the
     /// MAX_CARRY_BYTES cap (vs. terminating on a non-active byte). Each
     /// occurrence is a frame whose start got clipped — read via
@@ -202,7 +202,6 @@ impl EthRx {
         buf_a: RxBuf,
         buf_b: RxBuf,
         carry: CarryBuf,
-        stitch: StitchBuf,
     ) -> Self {
         let program = pio::pio_asm!(".wrap_target", "    in pins, 1", ".wrap",);
 
@@ -242,7 +241,6 @@ impl EthRx {
             xfer: Some(xfer),
             carry,
             carry_len: 0,
-            stitch,
             carry_capped: 0,
         }
     }
@@ -490,33 +488,38 @@ impl EthRx {
         computed == on_wire
     }
 
-    /// Non-blocking. If a DMA half just completed, hand the just-finished
-    /// half to `f` for scanning, carrying any frame that straddled the
-    /// boundary across the swap, then update the carry and re-arm DMA.
-    /// Caller must call this at least once per half-fill time (~2.18 ms)
-    /// or samples drop.
+}
+
+/// Outcome of `poll_into`: nothing pending, or a processing image of
+/// `len` bytes (with `carry_prefix` bytes carried from earlier halves)
+/// written into the caller's slot.
+pub enum PollOutcome {
+    /// No completed half (or the half was consumed into the carry /
+    /// dropped); nothing for the caller to process.
+    Nothing,
+    /// `slot[..len]` holds the continuous sample image to scan + decode.
+    Image { len: usize, carry_prefix: usize },
+}
+
+impl EthRx {
+    /// Service a completed DMA half: build the processing image (carry ++
+    /// settled bytes) into `slot`, update the carry, and RE-ARM the DMA —
+    /// all in bounded time (~0.6 ms worst), so the chain is never left
+    /// without an armed target. The (potentially multi-ms) scan + decode of
+    /// the returned image is the caller's business, in thread context.
     ///
-    /// Scan-in-place to avoid a 16 KB copy every half (it was ~296 µs of the
-    /// RX IRQ budget). The previous half's trailing-active tail lives in
-    /// `carry`:
-    /// - `carry_len == 0` (the common case — previous half ended idle):
-    ///   nothing straddles, so `f` is called once on the new half directly,
-    ///   no copy.
-    /// - `carry_len > 0`: a frame straddled — its head is in `carry`, its
-    ///   tail is the leading active run of the new half (up to the first idle
-    ///   byte). Only `carry + that tail` is stitched into `stitch` (small);
-    ///   `f` is then called a second time on the remainder of the new half in
-    ///   place. The split point is an idle byte, so no active run is cut
-    ///   across the two calls — `f` sees every frame whole, exactly as it did
-    ///   with the old full-buffer stitch.
+    /// (History: scan+decode used to run inline here, in the IRQ, in front
+    /// of the re-arm. Under load that exceeded one half-fill time, the chain
+    /// completed with nothing armed, and the 8-word PIO RX FIFO overflowed
+    /// ~200×/s — silently truncating any frame in flight. That sample loss
+    /// was misread for weeks as a clock-drift "decode cliff".)
     ///
-    /// So `f` may be invoked once or twice per completed half; each call gets
-    /// a self-contained slice and the caller scans runs within it.
-    pub fn poll_with<F: FnMut(&[u8])>(&mut self, mut f: F) {
+    /// `slot` must be at least `STITCH_BUF_BYTES` long.
+    pub fn poll_into(&mut self, slot: &mut [u8]) -> PollOutcome {
         let xfer = self.xfer.take().unwrap();
         if !xfer.is_done() {
             self.xfer = Some(xfer);
-            return;
+            return PollOutcome::Nothing;
         }
         // is_done() was true so wait() returns immediately.
         let (finished, idle) = xfer.wait();
@@ -525,21 +528,20 @@ impl EthRx {
         };
 
         let cl = self.carry_len;
-        if cl == 0 {
-            f(new_bytes);
-        } else {
-            // Leading active run of the new half = the straddling frame's
-            // tail; it ends at the first idle byte.
-            let mut k = 0;
+
+        // Leading active run of the new half (only meaningful when a frame
+        // straddled in): it ends at the first idle byte.
+        let mut k = 0;
+        if cl > 0 {
             while k < BUF_BYTES && new_bytes[k] != 0x00 && new_bytes[k] != 0xFF {
                 k += 1;
             }
             if k == BUF_BYTES {
                 // The whole half is active: the straddling frame hasn't ended
                 // yet (can't happen with 16 KB halves and legal frame sizes,
-                // but keeps smaller halves correct). Append the
-                // half to the carry and keep waiting for the half that
-                // contains the frame's end — decoding now would clip it.
+                // but keeps smaller halves correct). Append the half to the
+                // carry and keep waiting for the half that contains the
+                // frame's end — decoding now would clip it.
                 if cl + BUF_BYTES <= MAX_CARRY_BYTES {
                     self.carry[cl..cl + BUF_BYTES].copy_from_slice(new_bytes);
                     self.carry_len = cl + BUF_BYTES;
@@ -551,24 +553,20 @@ impl EthRx {
                     self.carry_len = 0;
                 }
                 self.xfer = Some(idle.write_next(finished));
-                return;
+                return PollOutcome::Nothing;
             }
-            // Stitch only carry + that tail (cl + k <= STITCH_BUF_BYTES).
-            self.stitch[..cl].copy_from_slice(&self.carry[..cl]);
-            self.stitch[cl..cl + k].copy_from_slice(&new_bytes[..k]);
-            f(&self.stitch[..cl + k]);
-            // Remainder of the new half, scanned in place (no copy).
-            f(&new_bytes[k..]);
         }
 
-        // Build the next carry: walk back from the end of the just-
-        // finished half while bytes are "active" (non-0x00, non-0xFF), so
-        // any frame whose tail is still in this half gets carried forward.
-        // Cap at MAX_CARRY_BYTES; bump `carry_capped` if we hit the cap so
-        // we can tell over-budget frames apart from clean termination.
+        // Trailing not-yet-terminated run (a frame whose end hasn't arrived):
+        // excluded from this half's image, carried into the next. Including
+        // it would decode a truncated head (valid preamble + dst MAC, so the
+        // MAC filter passes) that fails FCS — and the same frame would decode
+        // again via the carry next half. Cap at MAX_CARRY_BYTES (bump
+        // `carry_capped` so over-budget runs are distinguishable from clean
+        // termination).
         let mut tail_start = BUF_BYTES;
         loop {
-            if tail_start == 0 {
+            if tail_start <= k {
                 break;
             }
             if BUF_BYTES - tail_start >= MAX_CARRY_BYTES {
@@ -581,10 +579,26 @@ impl EthRx {
             }
             tail_start -= 1;
         }
+
+        // Processing image: carry ++ new_bytes[..tail_start] is the true
+        // continuous sample stream across the half boundary, so one scan over
+        // it handles straddlers and in-place frames identically.
+        slot[..cl].copy_from_slice(&self.carry[..cl]);
+        slot[cl..cl + tail_start].copy_from_slice(&new_bytes[..tail_start]);
+        let image_len = cl + tail_start;
+
+        // Next carry = the trailing in-flight run.
         let new_carry_len = BUF_BYTES - tail_start;
         self.carry[..new_carry_len].copy_from_slice(&new_bytes[tail_start..]);
         self.carry_len = new_carry_len;
 
+        // RE-ARM. From here the DMA double-buffer is self-sustaining for two
+        // full half-fills regardless of how long the decode takes.
         self.xfer = Some(idle.write_next(finished));
+
+        PollOutcome::Image {
+            len: image_len,
+            carry_prefix: cl,
+        }
     }
 }

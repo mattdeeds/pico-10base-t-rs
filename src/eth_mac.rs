@@ -11,8 +11,11 @@
 //! - **`RX_ENGINE`** (core-1-exclusive) holds the `EthRx` state machine + our
 //!   MAC. After `install_rx` populates it on core 0 (once, before core 1
 //!   enables `DMA_IRQ_0`), it is touched **only by core 1's `DMA_IRQ_0`
-//!   handler** — so the long stitch + decode + verify pipeline runs with no
-//!   lock at all.
+//!   handler**, which captures each completed half into the image ring and
+//!   re-arms the DMA in bounded time. The scan + decode + verify pipeline
+//!   runs in core 1's *thread* loop (`drain_rx_images`) from the ring — out
+//!   of the IRQ, so a long decode can never starve the DMA re-arm (which
+//!   silently truncated frames; see `eth_rx::poll_into`).
 //!
 //! - **`RX_SHARED`** (cross-core, guarded by `Spinlock<0>`) holds just the
 //!   decoded-frame inbox + RX stats. Core 1 publishes FCS-OK frames + stat
@@ -37,18 +40,12 @@ use smoltcp::time::Instant;
 
 #[cfg(not(feature = "mss-clamp"))]
 pub const MTU: usize = 1500;
-/// `mss-clamp` (`docs/rx-bulk-ceiling.md` §5/§9): clamp the advertised IP MTU
-/// so our SYN/SYN-ACK advertises a small TCP MSS (≈ MTU−40) → peers send
-/// segments below the RX clock-drift decode cliff. Only
-/// `max_transmission_unit` uses this const (no buffers), so clamping is safe;
-/// default off → production unchanged.
-///
-/// 1000 is the measured sweet spot (2026-06-10 MTU sweep on the wired rig,
-/// with immediate ACKs + the 2-segment window): ~1004 B on-wire decodes at
-/// ~1% FCS-fail and RX-of-bulk hits ~200 KB/s, vs ~30% fail / ~180 KB/s at
-/// full MTU. The cliff is sharp: 1104 B → 12% fail, 1204 B → ~25%. Smaller
-/// is NOT better — 500 (the original value) triples the frame/ACK rate and
-/// post-frame-gap contention collapses throughput to ~30-40 KB/s.
+/// `mss-clamp` (`docs/rx-bulk-ceiling.md` §5/§9/§10): clamp the advertised IP
+/// MTU so peers send smaller TCP segments. OBSOLETE as a performance lever
+/// since the 2026-06-10 decode-out-of-IRQ restructure: the "decode cliff"
+/// this worked around was DMA-starvation sample loss, not clock drift, and
+/// full-MTU RX now decodes at ~0.2% loss / ~310 KB/s (≥ any clamped value).
+/// Kept only as an experiment knob.
 #[cfg(feature = "mss-clamp")]
 pub const MTU: usize = 1000;
 /// Slack over 1518-byte max Ethernet frame; decoder allocates this much.
@@ -137,6 +134,47 @@ struct EngineCell(UnsafeCell<Option<RxEngine>>);
 // never genuinely concurrent.
 unsafe impl Sync for EngineCell {}
 static RX_ENGINE: EngineCell = EngineCell(UnsafeCell::new(None));
+
+/// Image ring: the DMA_IRQ_0 handler (producer) writes each completed half's
+/// processing image (carry ++ settled bytes) into a slot and re-arms the DMA
+/// immediately; core 1's thread loop (consumer, `drain_rx_images`) scans +
+/// decodes the slots with no deadline pressure on the DMA. SPSC on one core:
+/// the IRQ preempts the thread, never the reverse, so sequence counters with
+/// Acquire/Release are sufficient. On overload (ring full) the IRQ drops the
+/// whole image and counts it — bounded, visible degradation instead of
+/// silent FIFO-overflow sample corruption.
+pub const IMG_SLOTS: usize = 6;
+struct ImgRing(UnsafeCell<[[u8; crate::eth_rx::STITCH_BUF_BYTES]; IMG_SLOTS]>);
+unsafe impl Sync for ImgRing {}
+static IMG_RING: ImgRing =
+    ImgRing(UnsafeCell::new([[0; crate::eth_rx::STITCH_BUF_BYTES]; IMG_SLOTS]));
+#[allow(clippy::declare_interior_mutable_const)]
+const ATOMIC_ZERO: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static IMG_LEN: [core::sync::atomic::AtomicU32; IMG_SLOTS] = [ATOMIC_ZERO; IMG_SLOTS];
+static IMG_CL: [core::sync::atomic::AtomicU32; IMG_SLOTS] = [ATOMIC_ZERO; IMG_SLOTS];
+/// Monotonic produce / consume sequence numbers (slot = seq % IMG_SLOTS).
+static IMG_W: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static IMG_R: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Completed halves dropped because the ring was full (decode backlog).
+pub static IMG_DROP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Overload discard slot: when the ring is full the DMA must STILL be
+/// serviced (carry bookkeeping + re-arm — skipping it desyncs the HAL
+/// Transfer's channel accounting and kills RX permanently). The image goes
+/// here and is dropped, counted in IMG_DROP.
+struct DiscardSlot(UnsafeCell<[u8; crate::eth_rx::STITCH_BUF_BYTES]>);
+unsafe impl Sync for DiscardSlot {}
+static IMG_DISCARD: DiscardSlot =
+    DiscardSlot(UnsafeCell::new([0; crate::eth_rx::STITCH_BUF_BYTES]));
+
+/// Diagnostic: decode outcomes for runs that came through the carry+stitch
+/// straddler path (vs scanned in place). Read+reset by the 1 Hz diag log.
+pub static STITCH_DEC: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static STITCH_FAIL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// DIAG: halves during which the RX sampler's FIFO overflowed (PIO0 FDEBUG
+/// RXSTALL bit for SM1, checked+cleared once per completed half). Nonzero ⇒
+/// the DMA fell behind and samples were LOST — frames in flight at that
+/// moment are silently truncated.
+pub static RXSTALL_HALVES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Cross-core shared inbox + stats, guarded by `Spinlock<0>`. Const-init so it
 /// needs no run-time setup.
@@ -240,12 +278,82 @@ impl StatsDelta {
 /// `engine` (no lock); `Spinlock<0>` is taken only to push each frame and to
 /// merge the stat deltas at the end — never across the decode.
 fn process_completed_half(engine: &mut RxEngine) {
-    let our_mac = engine.our_mac;
-    let mut acc = StatsDelta::new();
+    // DIAG: did the RX FIFO overflow since the last check? (write-1-to-clear)
+    {
+        let pio = unsafe { &*rp235x_hal::pac::PIO0::ptr() };
+        if pio.fdebug().read().rxstall().bits() & (1 << 1) != 0 {
+            pio.fdebug().write(|w| unsafe { w.rxstall().bits(1 << 1) });
+            RXSTALL_HALVES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let w = IMG_W.load(Ordering::Relaxed);
+    let r = IMG_R.load(Ordering::Acquire);
+    if w.wrapping_sub(r) >= IMG_SLOTS as u32 {
+        // Ring full: decode backlog. The DMA must STILL be serviced (carry
+        // bookkeeping + re-arm), so capture into the discard slot and drop
+        // the image — bounded, counted overload behavior.
+        // Safety: the discard slot is producer-exclusive (IRQ context only).
+        let slot = unsafe { &mut *IMG_DISCARD.0.get() };
+        if let crate::eth_rx::PollOutcome::Image { .. } = engine.rx.poll_into(&mut slot[..]) {
+            IMG_DROP.fetch_add(1, Ordering::Relaxed);
+        }
+        return;
+    }
+    let slot_idx = (w as usize) % IMG_SLOTS;
+    // Safety: producer-exclusive slot (w - r < IMG_SLOTS checked above);
+    // the consumer only reads slots < w.
+    let slot = unsafe { &mut (*IMG_RING.0.get())[slot_idx] };
+    match engine.rx.poll_into(&mut slot[..]) {
+        crate::eth_rx::PollOutcome::Nothing => {}
+        crate::eth_rx::PollOutcome::Image { len, carry_prefix } => {
+            IMG_LEN[slot_idx].store(len as u32, Ordering::Relaxed);
+            IMG_CL[slot_idx].store(carry_prefix as u32, Ordering::Relaxed);
+            IMG_W.store(w.wrapping_add(1), Ordering::Release);
+        }
+    }
+    // Carry-cap accounting (engine-owned counter): merge under the brief
+    // cross-core lock from IRQ context — cheap, bounded.
+    let capped = engine.rx.take_carry_capped();
+    if capped != 0 {
+        with_rx_shared(|shared| {
+            shared.stats.carry_capped = shared.stats.carry_capped.wrapping_add(capped);
+        });
+    }
+}
 
-    engine.rx.poll_with(|bytes| scan_runs(&our_mac, bytes, &mut acc));
-    acc.carry = engine.rx.take_carry_capped();
-    merge_stats(&acc);
+/// Core 1 thread context: scan + decode any queued images. Called from the
+/// core-1 main loop after each WFI wake. No deadline — the IRQ side keeps
+/// the DMA fed regardless of how long a decode takes here.
+pub fn drain_rx_images() {
+    loop {
+        let r = IMG_R.load(Ordering::Relaxed);
+        let w = IMG_W.load(Ordering::Acquire);
+        if r == w {
+            return;
+        }
+        let slot_idx = (r as usize) % IMG_SLOTS;
+        let len = IMG_LEN[slot_idx].load(Ordering::Relaxed) as usize;
+        let cl = IMG_CL[slot_idx].load(Ordering::Relaxed) as usize;
+        // Safety: consumer-exclusive slot (r < w; producer writes only at
+        // w % IMG_SLOTS and refuses when the ring is full).
+        let image: &[u8] = unsafe {
+            let ring: *const [[u8; crate::eth_rx::STITCH_BUF_BYTES]; IMG_SLOTS] =
+                IMG_RING.0.get();
+            core::slice::from_raw_parts((*ring)[slot_idx].as_ptr(), len)
+        };
+        // our_mac: stable after install_rx; read it without touching the
+        // engine (which is IRQ-owned).
+        let our_mac = unsafe {
+            (*RX_ENGINE.0.get())
+                .as_ref()
+                .map(|e| e.our_mac)
+                .unwrap_or([0; 6])
+        };
+        let mut acc = StatsDelta::new();
+        scan_runs(&our_mac, image, if cl > 0 { Some(cl) } else { None }, &mut acc);
+        merge_stats(&acc);
+        IMG_R.store(r.wrapping_add(1), Ordering::Release);
+    }
 }
 
 /// Walk every frame-shaped active run in `bytes`, decode + verify the ones
@@ -253,7 +361,7 @@ fn process_completed_half(engine: &mut RxEngine) {
 /// stat deltas into `acc`. Shared by the half-completion path (the slices
 /// `poll_with` hands out) and the live-decode path (a terminated-run window
 /// of the in-flight half).
-fn scan_runs(our_mac: &[u8; 6], bytes: &[u8], acc: &mut StatsDelta) {
+fn scan_runs(our_mac: &[u8; 6], bytes: &[u8], stitch_cl: Option<usize>, acc: &mut StatsDelta) {
     let mut cursor = 0;
     while let Some((off, len)) = EthRx::find_active_run_from(bytes, cursor, 100) {
         cursor = off + len;
@@ -289,6 +397,13 @@ fn scan_runs(our_mac: &[u8; 6], bytes: &[u8], acc: &mut StatsDelta) {
             acc.ok = acc.ok.wrapping_add(1);
         } else {
             acc.fail = acc.fail.wrapping_add(1);
+        }
+        // Carry-prefixed-image provenance (straddler-path health).
+        if let Some(_cl) = stitch_cl {
+            STITCH_DEC.fetch_add(1, Ordering::Relaxed);
+            if !ok {
+                STITCH_FAIL.fetch_add(1, Ordering::Relaxed);
+            }
         }
         let snap_n = n.min(acc.last_snap.len());
         acc.last_snap[..snap_n].copy_from_slice(&frame[..snap_n]);
@@ -354,12 +469,11 @@ fn DMA_IRQ_0() {
     let Some(engine) = (unsafe { (*RX_ENGINE.0.get()).as_mut() }) else {
         return;
     };
-    // `dma_irq_pending` clears the per-channel pending bit. Return early if
-    // it's not actually ours (shouldn't happen — we own both channels — but
-    // cheap defensive check).
-    if !engine.rx.dma_irq_pending() {
-        return;
-    }
+    // Clear the per-channel pending bit. Do NOT gate processing on it: after
+    // an overload deferral the Transfer's active-channel accounting can lag
+    // the pending bits by one half, and `poll_into`'s is_done() is the
+    // source of truth anyway.
+    let _ = engine.rx.dma_irq_pending();
     // Perf step 2 (router build): bracket the decode so core 1's RX utilisation
     // is readable off `mcycle`. The span drops at function exit, right after the
     // decode returns; cost is negligible vs the ≤2.57 ms pipeline, and it's

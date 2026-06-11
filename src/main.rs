@@ -182,9 +182,13 @@ extern "C" fn core1_entry() -> ! {
     let mut n: u32 = 0;
     loop {
         hal::arch::wfi();
-        // Woke to service a DMA-half IRQ (handled via the trap before we
-        // resume here). Bump the liveness counter so core 0's 1 Hz log shows
-        // core 1 processing halves; ticks climbing == core 1 alive + working.
+        // Woke from a DMA-half IRQ: the handler (IRQ context) captured the
+        // half's processing image into the ring and re-armed the DMA in
+        // bounded time. The unbounded work — scan + Manchester decode —
+        // happens HERE, in thread context, so a long decode can never
+        // starve the DMA re-arm (that starvation silently truncated frames
+        // for weeks; see eth_rx::poll_into).
+        eth_mac::drain_rx_images();
         n = n.wrapping_add(1);
         CORE1_TICKS.store(n, Ordering::Relaxed);
     }
@@ -318,18 +322,16 @@ fn setup_eth_mac(
     let eth_tx = eth_tx::EthTx::new(&mut pio0, sm0, sm2, HW_PIN_TXD, HW_PIN_RXD, sys_clk_hz);
 
     // DMA channels 0 and 1 ferry samples from the PIO RX FIFO into two 16 KB
-    // half-buffers. EthRx::poll_with hands the just-filled half to the decoder
-    // while DMA continues filling the other. Buffers static via singleton!.
+    // half-buffers. The DMA_IRQ_0 handler captures each filled half into the
+    // image ring (eth_mac) and re-arms; core 1's thread loop decodes. Buffers
+    // static via singleton!.
     let dma = dma.split(resets);
     let rx_buf_a = singleton!(: [u32; eth_rx::BUF_WORDS] = [0; eth_rx::BUF_WORDS]).unwrap();
     let rx_buf_b = singleton!(: [u32; eth_rx::BUF_WORDS] = [0; eth_rx::BUF_WORDS]).unwrap();
     let rx_carry =
         singleton!(: [u8; eth_rx::MAX_CARRY_BYTES] = [0; eth_rx::MAX_CARRY_BYTES]).unwrap();
-    let rx_stitch =
-        singleton!(: [u8; eth_rx::STITCH_BUF_BYTES] = [0; eth_rx::STITCH_BUF_BYTES]).unwrap();
     let eth_rx = eth_rx::EthRx::new(
         &mut pio0, sm1, HW_PIN_RXD, sys_clk_hz, dma.ch0, dma.ch1, rx_buf_a, rx_buf_b, rx_carry,
-        rx_stitch,
     );
 
     // Install EthRx + our MAC into the core-1-exclusive RX engine *before*
@@ -948,6 +950,17 @@ fn log_status<B: UsbBus>(
     // pull in the EthMac TX stats; the lean default build skips them.
     #[cfg(feature = "diag")]
     {
+        // Straddler-path diagnosis: decode outcomes for carry+stitch runs.
+        line.clear();
+        let _ = writeln!(
+            line,
+            "[Stitch] dec={} fail={} rxstall={} img_drop={}",
+            eth_mac::STITCH_DEC.swap(0, Ordering::Relaxed),
+            eth_mac::STITCH_FAIL.swap(0, Ordering::Relaxed),
+            eth_mac::RXSTALL_HALVES.swap(0, Ordering::Relaxed),
+            eth_mac::IMG_DROP.swap(0, Ordering::Relaxed),
+        );
+        let _ = serial.write(line.as_bytes());
         line.clear();
         let _ = writeln!(
             line,

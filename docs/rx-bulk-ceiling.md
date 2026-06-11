@@ -286,3 +286,75 @@ Next lever for the cycle time is **decode CPU cost** (~1.7 ms/kB-frame on the
   fails ~50 % FCS while flow-controlled TCP at the same frame size fails ~1 %.
   Candidates: NLP TX landing mid-frame, the 4 ms cadence vs 2.18 ms half
   cadence, host NIC burst behavior. Worth its own investigation.
+
+## 10. The "decode cliff" was DMA-starvation sample loss — decode out of the IRQ → ~310 KB/s at stock MTU (2026-06-10)
+
+Follow-up to §9, chasing decode CPU time. The optimization work surfaced a far
+bigger find: **the full-MTU FCS-fail "cliff" (§3-§5, §8) was never clock
+drift or analog noise — it was silent sample loss from the RX DMA being
+starved while the decode ran in front of the re-arm.**
+
+### 10.1 The mechanism (instrumented, not inferred)
+
+- PIO FDEBUG `RXSTALL` (RX FIFO overflow, checked per half) fired **~200×/s**
+  under a 250 f/s broadcast blast on the pre-fix code, and 0 at idle.
+- `mcycle` timing showed the `DMA_IRQ_0` handler peaking at **2.9-4.6 ms,
+  exceeding the 2.18 ms half-fill period** under load. The double-buffer
+  chain then completed with nothing armed; the 8-word PIO RX FIFO (4.3 µs)
+  overflowed; whole stretches of samples vanished mid-frame.
+- A truncated frame followed by genuine idle is exactly what captured failing
+  runs showed (clean periodic Manchester, then early cut, then idle).
+- The loss concentrated on *straddling* frames because a frame straddles a
+  half boundary ⟺ the (long) handler runs during its flight. Flow-controlled
+  TCP at 16 KB halves accidentally phase-locks frame arrivals to the half
+  cadence (host sends right after our ACKs, which fire right after a half
+  completes) — few straddlers, so the loss hid for months and only blast
+  tests / large frames / small halves exposed it.
+
+This retroactively re-explains most of the §3-§5 matrix: the sharp
+1004→1504 B "cliff" tracks when a 2-segment TCP burst outgrows what fits
+inside one half between handler runs, not a per-frame decode property. §8's
+"PHY-limited" verdict is superseded for this failure mode (the offline corpus
+always decoded clean — consistent with sample loss, not noise). The
+sustained-full-MTU device wedge (§6) also stopped reproducing after the fix
+below (plus an overload path that must still service the DMA — see
+`eth_mac::process_completed_half`).
+
+### 10.2 The fix: bounded IRQ, decode in thread context
+
+- `EthRx::poll_into` (was `poll_with`): the IRQ now only builds the
+  processing image — `carry ++ settled-half`, one continuous sample stream,
+  no stitched/in-place split — into a slot of a 6-deep image ring, updates
+  the carry, and **re-arms the DMA, all in bounded ~0.6 ms**.
+- Core 1's thread loop (`eth_mac::drain_rx_images`, between WFIs) scans +
+  decodes the ring with **no deadline coupling to the DMA** at all.
+- Overload (ring full) degrades to counted whole-image drops (`img_drop` on
+  the diag log) via a discard slot — the DMA is *always* serviced; skipping
+  service desyncs the HAL Transfer's channel accounting and kills RX
+  permanently (found the hard way).
+- Two supporting fixes from the same investigation: the trailing
+  not-yet-terminated run is excluded from the scan (it used to decode as a
+  truncated head, fail FCS, and decode again via the carry — inflating
+  fcs_fail by the straddle rate); and the DPLL hot loop reads each bit's
+  4-sample edge window + data bit from ONE two-byte load (~2× decode
+  speed, bit-exact vs the old decoder over 200k fuzz inputs + corpus).
+
+### 10.3 Results (wired rig, immediate-ACK + 2-seg window from §9)
+
+| metric | before (§9 best) | after |
+|---|---|---|
+| RX-of-bulk, stock MTU 1500 | ~180 KB/s @ ~30% FCS-fail | **~310 KB/s @ 0.2%** |
+| RX-of-bulk, mss-clamp 1000 | ~200 KB/s @ ~1% | ~300-324 KB/s @ 0.2% |
+| 250 f/s broadcast blast | ~52% FCS-fail | **0.7-1.6%** |
+| RXSTALL (FIFO overflows) | ~200/s under load | 0 |
+| sustained full-MTU blast | device wedge (watchdog) | no wedge observed |
+
+`mss-clamp` is now obsolete as a performance lever (kept as an experiment
+knob). Health counters to watch on the diag build: `rxstall` (must stay 0 —
+any nonzero means samples were lost) and `img_drop` (decode backlog).
+
+Remaining levers if more RX speed is wanted: decode CPU cost is still the
+cycle's biggest term (~1-1.5 ms/frame keeps the ring shallow under blast);
+smaller DMA halves are now viable again (the decode-deadline coupling is
+gone) and would cut the ~2.2 ms ACK-latency floor; and the §9 ACK/window
+tuning could be revisited against the now-clean link.
