@@ -114,10 +114,19 @@ The cyw43 AP SSID/passphrase are **compile-time placeholders** in
 
 ## Repo layout
 
-- `src/eth_tx.rs`, `src/eth_rx.rs`, `src/eth_rx_dpll.rs`, `src/eth_mac.rs`,
-  `src/manchester.rs`, `src/crc.rs` — the **10BASE-T bit-bang NIC** (PHY + MAC).
-- `src/wireless.rs`, `src/forward.rs`, `src/conntrack.rs`, `src/dhcp_server.rs`,
-  `src/wan.rs`, `src/cyw43_phy.rs` — the **router** (cyw43 + forwarding + NAPT).
+The package is **a library + a binary**: the transport core is a reusable
+library crate that other projects can take as a Cargo dependency (e.g.
+[pico-remote-probe](https://github.com/mattdeeds/pico-remote-probe), a
+network-attached SWD debug probe, uses it as its NIC); the router application
+in `src/main.rs` is the in-tree consumer.
+
+- `src/lib.rs` — the **library**: `eth_tx`, `eth_rx`, `eth_rx_dpll`, `eth_mac`,
+  `manchester`, `crc` (the **10BASE-T bit-bang NIC**, PHY + MAC), plus
+  `multicore_riscv` (Hazard3 core-1 launch), `pico_reset` (picotool USB reset),
+  `pio_util`, and — behind the `cyw43-phy` feature — `cyw43_phy` (a smoltcp
+  `phy::Device` over the cyw43 radio, no executor required).
+- `src/main.rs`, `src/wireless.rs`, `src/forward.rs`, `src/conntrack.rs`,
+  `src/dhcp_server.rs`, `src/wan.rs` — the **router** (cyw43 + forwarding + NAPT).
 - `docs/` — a thorough **engineering log** (how this was built + characterized).
   Start with [`docs/README.md`](docs/README.md).
 - `tools/` — host-side measurement scripts.
