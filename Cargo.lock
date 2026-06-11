@@ -922,7 +922,7 @@ dependencies = [
 
 [[package]]
 name = "pico-10base-t-rs"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "critical-section",
  "cyw43",

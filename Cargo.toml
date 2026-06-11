@@ -1,6 +1,6 @@
 [package]
 name = "pico-10base-t-rs"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.82"
 description = "Software 10BASE-T Ethernet (PIO bit-bang TX + RX) and a wireless router on the Raspberry Pi Pico 2 W (RP2350 Hazard3 RISC-V)"
