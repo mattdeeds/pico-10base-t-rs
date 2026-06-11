@@ -3,8 +3,9 @@
 Measured on real hardware. The short version: the **bit-bang 10BASE-T TX is near
 line rate**, but two things shape real throughput — the link is **half-duplex**
 (so single-flow TCP collides with its own ACKs and varies a lot), and **10BASE-T
-RX is limited by the software clock-recovery decoder against this analog front
-end** (full-MTU frames fail FCS at a rate that collapses bulk RX to ~100 KB/s).
+RX runs ~310 KB/s at stock MTU with ~0.2% wire loss** — the former ~100 KB/s
+"decode/PHY ceiling" was root-caused (2026-06-10) to DMA-starvation sample
+loss plus ACK mis-pacing, and fixed; see `rx-bulk-ceiling.md` §9-§10.
 Latency is excellent. This is a fun, capable, *educational* software-PHY NIC and a
 working small router — not a fast router.
 
@@ -13,11 +14,11 @@ working small router — not a fast router.
 | Path | Direction | Throughput | Notes |
 |---|---|---|---|
 | **10BASE-T** (wired, the bit-bang) | TX, device→host (TCP) | **best ~0.95–1.0 MB/s**, typical single-flow ~0.4–0.7 MB/s | near line rate when clean; half-duplex collision variance + occasional RTO stalls |
-| **10BASE-T** | RX, host→device (TCP bulk) | **~100 KB/s** | PHY/decode-limited (full-MTU FCS-fail); the binding ceiling |
+| **10BASE-T** | RX, host→device (TCP bulk) | **~310 KB/s** | stock MTU, ~0.2% wire loss; immediate-ACK + 2-seg window + decode-out-of-IRQ (`rx-bulk-ceiling.md` §9-§10) |
 | **10BASE-T** | round-trip latency | **~2.6 ms** (0% loss) | ping, 30/30 |
 | **Wi-Fi LAN** (cyw43 AP, router build) | download (device→client) | **~909 KB/s** | after the gSPI 2→15 MHz fix |
 | **Wi-Fi LAN** (cyw43 AP) | upload (client→device) | **~716 KB/s** | |
-| **Routed LAN↔WAN** (NAPT) | bidirectional | bounded by the 10BT half-duplex + RX-decode ceiling | not the wire or CPU; see §Router |
+| **Routed LAN↔WAN** (NAPT) | bidirectional | bounded by the 10BT half-duplex link (TX ~1 MB/s, RX ~310 KB/s) | not the wire or CPU; see §Router |
 | **CPU** | core 1 (RX decode) | **~40 %** at idle | cost of the always-on 60 MHz sampler decoding ambient wire traffic |
 
 Line rate for reference: 10 Mbit/s ≈ 1.25 MB/s raw, ≈ 1.18 MB/s of TCP payload.
@@ -47,16 +48,23 @@ and the occasional RTO storm times out entirely. Typical single-flow average lan
 ~0.4–0.7 MB/s. (Carrier-sense + randomized backoff keep this from collapsing the way
 naive multicore TX did — see `docs/cpu-dpll-plan.md` gotcha #10.)
 
-### 10BASE-T RX (host → device) — the binding ceiling (~100 KB/s)
-Sustained bulk RX tops out at **~100 KB/s** — ~9× below TX. The cause is **decode
-reliability, not bandwidth**: at full MTU ~30 % of inbound frames fail FCS (a
-clock-drift / analog-PHY noise floor on this bit-banged front end), which collapses
-the sender's TCP congestion window (`ss` shows cwnd 10→1–2, thousands of retransmits,
-RTT a healthy ~3 ms). Small frames decode cleanly (~3 % fail ≤512 B), but real bulk
-is full-MTU. This is **PHY-limited** — the firmware decoder is near its floor; see
-`docs/rx-bulk-ceiling.md` + `docs/cpu-dpll-plan.md` §9d. The durable fix would be a
-hardware Ethernet PHY.
+### 10BASE-T RX (host → device) — ~310 KB/s after the 2026-06 fixes
+Sustained bulk RX runs **~310 KB/s at stock MTU 1500 with ~0.2% wire loss**
+(was ~100 KB/s at ~30% full-MTU FCS-fail). Two rounds of fixes, both in
+`rx-bulk-ceiling.md`:
+- **§9 — ACK pacing + window:** the 10 ms delayed-ACK timer sat exactly on
+  Linux's tail-loss-probe timer (collision storm), and the 1-segment
+  advertised window serialized the link. Immediate ACKs + a 2-segment window.
+- **§10 — the "decode cliff" was DMA starvation, not clock drift:** decode ran
+  in the DMA IRQ in front of the re-arm; under load it overran the half-fill
+  period and the PIO RX FIFO overflowed (~200×/s), silently truncating frames.
+  Decode now runs in core-1 thread context from a 6-slot image ring; the IRQ
+  only captures + re-arms in bounded time. Health counters: `rxstall` (must
+  stay 0) and `img_drop` (decode backlog) on the diag `[Stitch]` line.
 
+Remaining bounds: decode CPU time (~1-1.5 ms/frame) and the ~2.2 ms DMA
+half-fill ACK-latency floor (smaller halves are viable again now that the
+decode deadline coupling is gone).
 ### Latency — excellent
 `ping` over the wired link: **min/avg/max 2.1 / 2.6 / 3.0 ms, 0 % loss** (30 pkts).
 
@@ -69,8 +77,8 @@ bring-up SPI clock was). See `docs/perf-characterization-plan.md` §3.5.
 ### Router (LAN ↔ WAN, NAPT)
 The full routed/NAT path (Wi-Fi client ↔ Pico ↔ 10BT WAN) is **not** CPU- or
 forwarding-limited (core-0 forwarding fast-path is ~idle, drops ~0). It's bounded by
-the **slower link and the half-duplex/RX-decode interaction** on the 10BT side —
-i.e. the per-link ceilings above, with the RX-decode ceiling dominating any
+the **slower link and half-duplex contention** on the 10BT side —
+i.e. the per-link ceilings above, with the 10BT RX path bounding any
 WAN→LAN-heavy (download) flow. Best for low-rate / IoT-scale traffic.
 
 ### CPU
@@ -81,10 +89,11 @@ near-idle without load.
 
 ## Honest limitations
 
-- **RX bulk ~100 KB/s** (full-MTU decode/PHY ceiling) — accepted as a PHY limit;
-  see `docs/rx-bulk-ceiling.md`.
+- **RX bulk ~310 KB/s** — next bounds are decode CPU time and the DMA
+  half-fill latency floor; see `docs/rx-bulk-ceiling.md` §10.
 - **Half-duplex only** by MAC policy. The transceiver is *full-duplex-capable*, but
-  FD only helps contended/multi-client traffic and is still RX-decode-bounded; not
+  FD only helps contended/multi-client traffic (measured before the 2026-06 RX
+  fixes — worth re-testing against the now-clean link); not
   worth the auto-negotiation work — see `docs/full-duplex-analysis.md`.
 - **No auto-negotiation** — emits link pulses (NLPs) only; a switch parallel-detects
   it as 10BASE-T half-duplex (which is what we want).

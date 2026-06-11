@@ -30,14 +30,15 @@ Full detail + method in **[`docs/performance.md`](docs/performance.md)**. Headli
 | Path | Throughput | Note |
 |---|---|---|
 | 10BASE-T **TX** (device→host, TCP) | best **~0.95–1.0 MB/s**, typical ~0.4–0.7 | near line rate when clean; half-duplex collision variance |
-| 10BASE-T **RX** (host→device, TCP bulk) | **~100 KB/s** | decode/PHY-limited |
+| 10BASE-T **RX** (host→device, TCP bulk) | **~310 KB/s** @ 0.2% wire loss | stock MTU; ACK-pacing + decode-out-of-IRQ fixes (2026-06) |
 | 10BASE-T latency | **~2.6 ms**, 0% loss | |
 | Wi-Fi LAN (cyw43 AP) | **~909 down / ~716 up KB/s** | router build |
 
 > **It's a fun software-PHY NIC and a working router, not a
-> fast router.** The bit-bang TX is near line rate; RX bulk is limited by software
-> clock recovery against this analog front end. Latency
-> is great; ideal for low-rate / IoT-scale traffic.
+> fast router.** The bit-bang TX is near line rate; RX bulk runs ~310 KB/s
+> (the long-suspected "decode/PHY ceiling" turned out to be a fixable
+> DMA-starvation bug — see `docs/rx-bulk-ceiling.md` §10). Latency is great;
+> ideal for low-rate / IoT-scale traffic.
 
 ## Hardware
 
@@ -124,9 +125,11 @@ The cyw43 AP SSID/passphrase are **compile-time placeholders** in
 ## Limitations
 
 Half-duplex (by MAC policy; the transceiver is FD-*capable* but FD only helps
-contended traffic;
-no auto-negotiation; RX bulk capped ~100 KB/s by the decode/PHY ceiling; an
-intermittent full-MTU-inbound hang that the watchdog recovers.
+contended traffic); no auto-negotiation; RX bulk ~310 KB/s (next bounds:
+decode CPU time and the DMA half-fill ACK-latency floor — see
+`docs/rx-bulk-ceiling.md` §10). A hardware watchdog guards against hangs
+(the old full-MTU-inbound wedge stopped reproducing after the 2026-06 RX
+restructure, but the watchdog stays).
 Just an educational project, please don't replace your home router with this.
 
 ## Credits
