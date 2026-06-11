@@ -446,10 +446,27 @@ fn main_10bt(
     #[cfg(feature = "fd-bench")]
     let mut sink_tx_storage = [0u8; 2048];
     #[cfg(feature = "fd-bench")]
-    let sink_handle: SocketHandle = sockets.add(tcp::Socket::new(
-        tcp::SocketBuffer::new(&mut sink_rx_storage[..]),
-        tcp::SocketBuffer::new(&mut sink_tx_storage[..]),
-    ));
+    let sink_handle: SocketHandle = sockets.add({
+        let mut sink = tcp::Socket::new(
+            tcp::SocketBuffer::new(&mut sink_rx_storage[..]),
+            tcp::SocketBuffer::new(&mut sink_tx_storage[..]),
+        );
+        // RX-of-bulk pacing: disable the 10 ms delayed-ACK timer. With the
+        // small advertised window (max_burst_size clamp in eth_mac.rs) the
+        // timer dominated the per-segment cycle (~15 ms → ~96 KB/s), and
+        // worse, its fixed 10 ms phase sat right on Linux's tail-loss-probe
+        // timer (max(2·srtt, 10 ms)) — host probe retransmits and our delayed
+        // ACKs repeatedly transmitted into each other on the half-duplex
+        // wire, showing up as a 27–33% FCS-fail floor that vanished (→3–5%
+        // at a 1-seg window) the moment ACKs went immediate. An immediate
+        // ACK instead rides the quiet inter-frame gap right after the data
+        // frame it acknowledges. Coalescing (ack_delay = 1 ms ≈ ACK every
+        // 2nd segment) was also tried and is strictly worse (~54–78 KB/s,
+        // 43% fail): a timer-fired ACK lands mid-stream of the next inbound
+        // segment instead of in the post-frame gap.
+        sink.set_ack_delay(None);
+        sink
+    });
 
     // R15a — WAN-as-DHCP-client sockets. Buffers live in this never-returning
     // fn's stack (same pattern as the udp/tcp buffers above), so the borrows the

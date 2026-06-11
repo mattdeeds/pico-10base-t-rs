@@ -449,7 +449,19 @@ impl phy::Device for EthMac {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ethernet;
         caps.max_transmission_unit = MTU;
-        caps.max_burst_size = Some(1);
+        // smoltcp clamps the advertised TCP receive window to
+        // `max_burst_size × MSS` (iface/packet.rs), so this is really the
+        // RX-of-bulk pipelining knob (it does NOT limit TX). Measured on the
+        // wired rig (2026-06-10, with the immediate-ACK sink in main.rs):
+        //   Some(1) → ~135 KB/s  (serialized: one segment per ACK round-trip;
+        //                         also keeps the host at sub-MTU segments)
+        //   Some(2) → ~183 KB/s  (host pipelines full-MTU segments; the ~27%
+        //                         full-MTU decode loss is absorbed by TCP
+        //                         fast-retransmit instead of stalling)
+        //   Some(4) → ~178 KB/s  (no further gain, more loss: ~32% FCS-fail)
+        // Some(2) is BDP-matched for the 10BASE-T half-duplex link; going
+        // wider only adds contention/decode loss without throughput.
+        caps.max_burst_size = Some(2);
         caps
     }
 }
