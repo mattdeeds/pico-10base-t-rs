@@ -8,10 +8,10 @@
 //! 60 MHz = 3 samples per Manchester half-bit, matching the C version.
 //!
 //! Layer 2 (this phase, R3.3): DMA writes the PIO RX FIFO into two
-//! `[u32; 4096]` half-buffers in turn, chained so that when one fills the
+//! `[u32; BUF_WORDS]` half-buffers in turn, chained so that when one fills the
 //! other automatically starts. `poll_with` returns the just-completed half
 //! to the caller as a `&[u8]` and immediately re-arms it. Caller must poll
-//! at least every 2.18 ms (= one half-fill time) or samples drop.
+//! at least once per half-fill time (~2.18 ms) or samples drop.
 
 use rp235x_hal as hal;
 use hal::dma::{double_buffer, Channel, SingleChannel, CH0, CH1};
@@ -47,7 +47,19 @@ const HB1_CENTER_OFFSET: usize = 4;
 #[cfg(feature = "sample-rate-20mhz")]
 const HB1_CENTER_OFFSET: usize = 1;
 
-/// Words per half-buffer. 4096 u32 = 16 KB = 16384 bytes = ~2.18 ms of audio.
+/// Words per half-buffer. 4096 u32 = 16 KB = ~2.18 ms of samples at 60 MHz.
+///
+/// Sizing trade-off (measured 2026-06-10, see docs/rx-bulk-ceiling.md): the
+/// half-fill time is a fixed latency floor under every RX→response cycle —
+/// a frame can't decode until the half containing its *end* completes — so
+/// smaller halves cut TCP ACK latency. BUT decode runs inline in the
+/// DMA_IRQ_0 handler, so the half-fill time is also the decode deadline:
+/// 2048-word halves (1.09 ms) were tried and a ~1.7 ms mid-size-frame decode
+/// overran the deadline, clipping the next back-to-back segment (50% FCS
+/// fail, net regression). Don't shrink below decode-worst-case (~2.6 ms ≈
+/// this size) without first moving decode out of the re-arm path.
+/// (`poll_with` already handles frames outspanning one half via carry
+/// accumulation, so the carry logic is not the blocker.)
 pub const BUF_WORDS: usize = 4096;
 /// Bytes per half-buffer.
 pub const BUF_BYTES: usize = BUF_WORDS * 4;
@@ -481,7 +493,7 @@ impl EthRx {
     /// Non-blocking. If a DMA half just completed, hand the just-finished
     /// half to `f` for scanning, carrying any frame that straddled the
     /// boundary across the swap, then update the carry and re-arm DMA.
-    /// Caller must call this at least once per ~2.18 ms (one half-fill time)
+    /// Caller must call this at least once per half-fill time (~2.18 ms)
     /// or samples drop.
     ///
     /// Scan-in-place to avoid a 16 KB copy every half (it was ~296 µs of the
@@ -521,6 +533,25 @@ impl EthRx {
             let mut k = 0;
             while k < BUF_BYTES && new_bytes[k] != 0x00 && new_bytes[k] != 0xFF {
                 k += 1;
+            }
+            if k == BUF_BYTES {
+                // The whole half is active: the straddling frame hasn't ended
+                // yet (can't happen with 16 KB halves and legal frame sizes,
+                // but keeps smaller halves correct). Append the
+                // half to the carry and keep waiting for the half that
+                // contains the frame's end — decoding now would clip it.
+                if cl + BUF_BYTES <= MAX_CARRY_BYTES {
+                    self.carry[cl..cl + BUF_BYTES].copy_from_slice(new_bytes);
+                    self.carry_len = cl + BUF_BYTES;
+                } else {
+                    // Over budget. A real frame + TP_IDL straggle fits in
+                    // MAX_CARRY_BYTES, so this is sustained noise — drop the
+                    // run and count it, same semantics as the tail cap below.
+                    self.carry_capped = self.carry_capped.wrapping_add(1);
+                    self.carry_len = 0;
+                }
+                self.xfer = Some(idle.write_next(finished));
+                return;
             }
             // Stitch only carry + that tail (cl + k <= STITCH_BUF_BYTES).
             self.stitch[..cl].copy_from_slice(&self.carry[..cl]);

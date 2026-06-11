@@ -37,15 +37,20 @@ use smoltcp::time::Instant;
 
 #[cfg(not(feature = "mss-clamp"))]
 pub const MTU: usize = 1500;
-/// Experiment (`docs/rx-bulk-ceiling.md` §5): clamp the advertised IP MTU so our
-/// SYN/SYN-ACK advertises a small TCP MSS (≈ MTU−40) → peers send sub-knee
-/// segments (on-wire frame ≈ MTU+26 B; the RX decode cliff starts ~600 B on-wire).
-/// Tests whether keeping inbound frames below the clock-drift cliff lifts
-/// RX-of-bulk past the ~100 KB/s ceiling. Only `max_transmission_unit` uses this
-/// const (no buffers), so clamping is safe; default off → production unchanged.
-/// 500 → MSS ≈ 460, on-wire ≈ 526 B (clean ~3-4 % decode region).
+/// `mss-clamp` (`docs/rx-bulk-ceiling.md` §5/§9): clamp the advertised IP MTU
+/// so our SYN/SYN-ACK advertises a small TCP MSS (≈ MTU−40) → peers send
+/// segments below the RX clock-drift decode cliff. Only
+/// `max_transmission_unit` uses this const (no buffers), so clamping is safe;
+/// default off → production unchanged.
+///
+/// 1000 is the measured sweet spot (2026-06-10 MTU sweep on the wired rig,
+/// with immediate ACKs + the 2-segment window): ~1004 B on-wire decodes at
+/// ~1% FCS-fail and RX-of-bulk hits ~200 KB/s, vs ~30% fail / ~180 KB/s at
+/// full MTU. The cliff is sharp: 1104 B → 12% fail, 1204 B → ~25%. Smaller
+/// is NOT better — 500 (the original value) triples the frame/ACK rate and
+/// post-frame-gap contention collapses throughput to ~30-40 KB/s.
 #[cfg(feature = "mss-clamp")]
-pub const MTU: usize = 500;
+pub const MTU: usize = 1000;
 /// Slack over 1518-byte max Ethernet frame; decoder allocates this much.
 pub const MAX_FRAME_BYTES: usize = 1600;
 /// How many decoded frames the inbox can hold before back-pressure forces
@@ -238,72 +243,82 @@ fn process_completed_half(engine: &mut RxEngine) {
     let our_mac = engine.our_mac;
     let mut acc = StatsDelta::new();
 
-    engine.rx.poll_with(|bytes| {
-        let mut cursor = 0;
-        while let Some((off, len)) = EthRx::find_active_run_from(bytes, cursor, 100) {
-            cursor = off + len;
-            // MAC filter first — cheap peek (~1–2 µs) that skips the full
-            // decode + CRC + push for frames not addressed to us. We accept
-            // unicast-to-us + all multicast/broadcast.
-            let Some(dst) = EthRx::peek_dst_mac(bytes, off, len) else {
-                continue;
-            };
-            if !mac_accept(&dst, &our_mac) {
-                acc.filtered = acc.filtered.wrapping_add(1);
-                continue;
-            }
-            // Manchester decoder: by default the edge-track DPLL (productized
-            // in R10 — re-anchors to each per-bit mid-bit transition so
-            // accumulated clock drift can't walk the sample point off). With
-            // `--features decoder-openloop` the pre-R10 fixed-stride open-loop
-            // decoder is used instead, for FCS-ceiling A/B vs Niccle. See
-            // triage plan.
-            #[cfg(feature = "decoder-openloop")]
-            let decoded = EthRx::decode_frame(bytes, off, len);
-            #[cfg(not(feature = "decoder-openloop"))]
-            let decoded = crate::eth_rx_dpll::decode_frame_edge_track(&bytes[off..off + len]);
-            let Some(mut frame) = decoded else {
-                continue;
-            };
-            let flen = EthRx::derive_frame_len(&frame);
-            let ok = EthRx::verify_fcs(&frame, flen);
-            let n = flen.min(frame.len());
-
-            acc.decoded = acc.decoded.wrapping_add(1);
-            if ok {
-                acc.ok = acc.ok.wrapping_add(1);
-            } else {
-                acc.fail = acc.fail.wrapping_add(1);
-            }
-            let snap_n = n.min(acc.last_snap.len());
-            acc.last_snap[..snap_n].copy_from_slice(&frame[..snap_n]);
-            acc.last_snap_len = snap_n;
-            acc.last_len = n;
-            acc.last_ok = ok;
-            acc.have_last = true;
-
-            if !ok {
-                continue;
-            }
-            frame.truncate(n);
-            // Brief cross-core lock: publish this frame + inbox-side stats.
-            with_rx_shared(|shared| {
-                if shared.inbox.is_full() {
-                    let _ = shared.inbox.pop_front();
-                    shared.stats.inbox_dropped = shared.stats.inbox_dropped.wrapping_add(1);
-                }
-                let _ = shared.inbox.push_back(frame);
-                let depth = shared.inbox.len() as u8;
-                if depth > shared.stats.inbox_high_water {
-                    shared.stats.inbox_high_water = depth;
-                }
-            });
-        }
-    });
+    engine.rx.poll_with(|bytes| scan_runs(&our_mac, bytes, &mut acc));
     acc.carry = engine.rx.take_carry_capped();
+    merge_stats(&acc);
+}
 
-    // Brief cross-core lock: merge the decode-side stat deltas + last-frame
-    // snapshot in one shot.
+/// Walk every frame-shaped active run in `bytes`, decode + verify the ones
+/// addressed to us, publish FCS-OK frames to the shared inbox, and tally
+/// stat deltas into `acc`. Shared by the half-completion path (the slices
+/// `poll_with` hands out) and the live-decode path (a terminated-run window
+/// of the in-flight half).
+fn scan_runs(our_mac: &[u8; 6], bytes: &[u8], acc: &mut StatsDelta) {
+    let mut cursor = 0;
+    while let Some((off, len)) = EthRx::find_active_run_from(bytes, cursor, 100) {
+        cursor = off + len;
+        // MAC filter first — cheap peek (~1–2 µs) that skips the full
+        // decode + CRC + push for frames not addressed to us. We accept
+        // unicast-to-us + all multicast/broadcast.
+        let Some(dst) = EthRx::peek_dst_mac(bytes, off, len) else {
+            continue;
+        };
+        if !mac_accept(&dst, our_mac) {
+            acc.filtered = acc.filtered.wrapping_add(1);
+            continue;
+        }
+        // Manchester decoder: by default the edge-track DPLL (productized
+        // in R10 — re-anchors to each per-bit mid-bit transition so
+        // accumulated clock drift can't walk the sample point off). With
+        // `--features decoder-openloop` the pre-R10 fixed-stride open-loop
+        // decoder is used instead, for FCS-ceiling A/B vs Niccle. See
+        // triage plan.
+        #[cfg(feature = "decoder-openloop")]
+        let decoded = EthRx::decode_frame(bytes, off, len);
+        #[cfg(not(feature = "decoder-openloop"))]
+        let decoded = crate::eth_rx_dpll::decode_frame_edge_track(&bytes[off..off + len]);
+        let Some(mut frame) = decoded else {
+            continue;
+        };
+        let flen = EthRx::derive_frame_len(&frame);
+        let ok = EthRx::verify_fcs(&frame, flen);
+        let n = flen.min(frame.len());
+
+        acc.decoded = acc.decoded.wrapping_add(1);
+        if ok {
+            acc.ok = acc.ok.wrapping_add(1);
+        } else {
+            acc.fail = acc.fail.wrapping_add(1);
+        }
+        let snap_n = n.min(acc.last_snap.len());
+        acc.last_snap[..snap_n].copy_from_slice(&frame[..snap_n]);
+        acc.last_snap_len = snap_n;
+        acc.last_len = n;
+        acc.last_ok = ok;
+        acc.have_last = true;
+
+        if !ok {
+            continue;
+        }
+        frame.truncate(n);
+        // Brief cross-core lock: publish this frame + inbox-side stats.
+        with_rx_shared(|shared| {
+            if shared.inbox.is_full() {
+                let _ = shared.inbox.pop_front();
+                shared.stats.inbox_dropped = shared.stats.inbox_dropped.wrapping_add(1);
+            }
+            let _ = shared.inbox.push_back(frame);
+            let depth = shared.inbox.len() as u8;
+            if depth > shared.stats.inbox_high_water {
+                shared.stats.inbox_high_water = depth;
+            }
+        });
+    }
+}
+
+/// Brief cross-core lock: merge the decode-side stat deltas + last-frame
+/// snapshot in one shot.
+fn merge_stats(acc: &StatsDelta) {
     with_rx_shared(|shared| {
         let s = &mut shared.stats;
         s.frames_decoded = s.frames_decoded.wrapping_add(acc.decoded);
@@ -320,6 +335,7 @@ fn process_completed_half(engine: &mut RxEngine) {
         }
     });
 }
+
 
 /// DMA channel-completion IRQ. Linker-resolved via `extern "Rust"` in
 /// `rp235x-hal::arch`; needs `#[unsafe(no_mangle)]` for the symbol name to
@@ -351,6 +367,7 @@ fn DMA_IRQ_0() {
     #[cfg(feature = "router")]
     let _cyc = crate::cycles::CycleSpan::new(&crate::cycles::CORE1_BUSY);
     process_completed_half(engine);
+
 }
 
 pub struct EthMac {

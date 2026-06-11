@@ -204,3 +204,85 @@ a decoder bug:
 full NCO-phase-tracked matched filter) is complex and §9d predicts marginal returns.
 The high-value lever for full-MTU RX is a **hardware PHY** — ties to the
 `docs/full-duplex-analysis.md` "real PHY" option and any board respin.
+
+## 9. RX-of-bulk: ACK pacing + window + MTU sweep — 96 → ~200 KB/s (2026-06-10)
+
+Branch `rx-ack-pacing`. Three coordinated changes, each A/B'd on the wired rig
+(`/tmp/rx_bench.sh`-style: `cat /dev/zero | nc <dev> 9999`, flow control =
+device RX rate, 3-5 runs per config; FCS% from `[Rx]` lines with dec>50):
+
+| config | mean RX | FCS-fail |
+|---|---|---|
+| baseline: `Some(1)` + 10 ms delayed-ACK | 93–96 KB/s | 27–33 % |
+| immediate ACK, `Some(1)` | 129–141 | 3–5 % |
+| immediate ACK, `Some(2)` (full MTU) | 163–198 | ~27 % |
+| immediate ACK, `Some(4)` (full MTU) | 163–186 | ~32 % |
+| **immediate ACK, `Some(2)`, `mss-clamp` MTU=1000** | **174–208** | **1–3 %** |
+
+1. **`set_ack_delay(None)`** on the :9999 sink (main.rs). At a 1-segment
+   advertised window smoltcp's immediate-ACK rule (>1 MSS unacked) can never
+   fire, so every segment paid the full 10 ms delayed-ACK timer — and that
+   fixed 10 ms phase sits exactly on Linux's tail-loss-probe timer
+   (`max(2·srtt, 10 ms)` = 10 ms at our sub-5 ms srtt), so host probe
+   retransmits and our delayed ACKs repeatedly transmitted into each other on
+   the half-duplex wire. Most of the "27–33 % decode loss" at baseline was
+   actually this collision storm (device decoded 2–3× more frames than
+   goodput). Immediate ACKs ride the post-frame quiet gap. ACK *coalescing*
+   (1 ms delay ≈ ACK every 2nd segment) is strictly worse (54–78 KB/s, 43 %):
+   a timer-fired ACK lands mid-stream of the next inbound segment.
+2. **`max_burst_size = Some(2)`** (eth_mac.rs). smoltcp clamps the advertised
+   window to `max_burst_size × MSS` (iface/packet.rs; RX-window-only — TX
+   verified unaffected at 505–941 KB/s). With ACK pacing fixed, 2 segments
+   in flight lets the host pipeline; `Some(4)` adds loss with no gain
+   (PR #1 regressed mainly because it opened the window *without* fixing
+   ACK pacing).
+3. **`mss-clamp` MTU 500 → 1000** (eth_mac.rs). The decode cliff (§5/§8) is
+   sharp and sits just above 1004 B on-wire: 1004 B → ~1 % fail, 1104 B →
+   12 %, 1204 B → ~25 %, 1504 B → ~30 %. MTU=1000 rides just under it.
+   §5's refutation of MTU=500 still stands — and is now explained: at the
+   old serialized 15 ms/segment regime, small segments just meant less data
+   per cycle; under pipelining, tripling the frame/ACK rate explodes
+   post-frame-gap contention (44 % fail). Bigger-but-sub-cliff wins.
+
+The §4 "track CLOSED at ~100 KB/s" verdict is superseded: ~200 KB/s with the
+clamp feature on, ~180 KB/s at stock MTU. The decode cliff itself (§8,
+PHY-limited) still stands and is the binding constraint again.
+
+### 9.1 Tried and rejected: DMA-half latency attacks
+
+The per-segment cycle still carries the DMA half-fill latency (a frame can't
+decode until the 16 KB / 2.18 ms half containing its end completes — also why
+idle RTT is ~2.5 ms). Three attempts to cut it, all benched, none kept:
+
+- **8 KB halves** (with carry accumulated across swaps — that fix IS kept in
+  `poll_with`): decode (~1.7 ms for a 1 kB frame) runs inline in `DMA_IRQ_0`,
+  so the half-fill time is also the decode deadline; 1.09 ms halves overran
+  it and clipped the following back-to-back segment. 128–157 KB/s @ 50 %
+  fail. Don't shrink `BUF_WORDS` without first moving decode out of the
+  re-arm path.
+- **Core-1 busy-poll live decode** (scan the in-flight half via the DMA write
+  cursor, decode each frame as its run terminates): cut idle RTT to ~1.1 ms
+  but regressed bulk. Root cause of the regression was never pinned —
+  the UDP "discriminator" used to chase it was confounded (see below).
+- **In-IRQ live scan piggyback** (one early scan at the end of each
+  `DMA_IRQ_0`): clean, but a wash (161–198 KB/s) — at `Some(2)`/MTU-1000 both
+  in-flight segments usually land in the *same* half and decode together, so
+  the boundary case it accelerates is rare. Removed; not worth the unsafe
+  cursor-aliasing complexity.
+
+Next lever for the cycle time is **decode CPU cost** (~1.7 ms/kB-frame on the
+240 MHz Hazard3): the DPLL inner loop, not more TCP/window tuning.
+
+### 9.2 Methodology gotchas (so the next session doesn't repay this tuition)
+
+- **UDP-to-closed-port is NOT a "no device TX" RX test**: smoltcp answers
+  every datagram with ICMP port-unreachable (~160/s measured) and those
+  replies collide with subsequent inbound frames. A whole bisect tree
+  ("busy core 1 corrupts sampling") was built on this confound before the
+  `tx_icmp` counter exposed it. Use **UDP broadcast** (no ICMP reply,
+  `tx_icmp=0`) for a true zero-TX RX test.
+- **Open question (pre-existing, NOT from this session's changes):** even on
+  production builds, an unsynchronized 250 f/s × 996 B UDP broadcast blast
+  fails ~50 % FCS while flow-controlled TCP at the same frame size fails ~1 %.
+  Candidates: NLP TX landing mid-frame, the 4 ms cadence vs 2.18 ms half
+  cadence, host NIC burst behavior. Worth its own investigation.
