@@ -1,18 +1,8 @@
-//! Minimal LAN DHCP server (R14.4).
+//! Minimal LAN DHCP server using smoltcp's DHCP codec.
 //!
-//! smoltcp ships only a DHCP *client*, so the server is ours — but we reuse
-//! smoltcp's DHCP *wire codec* (`DhcpRepr`/`DhcpPacket`, gated by the
-//! `proto-dhcpv4` feature) to parse requests and emit replies, so there's no
-//! hand-rolled BOOTP byte layout.
-//!
-//! It runs as a UDP socket on port 67 inside the wireless `net_task`'s
-//! `SocketSet`: each poll we drain the socket, answer DISCOVER with OFFER and
-//! REQUEST with ACK, handing out a fixed `192.168.4.0/24` pool with the Pico's
-//! LAN IP (`192.168.4.1`) as gateway and a DNS server (R18 — see
-//! [`LAN_DNS_OFFER`]). Replies are broadcast to
-//! `255.255.255.255:68` (the client has no IP/ARP entry yet). Leases are keyed
-//! by client MAC so a given client keeps its address across DISCOVER→REQUEST and
-//! reconnects; the table is fixed-size (no alloc).
+//! Answers DISCOVER with OFFER and REQUEST with ACK from a fixed pool in
+//! `192.168.4.0/24`, keyed by client MAC. Replies are broadcast.
+//! Gateway is `192.168.4.1`; DNS is [`LAN_DNS_OFFER`].
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -27,8 +17,7 @@ const SERVER_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
 const SUBNET_MASK: Ipv4Address = Ipv4Address::new(255, 255, 255, 0);
 /// Lease pool: `192.168.4.{POOL_BASE .. POOL_BASE+POOL_LEN}` (slot i ↔ that IP).
 const POOL_BASE: u8 = 10;
-/// Lease pool size. `pub` so the mgmt page can size its body to fit one line per
-/// possible lease (R18) without a magic number that silently undersizes.
+/// Lease pool size. Public so the mgmt page can size its body.
 pub const POOL_LEN: usize = 32;
 /// Lease time handed to clients (1 hour).
 const LEASE_SECS: u32 = 3600;
@@ -38,14 +27,8 @@ const OPT_DNS_SERVER: u8 = 6;
 /// Count of DHCP replies (OFFER + ACK) emitted — surfaced in the `[Cyw43]` line.
 pub static DHCP_TX: AtomicU32 = AtomicU32::new(0);
 
-/// The DNS server advertised to LAN clients in every OFFER/ACK, stored as its
-/// four IPv4 octets packed big-endian (R18). Defaults to a public resolver
-/// (`8.8.8.8`) so name resolution works before the WAN lease lands; `wan_task`
-/// overwrites it with the upstream resolver learned from the WAN DHCP lease.
-///
-/// No DNS *relay* is needed: R17 NAPT already forwards LAN→WAN UDP, so a client's
-/// query to this address is NAT'd out the WAN and the reply NAT'd back like any
-/// other flow (router-plan §6.4 — "just NAT port 53 through").
+/// DNS server offered to LAN clients, as big-endian octets. Starts at 8.8.8.8;
+/// `wan_task` sets it from the WAN lease. NAPT forwards the queries.
 pub static LAN_DNS_OFFER: AtomicU32 = AtomicU32::new(u32::from_be_bytes([8, 8, 8, 8]));
 
 /// Fixed MAC→IP lease allocator. `leases[i] == Some(mac)` means
@@ -61,7 +44,7 @@ impl DhcpServer {
         }
     }
 
-    /// Iterate the currently-held leases as `(ip, mac)` — for the R18 mgmt page.
+    /// Currently held leases as `(ip, mac)`.
     pub fn active_leases(&self) -> impl Iterator<Item = (Ipv4Address, [u8; 6])> + '_ {
         self.leases
             .iter()
@@ -79,15 +62,13 @@ impl DhcpServer {
         Some(ip_for(i))
     }
 
-    /// Drain the DHCP socket and answer DISCOVER/REQUEST. Call every poll, after
-    /// `iface.poll` has delivered any inbound datagrams. Binds lazily to :67.
+    /// Answer queued DISCOVER/REQUESTs. Call after each `iface.poll`. Binds :67 lazily.
     pub fn poll(&mut self, socket: &mut udp::Socket) {
         if !socket.is_open() {
             let _ = socket.bind(DHCP_SERVER_PORT);
         }
 
-        // A handful per call keeps the loop bounded; `recv_slice` errors when
-        // the queue is drained.
+        // At most 4 per call to bound the loop.
         let mut req_buf = [0u8; 1024];
         for _ in 0..4 {
             let len = match socket.recv_slice(&mut req_buf) {
@@ -112,17 +93,14 @@ impl DhcpServer {
         let reply_type = match req.message_type {
             DhcpMessageType::Discover => DhcpMessageType::Offer,
             DhcpMessageType::Request => DhcpMessageType::Ack,
-            // Release/Decline/Inform/etc. — ignored for this LAN-bring-up server.
+            // Other message types are ignored.
             _ => return None,
         };
 
         let your_ip = self.allocate(req.client_hardware_address.0)?;
 
-        // R18: advertise a DNS server (RFC 2132 option 6). We emit it as a raw
-        // option via `additional_options` rather than `DhcpRepr.dns_servers` —
-        // that typed field is a smoltcp-internal heapless-0.9 `Vec` we can't
-        // name from our heapless 0.8. `dns_octets`/`extra_opts` must outlive the
-        // `reply.emit` below (they do — both are locals).
+        // DNS goes in as raw option 6: `DhcpRepr.dns_servers` uses smoltcp's
+        // heapless 0.9 Vec, which our heapless 0.8 can't name.
         let dns_octets = LAN_DNS_OFFER.load(Ordering::Relaxed).to_be_bytes();
         let extra_opts = [DhcpOption {
             kind: OPT_DNS_SERVER,
@@ -140,15 +118,13 @@ impl DhcpServer {
             router: Some(SERVER_IP),
             subnet_mask: Some(SUBNET_MASK),
             relay_agent_ip: Ipv4Address::UNSPECIFIED,
-            // Broadcast the reply: the client has no IP (and we no ARP entry for
-            // it) until it applies this lease.
+            // Broadcast: the client has no IP yet.
             broadcast: true,
             requested_ip: None,
             client_identifier: None,
             server_identifier: Some(SERVER_IP),
             parameter_request_list: None,
-            // DNS is advertised via `additional_options` below (option 6), not
-            // this typed field — see the note on `extra_opts`.
+            // DNS is sent via `additional_options`.
             dns_servers: None,
             max_size: None,
             lease_duration: Some(LEASE_SECS),

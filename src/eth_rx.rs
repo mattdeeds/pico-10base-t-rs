@@ -1,21 +1,8 @@
-//! 10BASE-T Ethernet RX over PIO + DMA double-buffer.
+//! 10BASE-T RX: PIO sampler + DMA double-buffer.
 //!
-//! Ports `src/rx_10base_t.pio` and (in later phases) the decoder from
-//! `src/eth_rx.c` in the C reference repo.
-//!
-//! Layer 1: a continuous PIO sampler — `in pins, 1` at 60 MHz on the
-//! ISL3177E RO pin (= GP13). Autopush 32 bits per FIFO word, LSB-first.
-//! 60 MHz = 3 samples per Manchester half-bit, matching the C version.
-//!
-//! Layer 2: DMA writes the PIO RX FIFO into two `[u32; BUF_WORDS]`
-//! half-buffers in turn, chained so that when one fills the other
-//! automatically starts. `poll_into` captures the completed half into a
-//! caller-provided image slot and re-arms the DMA in bounded time; the
-//! (potentially multi-ms) scan + decode runs from that copy in thread
-//! context, so a long decode can never starve the re-arm. The re-arm must
-//! happen within ~2 half-fill times (~4.4 ms) of a completion or the PIO RX
-//! FIFO (8 words ≈ 4.3 µs) overflows and samples are silently lost — the
-//! `rxstall` counter on the diag log watches for exactly that.
+//! PIO samples RO (GP13) at `SAMPLE_HZ`, 32 bits per FIFO word, LSB-first.
+//! DMA fills two half-buffers in turn. `poll_into` must re-arm within
+//! ~4.4 ms or the PIO FIFO overflows and samples are lost (`rxstall`).
 
 use rp235x_hal as hal;
 use hal::dma::{double_buffer, Channel, SingleChannel, CH0, CH1};
@@ -27,20 +14,14 @@ use hal::pio::{
 #[cfg(feature = "decoder-openloop")]
 use crate::eth_mac::MAX_FRAME_BYTES;
 
-/// Sample rate. Default: 60 MHz = 3 samples per Manchester half-bit
-/// (half-bit = 50 ns @ 10 Mbps). With `--features sample-rate-20mhz` the
-/// PIO sampler runs at 20 MHz = 1 sample per half-bit (Niccle's pipeline),
-/// which is the Nyquist minimum and disables any per-bit edge tracking —
-/// hence the feature also forces the open-loop decoder.
+/// Sampler rate: 60 MHz = 3 samples per half-bit.
+/// `sample-rate-20mhz` gives 1 per half-bit and forces the open-loop decoder.
 #[cfg(not(feature = "sample-rate-20mhz"))]
 pub const SAMPLE_HZ: u32 = 60_000_000;
 #[cfg(feature = "sample-rate-20mhz")]
 pub const SAMPLE_HZ: u32 = 20_000_000;
 
-/// Samples per data bit and the in-bit center offset, derived from `SAMPLE_HZ`.
-/// At 60 MHz: 6 samples/bit, midpoint of HB[1] = bit-start + 4 (= half-bit
-/// width 3 + offset 1 into the second half). At 20 MHz: 2 samples/bit, "center"
-/// of HB[1] = bit-start + 1.
+/// Samples per data bit, and offset from bit start to mid second half-bit.
 #[cfg(not(feature = "sample-rate-20mhz"))]
 const SAMPLES_PER_BIT: usize = 6;
 #[cfg(feature = "sample-rate-20mhz")]
@@ -51,40 +32,20 @@ const HB1_CENTER_OFFSET: usize = 4;
 #[cfg(feature = "sample-rate-20mhz")]
 const HB1_CENTER_OFFSET: usize = 1;
 
-/// Words per half-buffer. 4096 u32 = 16 KB = ~2.18 ms of samples at 60 MHz.
-///
-/// The half-fill time is a fixed latency floor under every RX→response
-/// cycle: a frame can't decode until the half containing its *end*
-/// completes. Since the 2026-06-10 restructure (decode moved out of the
-/// DMA_IRQ_0 handler into core 1's thread loop; the IRQ only captures the
-/// image + re-arms in ~bounded µs), the old decode-deadline coupling is
-/// gone, so smaller halves are now *viable* if the added per-half overhead
-/// is worth the latency cut — `poll_into` handles frames outspanning one
-/// half via carry accumulation. Untested at other sizes since the
-/// restructure; 16 KB is the known-good configuration.
+/// Words per half-buffer: 16 KB, ~2.18 ms at 60 MHz.
+/// Also the RX latency floor. Other sizes are untested.
 pub const BUF_WORDS: usize = 4096;
 /// Bytes per half-buffer.
 pub const BUF_BYTES: usize = BUF_WORDS * 4;
 
-/// Maximum trailing-active bytes we carry from one DMA half into the next so
-/// frames straddling the boundary aren't truncated. A max-sized Ethernet
-/// frame (1518 bytes) + preamble/SFD (8) = 1526 data bytes. At 60 MHz (default)
-/// that's × 6 sample-bytes per data byte ≈ 9.2 KB; at 20 MHz it's ≈ 3 KB.
-/// 16 KB gives ample slack for TP_IDL straggle + a few NLPs trailing into
-/// the carry. Bumped from 12 KB after post-R5 telemetry suggested a small
-/// fraction of frames were getting their preamble clipped at the cap (see
-/// `carry_capped` on `EthRx`).
+/// Max bytes carried into the next half for straddling frames.
+/// A 1526-byte frame is ~9.2 KB of samples at 60 MHz; 16 KB adds slack.
 pub const MAX_CARRY_BYTES: usize = 16 * 1024;
 
-/// Processing-image slot size: worst case carry prefix + a full half.
-/// (`poll_into` writes `carry ++ settled-half` into a caller slot this big.)
+/// Image slot size: max carry plus one half.
 pub const STITCH_BUF_BYTES: usize = BUF_BYTES + MAX_CARRY_BYTES;
 
-/// Upper bound on the SFD search in `decode_frame` — preserves the historical
-/// 1600-bit extraction cap. The SFD normally appears within the first ~64 data
-/// bits (7-byte preamble + SFD); this only bounds the pathological no-SFD case
-/// so a noise run can't spin the search unboundedly. Only used by the
-/// `decoder-openloop` feature; off by default the open-loop decoder is gone.
+/// Cap on the open-loop SFD search, bounding noise runs.
 #[cfg(feature = "decoder-openloop")]
 const SFD_SEARCH_BITS: usize = 1600;
 
@@ -99,19 +60,13 @@ type Xfer = double_buffer::Transfer<
     double_buffer::WriteNext<RxBuf>,
 >;
 
-/// Read one sample bit out of the packed PIO buffer. `bit_offset` is the
-/// absolute bit index from the start of `bytes`; PIO autopush packs samples
-/// LSB-first within each byte (sample 0 → bit 0 of byte 0).
+/// Sample bit at `bit_offset`, packed LSB-first per byte.
 #[inline]
 fn sample_bit(bytes: &[u8], bit_offset: usize) -> u8 {
     (bytes[bit_offset >> 3] >> (bit_offset & 7)) & 1
 }
 
-/// Find F — the first H→L transition within the first `nsamples` samples of
-/// the run, as a sample offset from `base_bit`. F marks the start of
-/// half-bit 0. Returns `None` if no falling edge is present. Open-loop
-/// helper used by `peek_dst_mac` (the IRQ-side MAC filter only — full-frame
-/// decoding now goes through the edge-track DPLL in `eth_rx_dpll`).
+/// Offset of the first H→L edge (start of half-bit 0), if any.
 #[inline]
 fn find_first_falling_edge(bytes: &[u8], base_bit: usize, nsamples: usize) -> Option<usize> {
     let mut prev = sample_bit(bytes, base_bit);
@@ -125,14 +80,8 @@ fn find_first_falling_edge(bytes: &[u8], base_bit: usize, nsamples: usize) -> Op
     None
 }
 
-/// The phase-locked data bit at logical half-bit index `k`: the sample at
-/// `F + HB1_CENTER_OFFSET + SAMPLES_PER_BIT * k` (the midpoint of the second
-/// half-bit of Manchester pair k). Stride/offset come from `SAMPLE_HZ` —
-/// default 60 MHz gives F+4+6k, the `sample-rate-20mhz` feature gives F+1+2k.
-/// Returns `None` once that sample would fall past `nsamples`, i.e. the run
-/// ran out before bit `k`. This is the per-bit primitive the single-pass
-/// decoder reads on demand, instead of materializing every bit into an
-/// intermediate `Vec`.
+/// Open-loop data bit `k`: the sample at `F + HB1_CENTER_OFFSET + SAMPLES_PER_BIT * k`.
+/// `None` once past `nsamples`.
 #[inline]
 fn data_bit(bytes: &[u8], base_bit: usize, f: usize, k: usize, nsamples: usize) -> Option<u8> {
     let idx = f + HB1_CENTER_OFFSET + SAMPLES_PER_BIT * k;
@@ -143,11 +92,8 @@ fn data_bit(bytes: &[u8], base_bit: usize, f: usize, k: usize, nsamples: usize) 
     }
 }
 
-/// Locate the SFD end: the index of the *second* `1` in the first `1,1`
-/// data-bit pair (the trailing two bits of the 0xD5 SFD byte, LSB-first).
-/// Reads data bits on demand up to `max_bits`, stopping early if the run's
-/// samples are exhausted. Frame data starts at the next bit (`sfd_end + 1`).
-/// Returns `None` if no SFD pair is found within the searched window.
+/// Bit index ending the SFD (second bit of the first `1,1` pair) within
+/// `max_bits`. Frame data starts at the next bit.
 #[inline]
 fn find_sfd_end(
     bytes: &[u8],
@@ -167,31 +113,19 @@ fn find_sfd_end(
     None
 }
 
-/// PIO RX + DMA double-buffer state. Holds the running SM (so it isn't
-/// dropped), and the current `WriteNext` transfer wrapped in an `Option`
-/// so `poll_with` can `take()` it for the wait/re-arm cycle.
-///
-/// `carry` holds the trailing active bytes of the previous half so a frame
-/// straddling the half boundary survives across DMA swap. `stitch` is the
-/// scratch the carry + current half get concatenated into before the
-/// caller's decoder scans it.
+/// PIO RX + DMA double-buffer state. `carry` holds a frame straddling halves.
 pub struct EthRx {
     _sm: StateMachine<(PIO0, SM1), Running>,
     xfer: Option<Xfer>,
     carry: CarryBuf,
     carry_len: usize,
-    /// Number of times the trailing-active walkback in `poll_with` hit the
-    /// MAX_CARRY_BYTES cap (vs. terminating on a non-active byte). Each
-    /// occurrence is a frame whose start got clipped — read via
-    /// `take_carry_capped()` to monitor + tune the carry budget.
+    /// Times the carry hit `MAX_CARRY_BYTES`, clipping a frame.
     pub carry_capped: u32,
 }
 
 impl EthRx {
-    /// Install the RX PIO program on PIO0 SM1, start it sampling `rx_pin_id`,
-    /// and arm the DMA double-buffer between the PIO RX FIFO and the two
-    /// caller-provided buffers. Caller must have already reassigned the GPIO
-    /// to PIO0 function.
+    /// Start the sampler on PIO0 SM1 and arm the DMA double-buffer.
+    /// The pin must already be in PIO0 function.
     pub fn new(
         pio: &mut hal::pio::PIO<PIO0>,
         sm: UninitStateMachine<(PIO0, SM1)>,
@@ -207,8 +141,7 @@ impl EthRx {
 
         let installed = pio.install(&program.program).unwrap();
 
-        // 60 MHz from sys_clk_hz. At sys_clk=150 MHz that's div=2.5
-        // (int=2, frac=128/256). ~3.3 ns jitter — well within tolerance.
+        // Sample clock divider.
         let (div_int, div_frac) = crate::pio_util::clock_divider(sys_clk_hz, SAMPLE_HZ as f32);
 
         let (mut sm, rx, _tx) = hal::pio::PIOBuilder::from_installed_program(installed)
@@ -223,16 +156,12 @@ impl EthRx {
         sm.set_pindirs([(rx_pin_id, PinDir::Input)]);
         let sm = sm.start();
 
-        // Enable per-channel DMA_IRQ_0 BEFORE handing channels off — once
-        // the channels are consumed by `Config::new` they're only reachable
-        // through the Transfer's delegating `check_irq0` (which clears the
-        // active-channel pending bit, but doesn't set the enable bit). The
-        // enable bit is persistent across chain swaps.
+        // Enable DMA_IRQ_0 before `Config::new` consumes the channels.
+        // The enable bit survives chain swaps.
         dma_ch_a.enable_irq0();
         dma_ch_b.enable_irq0();
 
-        // Start ch_a writing buf_a, then arm ch_b with buf_b. The HAL chains
-        // ch_a → ch_b so when ch_a completes, ch_b starts automatically.
+        // ch_a fills buf_a, then chains to ch_b with buf_b.
         let xfer = double_buffer::Config::new((dma_ch_a, dma_ch_b), rx, buf_a).start();
         let xfer = xfer.write_next(buf_b);
 
@@ -245,18 +174,14 @@ impl EthRx {
         }
     }
 
-    /// Read + reset `carry_capped`. Wraps the typical "snapshot every 1 s
-    /// for the log line" usage so callers don't have to remember to reset.
+    /// Read and reset `carry_capped`.
     pub fn take_carry_capped(&mut self) -> u32 {
         let v = self.carry_capped;
         self.carry_capped = 0;
         v
     }
 
-    /// Check + clear the active channel's DMA_IRQ_0 pending bit. Returns
-    /// true if the just-completed half generated the interrupt we're in
-    /// (false → stale or someone else's DMA channel sharing the line).
-    /// Called from the DMA_IRQ_0 handler before `poll_with`.
+    /// Check and clear the active channel's DMA_IRQ_0 pending bit.
     pub fn dma_irq_pending(&mut self) -> bool {
         self.xfer
             .as_mut()
@@ -264,12 +189,8 @@ impl EthRx {
             .unwrap_or(false)
     }
 
-    /// Find the next active run (bytes that are neither 0x00 nor 0xFF) of
-    /// length ≥ `min_len`, starting at or after `start`. Skips any runs
-    /// shorter than `min_len` (NLPs / noise). The DMA_IRQ_0 handler
-    /// (`EthRxShared::process_completed_half`) calls this in a loop to walk
-    /// every frame-shaped run in a stitched buffer, not just the longest
-    /// one — fixes loss when two frames land in the same DMA half.
+    /// Next active run (bytes not 0x00/0xFF) of at least `min_len`, from `start`.
+    /// Shorter runs (NLPs, noise) are skipped.
     pub fn find_active_run_from(
         bytes: &[u8],
         start: usize,
@@ -297,28 +218,19 @@ impl EthRx {
         }
     }
 
-    /// Decode just the destination MAC of a frame-shaped active run —
-    /// stops as soon as the 6 dst-MAC bytes are recovered. Uses the cheap
-    /// open-loop F+4+6k sample point (no edge-tracking) because the dst MAC
-    /// is in the first 48 data bits, well inside the no-drift window. Capped
-    /// at ~200 bits (preamble + SFD slack + 48 MAC bits) and uses a fixed
-    /// stack array. Cost is ~1–2 µs per call; if the MAC filter accepts,
-    /// the full edge-track DPLL decode runs in `eth_rx_dpll`. Returns `None`
-    /// if F or SFD couldn't be located or there weren't enough samples.
+    /// Open-loop decode of just the destination MAC (~1–2 µs). The MAC is early
+    /// enough to ignore drift. `None` if F or SFD isn't found in 200 bits.
     pub fn peek_dst_mac(bytes: &[u8], base: usize, nbytes: usize) -> Option<[u8; 6]> {
         let nsamples = nbytes * 8;
         let base_bit = base * 8;
 
         let f = find_first_falling_edge(bytes, base_bit, nsamples)?;
 
-        // Cap the SFD search at 200 bits: 56 preamble + 8 SFD + 48 MAC = 112
-        // minimum, but the SFD can appear later if the first H→L wasn't
-        // exactly at HB[0]. 200 gives slack without wasting work.
+        // 112 bits minimum, plus slack for a late first H→L edge.
         const MAX_BITS: usize = 200;
         let sfd_end = find_sfd_end(bytes, base_bit, f, nsamples, MAX_BITS)?;
 
-        // The 48 dst-MAC bits must fit within the same 200-bit window
-        // (matches the old `start_bit + 48 > nbits` guard).
+        // The dst MAC must fit in the same window.
         let start_bit = sfd_end + 1;
         if start_bit + 48 > MAX_BITS {
             return None;
@@ -335,32 +247,11 @@ impl EthRx {
         Some(mac)
     }
 
-    /// Open-loop locked-once Manchester decoder — phase-lock + Manchester
-    /// decode + SFD-align a frame-shaped active run in `bytes`. `base` is the
-    /// byte offset of the run within `bytes`, `nbytes` its length. Returns
-    /// the unverified post-SFD frame bytes (CRC verification happens in
-    /// [`verify_fcs`]).
+    /// Open-loop Manchester decode (`decoder-openloop` A/B build only).
+    /// Returns unverified post-SFD bytes; see `verify_fcs`.
     ///
-    /// **R10 retired this in favour of `eth_rx_dpll::decode_frame_edge_track`
-    /// because the open-loop sample-stride accumulates clock drift over a
-    /// full-MTU frame (per-byte errors ramped from byte ~575 → ~89% at the
-    /// tail).** Restored behind `--features decoder-openloop` for A/B
-    /// measurement against the DPLL on identical on-wire traffic — see the
-    /// FCS-ceiling triage plan in `niccle-comparison-fcs-ceiling` memory.
-    ///
-    /// Algorithm — see `eth_rx_decode_frame` in `../Pico-10BASE-T/src/eth_rx.c`:
-    /// 1. Find F = first H→L transition in the run = start of HB[0].
-    /// 2. Data bit k value = sample at F + 4 + 6k (3 samples per half-bit,
-    ///    so the midpoint of HB[2k+1] is sample 4 + 6k from F).
-    /// 3. SFD = first `1,1` pair in the decoded bit stream — the last two
-    ///    bits of the 0xD5 SFD byte (LSB-first).
-    /// 4. Pack post-SFD bits LSB-first straight into frame bytes — single
-    ///    pass, no intermediate bit `Vec`. The packer hoists the
-    ///    sample-availability bound out of the loop, strides the sample
-    ///    offset by 6 instead of recomputing `f + 4 + 6k` per bit, and
-    ///    reads the packed buffer unchecked over a range proven in-bounds.
-    ///    Bounded by the header-declared frame length so an over-long
-    ///    active run can't force a full-buffer decode.
+    /// Locks to the first H→L edge, samples each bit at a fixed stride, and
+    /// stops at the header-declared length.
     #[cfg(feature = "decoder-openloop")]
     pub fn decode_frame(
         bytes: &[u8],
@@ -368,9 +259,7 @@ impl EthRx {
         nbytes: usize,
     ) -> Option<heapless::Vec<u8, MAX_FRAME_BYTES>> {
         let base_bit = base * 8;
-        // Clamp samples to the buffer so the unchecked reads in the packer
-        // are sound even if a caller passes nbytes past the slice end. For
-        // valid runs (base + nbytes <= bytes.len()) this is a no-op.
+        // Clamp to the buffer so the unchecked reads stay sound.
         let buf_bits = bytes.len() * 8;
         if base_bit >= buf_bits {
             return None;
@@ -380,11 +269,7 @@ impl EthRx {
         let f = find_first_falling_edge(bytes, base_bit, nsamples)?;
         let sfd_end = find_sfd_end(bytes, base_bit, f, nsamples, SFD_SEARCH_BITS)?;
 
-        // Data bit m of the frame (m = 0 at start_bit) is the sample at
-        // absolute offset `first_off + 6*m`. Compute how many *whole* frame
-        // bytes the run can supply once, up front — dropping any partial
-        // trailing byte matches the old `avail / 8` truncation — then pack
-        // with a striding offset and no per-bit bound check or `Option`.
+        // Whole frame bytes available; pack with a striding offset.
         let start_bit = sfd_end + 1;
         let limit = base_bit + nsamples;
         let first_off = base_bit + f + HB1_CENTER_OFFSET + SAMPLES_PER_BIT * start_bit;
@@ -395,15 +280,8 @@ impl EthRx {
         };
         let nframe_avail = (avail_bits / 8).min(MAX_FRAME_BYTES);
 
-        // Decode-length cap: pack the 18-byte header (14 Ethernet + 4 IPv4
-        // ver..total-len), then bound the rest to the length the header
-        // *declares* rather than however long the active run happens to be.
-        // Keeps a long run (merged frames / noise) from costing a full
-        // MAX_FRAME_BYTES decode. Behaviour-preserving: a normal run is
-        // ~its own frame length, and `verify_fcs`/`derive_frame_len`
-        // already use the same declared length, so the decoded bytes the
-        // caller keeps are identical. Unknown EtherTypes can't be bounded
-        // from the header → uncapped.
+        // After the 18-byte header, cap to the declared length so long runs
+        // (merged frames, noise) stay cheap. Unknown EtherTypes stay uncapped.
         const HDR_BYTES: usize = 18;
         let mut nframe = nframe_avail;
 
@@ -439,18 +317,9 @@ impl EthRx {
         Some(frame)
     }
 
-    /// Best-effort frame length from EtherType + IP header. Returns the
-    /// total frame length *including* the 4-byte FCS, so the caller can
-    /// CRC over `frame[..frame_len - 4]`.
-    ///
-    /// IEEE 802.3 minimum frame size is 64 bytes (60 body + 4 FCS). For
-    /// packets where the IP-declared length yields a body < 60 bytes,
-    /// the sender pads with zeros *before* the FCS — so the actual frame
-    /// length and FCS position are at the 64-byte mark, not the IP one.
-    ///
-    /// - IPv4 (0x0800): `max(14 + ip_total_len + 4, 64)` (clamped to buf).
-    /// - ARP  (0x0806): a flat 64.
-    /// - Anything else: `frame.len()`.
+    /// Frame length including FCS, from EtherType and IP length.
+    /// IPv4: `max(14 + ip_total_len + 4, 64)`, clamped to the buffer. ARP: 64.
+    /// Otherwise `frame.len()`.
     pub fn derive_frame_len(frame: &[u8]) -> usize {
         if frame.len() < 18 {
             return frame.len();
@@ -471,9 +340,7 @@ impl EthRx {
         }
     }
 
-    /// CRC-32 the first `frame_len - 4` bytes and compare against the
-    /// trailing 4 bytes (little-endian on the wire). Returns true if the
-    /// FCS matches — i.e. the frame decoded byte-perfect.
+    /// True if the trailing 4-byte FCS (little-endian) matches.
     pub fn verify_fcs(frame: &[u8], frame_len: usize) -> bool {
         if frame_len < 14 + 4 || frame_len > frame.len() {
             return false;
@@ -490,31 +357,18 @@ impl EthRx {
 
 }
 
-/// Outcome of `poll_into`: nothing pending, or a processing image of
-/// `len` bytes (with `carry_prefix` bytes carried from earlier halves)
-/// written into the caller's slot.
+/// Result of `poll_into`.
 pub enum PollOutcome {
-    /// No completed half (or the half was consumed into the carry /
-    /// dropped); nothing for the caller to process.
+    /// No image to process.
     Nothing,
     /// `slot[..len]` holds the continuous sample image to scan + decode.
     Image { len: usize, carry_prefix: usize },
 }
 
 impl EthRx {
-    /// Service a completed DMA half: build the processing image (carry ++
-    /// settled bytes) into `slot`, update the carry, and RE-ARM the DMA —
-    /// all in bounded time (~0.6 ms worst), so the chain is never left
-    /// without an armed target. The (potentially multi-ms) scan + decode of
-    /// the returned image is the caller's business, in thread context.
-    ///
-    /// (History: scan+decode used to run inline here, in the IRQ, in front
-    /// of the re-arm. Under load that exceeded one half-fill time, the chain
-    /// completed with nothing armed, and the 8-word PIO RX FIFO overflowed
-    /// ~200×/s — silently truncating any frame in flight. That sample loss
-    /// was misread for weeks as a clock-drift "decode cliff".)
-    ///
-    /// `slot` must be at least `STITCH_BUF_BYTES` long.
+    /// Service a completed half: write carry ++ settled bytes into `slot`,
+    /// update the carry, re-arm the DMA. Bounded (~0.6 ms worst).
+    /// `slot` must be at least `STITCH_BUF_BYTES`.
     pub fn poll_into(&mut self, slot: &mut [u8]) -> PollOutcome {
         let xfer = self.xfer.take().unwrap();
         if !xfer.is_done() {
@@ -529,26 +383,20 @@ impl EthRx {
 
         let cl = self.carry_len;
 
-        // Leading active run of the new half (only meaningful when a frame
-        // straddled in): it ends at the first idle byte.
+        // Leading active run; only meaningful if a frame straddled in.
         let mut k = 0;
         if cl > 0 {
             while k < BUF_BYTES && new_bytes[k] != 0x00 && new_bytes[k] != 0xFF {
                 k += 1;
             }
             if k == BUF_BYTES {
-                // The whole half is active: the straddling frame hasn't ended
-                // yet (can't happen with 16 KB halves and legal frame sizes,
-                // but keeps smaller halves correct). Append the half to the
-                // carry and keep waiting for the half that contains the
-                // frame's end — decoding now would clip it.
+                // Whole half active: the frame hasn't ended, so carry it.
+                // Unreachable with 16 KB halves and legal frames.
                 if cl + BUF_BYTES <= MAX_CARRY_BYTES {
                     self.carry[cl..cl + BUF_BYTES].copy_from_slice(new_bytes);
                     self.carry_len = cl + BUF_BYTES;
                 } else {
-                    // Over budget. A real frame + TP_IDL straggle fits in
-                    // MAX_CARRY_BYTES, so this is sustained noise — drop the
-                    // run and count it, same semantics as the tail cap below.
+                    // Over budget means sustained noise. Drop and count.
                     self.carry_capped = self.carry_capped.wrapping_add(1);
                     self.carry_len = 0;
                 }
@@ -557,13 +405,8 @@ impl EthRx {
             }
         }
 
-        // Trailing not-yet-terminated run (a frame whose end hasn't arrived):
-        // excluded from this half's image, carried into the next. Including
-        // it would decode a truncated head (valid preamble + dst MAC, so the
-        // MAC filter passes) that fails FCS — and the same frame would decode
-        // again via the carry next half. Cap at MAX_CARRY_BYTES (bump
-        // `carry_capped` so over-budget runs are distinguishable from clean
-        // termination).
+        // Carry the unterminated trailing run into the next half rather than
+        // decode a truncated head. Capped at MAX_CARRY_BYTES.
         let mut tail_start = BUF_BYTES;
         loop {
             if tail_start <= k {
@@ -580,9 +423,7 @@ impl EthRx {
             tail_start -= 1;
         }
 
-        // Processing image: carry ++ new_bytes[..tail_start] is the true
-        // continuous sample stream across the half boundary, so one scan over
-        // it handles straddlers and in-place frames identically.
+        // Image = carry ++ settled bytes: one continuous sample stream.
         slot[..cl].copy_from_slice(&self.carry[..cl]);
         slot[cl..cl + tail_start].copy_from_slice(&new_bytes[..tail_start]);
         let image_len = cl + tail_start;
@@ -592,8 +433,7 @@ impl EthRx {
         self.carry[..new_carry_len].copy_from_slice(&new_bytes[tail_start..]);
         self.carry_len = new_carry_len;
 
-        // RE-ARM. From here the DMA double-buffer is self-sustaining for two
-        // full half-fills regardless of how long the decode takes.
+        // Re-arm. The DMA now runs two half-fills without us.
         self.xfer = Some(idle.write_next(finished));
 
         PollOutcome::Image {

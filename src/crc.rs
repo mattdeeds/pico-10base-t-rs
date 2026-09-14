@@ -1,17 +1,13 @@
-//! CRC-32 / IEEE 802.3, used by TX (FCS generation) and RX (FCS verify).
+//! CRC-32 (IEEE 802.3) for Ethernet FCS.
 //!
-//! Reflected polynomial 0xEDB88320, init 0xFFFFFFFF, xor-out 0xFFFFFFFF.
-//! Transmitted little-endian on the wire (standard Ethernet FCS layout).
+//! Reflected poly 0xEDB88320, init/xor-out 0xFFFFFFFF, sent little-endian.
 
-/// Compute the CRC-32/IEEE-802.3 of `data`. Bit-by-bit implementation —
-/// no lookup table needed: at our frame rates (<1 K frame/sec) the CPU
-/// cost is negligible (≈100 µs/sec at 150 MHz for typical Ethernet sizes).
+/// CRC-32 of `data`. Bitwise; fast enough at our frame rates.
 pub fn crc32_ieee802_3(data: &[u8]) -> u32 {
     finalize(update(0xFFFF_FFFF, data))
 }
 
-/// Compute the CRC over `data` followed by `pad_len` zero bytes. Saves
-/// allocating a padded buffer just to hand it to the CRC routine.
+/// CRC-32 of `data` followed by `pad_len` zero bytes.
 pub fn crc32_ieee802_3_padded(data: &[u8], pad_len: usize) -> u32 {
     let mut crc = update(0xFFFF_FFFF, data);
     for _ in 0..pad_len {

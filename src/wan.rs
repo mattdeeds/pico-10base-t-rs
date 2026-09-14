@@ -1,17 +1,7 @@
-//! Shared WAN-as-DHCP-client logic (R15a/R15b).
+//! WAN DHCP client: lease, default route, DNS, plus ping and DNS probes.
 //!
-//! The 10BASE-T side acts as a DHCP *client*: it leases an upstream IP + default
-//! route + DNS, then proves internet reachability by pinging 8.8.8.8 and
-//! resolving a name out the wired link. NAPT/forwarding stay R16/R17 — this is
-//! the router box being a *client*, not routing other clients' traffic.
-//!
-//! These are plain synchronous smoltcp socket operations (no async, no timer),
-//! so the *same* functions drive both:
-//!   * **R15a** — the blocking `main_10bt` loop (`--features wan-dhcp`), and
-//!   * **R15b** — the executor's `wan_task` (`--features router`), beside the
-//!     cyw43 LAN.
-//!
-//! See `docs/r15-plan.md` §5/§6.
+//! Plain sync smoltcp calls, shared by the `wan-dhcp` loop and the router's
+//! `wan_task`.
 
 use core::fmt::Write;
 
@@ -22,17 +12,14 @@ use smoltcp::wire::{
     DnsQueryType, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr,
 };
 
-/// Off-link ping target (Google public DNS) — reachable only via the default
-/// route, so a reply proves the DHCP-installed gateway + upstream NAT work.
+/// Off-link ping target; a reply proves the gateway works.
 pub const PING_TARGET: Ipv4Address = Ipv4Address::new(8, 8, 8, 8);
-/// Name to resolve via the DHCP-provided DNS server (acceptance #3).
+/// Name resolved to prove DNS works.
 pub const DNS_NAME: &str = "example.com";
 /// ICMP echo identifier we bind to + match replies against.
 pub const ICMP_IDENT: u16 = 0x42;
 
-/// Live WAN-client state, surfaced once per second as the `[Wan]` telemetry
-/// line — the on-device evidence for the R15 WAN acceptance. `Copy` so the
-/// router build can publish a snapshot through a `Cell` for `usb_task` to read.
+/// WAN client state for the `[Wan]` line. `Copy` for snapshot publishing.
 #[derive(Clone, Copy)]
 pub struct WanState {
     /// Address the dhcpv4 client leased (`None` until configured).
@@ -65,8 +52,7 @@ impl WanState {
         }
     }
 
-    /// Write the `[Wan]` body (no prefix, no newline) into `w`: lease IP /
-    /// gateway / DNS, the ICMP ping tally, and the last resolved A record.
+    /// Write the `[Wan]` line body (no prefix or newline).
     pub fn write_status(&self, w: &mut impl Write) {
         match self.addr {
             Some(c) => {
@@ -110,10 +96,8 @@ impl Default for WanState {
     }
 }
 
-/// Apply a dhcpv4 lease change: install/clear the interface address + default
-/// route and feed (or clear) the DNS socket's server list. Call every poll,
-/// after `iface.poll`. The lease data is copied out of the borrowed `Event`
-/// first (it borrows the SocketSet) so we can then touch the dns socket.
+/// Apply dhcpv4 lease changes to the address, default route, and DNS servers.
+/// Call after each `iface.poll`.
 pub fn dhcp_apply(
     iface: &mut Interface,
     sockets: &mut SocketSet,

@@ -15,17 +15,16 @@ here" is half the value of a project like this.
 
 ## Key findings (the interesting bits)
 
-- **[rx-bulk-ceiling.md](rx-bulk-ceiling.md)** — why 10BASE-T RX of bulk tops out at
-  ~100 KB/s: it's the decode/PHY noise floor at full MTU, not inbox/DMA/window
-  (proven with `ss` + a size sweep + a matched-filter test). The MSS-clamp "fix" was
-  tested and refuted. Decision: accepted as a PHY limit.
+- **[rx-bulk-ceiling.md](rx-bulk-ceiling.md)** — the RX-of-bulk investigation. Its
+  "PHY limit at ~100 KB/s" verdict was later overturned: the cause was DMA-starved
+  sample loss, and RX now runs ~310 KB/s (see [performance.md](performance.md)).
 - **[full-duplex-analysis.md](full-duplex-analysis.md)** — the ISL3177E is
   full-duplex-*capable* (half-duplex is a MAC policy). Forced-FD on-wire experiment:
   FD helps only contended traffic and is still RX-decode-bounded → not worth the
   auto-negotiation work.
 - **[cpu-dpll-plan.md](cpu-dpll-plan.md)** + **[clock-recovery-decoder-plan.md](clock-recovery-decoder-plan.md)**
   — the RX Manchester decoder: an edge-tracking DPLL on core 1 that cancels clock
-  drift; the offline corpus bench; and the §9d "residual is PHY-limited" verdict.
+  drift; the offline corpus bench; and the §9d "residual is PHY-limited" verdict (since overturned).
 - **[pio-dpll-report.md](pio-dpll-report.md)** — retrospective on the *PIO-side*
   decoder attempt (capped ~40% full-MTU → pivoted to the CPU DPLL on core 1).
 
@@ -45,6 +44,7 @@ here" is half the value of a project like this.
 ## Meta
 
 - **[release-checklist.md](release-checklist.md)** — the open-source prep checklist.
+- **[log.md](log.md)** — raw notes: history and lessons moved out of code comments.
 
-> Note: some docs reference internal "R-numbers", "gotcha #N", and session notes —
-> that's the raw lab notebook. `../RESUME.md` is the running session pointer.
+> Note: some docs reference internal "R-numbers", "gotcha #N", and session notes
+> (`RESUME.md`, not published) — that's the raw lab notebook.

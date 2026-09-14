@@ -1,35 +1,16 @@
-//! Edge-track DPLL Manchester decoder (Phase 3b — CPU DPLL port, optimized).
+//! Edge-track DPLL Manchester decoder.
 //!
-//! Rust port of `decode_edge_track` from `tools/clock-recovery/harness.py`.
-//! Validated against the corpus (FCS-OK N/N, flat per-byte error bins). The
-//! decoder re-anchors to each per-bit Manchester transition (search ±W
-//! samples around the expected mid-bit edge position) so accumulated clock
-//! drift can't walk the sample point off the bit-centre — fixes the open-loop
-//! decoder's A1 ramp-from-575 B failure mode.
-//!
-//! Sampler runs at 60 MHz (T = 6 samples/bit). Edge expected at `F + 5 + 6·k`
-//! from the F=first-H→L anchor; data bit `k` is sampled one sample BEFORE
-//! the resync'd edge (= `tr − 1`).
-//!
-//! **Optimized for IRQ-budget fit** (Phase 3b second-pass, after the naive
-//! port confirmed the budget concern on-wire at ~3-9 ms/frame). Applies the
-//! same playbook the open-loop went through:
-//! 1. `sample_bit` via `get_unchecked` after proving the upper-bound `ns`
-//!    is in-bounds; this drops the bounds-check load per sample.
-//! 2. `find_edge` inlined + unrolled for W=1 (4-sample slide-window check).
-//! 3. Decode-length cap derived from the IP-header total-length once the
-//!    first 18 bytes are decoded, so an over-long active run can't force a
-//!    full-MAX_FRAME_BYTES decode.
-//!
-//! Pure `no_std`, no allocator. Same I/O shape as `eth_rx::decode_frame`.
+//! Re-anchors to each mid-bit edge (±1 sample) so clock drift can't walk the
+//! sample point off center. At 60 MHz the edge is expected at `F + 5 + 6k`;
+//! each data bit is sampled one before its edge.
+//! Port of `decode_edge_track` in `tools/clock-recovery/harness.py`.
 
 use heapless::Vec;
 
-/// Same as `eth_mac::MAX_FRAME_BYTES`. Kept in sync by convention (1600 bytes).
+/// Must match `eth_mac::MAX_FRAME_BYTES`.
 pub const MAX_FRAME_BYTES: usize = 1600;
 
-/// Read 1 bit at `off` in LSB-first packed bytes. SAFETY: caller must ensure
-/// `off >> 3 < buf.len()` (which holds when `off < buf.len() * 8`).
+/// Bit at `off`, LSB-first. SAFETY: caller ensures `off >> 3 < buf.len()`.
 #[inline(always)]
 unsafe fn sample_bit_unchecked(buf: &[u8], off: usize) -> u8 {
     let b = unsafe { *buf.get_unchecked(off >> 3) };
@@ -41,8 +22,7 @@ fn sample_bit(buf: &[u8], off: usize) -> u8 {
     (buf[off >> 3] >> (off & 7)) & 1
 }
 
-/// First H→L (1→0) edge in the sample stream — the F anchor used by the
-/// open-loop decoder. Returns `None` if no falling edge in the window.
+/// First H→L edge (the F anchor), if any.
 fn find_f(buf: &[u8], ns: usize) -> Option<usize> {
     let mut prev = sample_bit(buf, 0);
     for i in 1..ns {
@@ -55,8 +35,7 @@ fn find_f(buf: &[u8], ns: usize) -> Option<usize> {
     None
 }
 
-/// Find the SFD (`...0xD5`) end inside the preamble: first place where two
-/// consecutive open-loop data bits (sampled at F+4+6k) are both 1.
+/// End of the SFD: first two consecutive 1 bits sampled at F+4+6k.
 fn find_sfd(buf: &[u8], ns: usize, f: usize) -> Option<usize> {
     let read = |k: usize| -> Option<u8> {
         let idx = f + 4 + 6 * k;
@@ -77,13 +56,8 @@ fn find_sfd(buf: &[u8], ns: usize, f: usize) -> Option<usize> {
     None
 }
 
-/// W=1 windowed edge search around `center`, unrolled (4-sample slide-window).
-/// Returns the nearest edge to `center` (smaller distance wins; ties → lower
-/// i, matching Python `find_edge`'s strict `<` tie-break), or `center` if no
-/// edge in window (coast). Per the on-wire sweep, W=1/W=2/W=3 all gave the
-/// same ~50 % full-MTU FCS-OK, so the failures aren't jitter beyond ±W —
-/// W=1 is the cheapest within-budget choice.
-/// SAFETY: caller must ensure `center >= 2 && center + 1 < ns_full`.
+/// Nearest edge to `center` within ±1 sample, ties low; `center` if none.
+/// SAFETY: caller ensures `center >= 2 && center + 1 < ns_full`.
 #[inline(always)]
 unsafe fn find_edge_w1(buf: &[u8], center: usize) -> usize {
     unsafe {
@@ -103,26 +77,14 @@ unsafe fn find_edge_w1(buf: &[u8], center: usize) -> usize {
     }
 }
 
-/// Branchless W=1 edge select, indexed by the 3 pairwise-difference bits of
-/// the window `[c-2, c-1, c, c+1]`: bit0 = edge(c-2,c-1), bit1 = edge(c-1,c),
-/// bit2 = edge(c,c+1). Priority identical to `find_edge_w1`: d=0 (bit1) wins,
-/// then d=1-lower (bit0), then d=1-higher (bit2), else coast.
+/// Branchless `find_edge_w1`: edge offset indexed by 3 pairwise-difference bits.
 const EDGE_DELTA: [i32; 8] = [0, -1, 0, 0, 1, -1, 0, 0];
 
-/// Edge-track DPLL decode. Returns the decoded frame bytes (LSB-first) up to
-/// `MAX_FRAME_BYTES` (capped further by the IP-derived frame length once the
-/// header is in), or `None` if F or SFD not found.
+/// Decode a frame from `buf`: bytes LSB-first, capped by IP length.
+/// `None` if F or SFD isn't found.
 ///
-/// Hot loop (third-pass optimization, 2026-06-10): the W=1 edge window for
-/// `next_center = tr+6` is 4 *contiguous* sample bits (`tr+4..=tr+7`), and the
-/// resync'd data bit (`new_tr - 1` ∈ `tr+4..=tr+6`) always lands inside that
-/// same window. So each bit needs ONE two-byte window load: edge select is an
-/// XOR + 8-entry table on the window's pairwise-difference bits, and the data
-/// bit is a shift of the same register — replacing the previous 5 separate
-/// load+shift+mask sample reads per bit. The fast loop runs while the window
-/// is provably in range (`tr + 20 <= ns_full`); the last few bits near the
-/// buffer end fall through to the original per-sample loop, which keeps the
-/// boundary-coast semantics exactly (matches the Python `find_edge` clamp).
+/// The fast path loads each bit's 4-sample window once. The last bits near
+/// the buffer end use the per-sample loop to keep boundary coasting exact.
 pub fn decode_frame_edge_track(buf: &[u8]) -> Option<Vec<u8, MAX_FRAME_BYTES>> {
     let ns_full = buf.len().checked_mul(8)?;
     let f = find_f(buf, ns_full)?;
@@ -141,14 +103,10 @@ pub fn decode_frame_edge_track(buf: &[u8]) -> Option<Vec<u8, MAX_FRAME_BYTES>> {
     let mut frame: Vec<u8, MAX_FRAME_BYTES> = Vec::new();
     let mut byte: u8 = 0;
     let mut bit_idx: u8 = 0;
-    // Decode-length cap from the IP header — bounds the loop to the declared
-    // frame length once we've decoded enough to read total-length. Starts at
-    // MAX_FRAME_BYTES so the loop runs at least the header bytes.
+    // Length cap from the IP header; starts at the max.
     let mut cap_bytes: usize = MAX_FRAME_BYTES;
 
-    // Fast path. Loop state at top: the data bit at `tr - 1` has NOT been
-    // emitted yet (same as the slow loop below). `pending` carries that bit
-    // when the previous iteration already extracted it from its window.
+    // Fast path. `pending` holds the next data bit if already extracted.
     let mut pending: Option<u32> = None;
     while tr >= 1 && tr + 20 <= ns_full {
         let bit = match pending {
@@ -178,9 +136,8 @@ pub fn decode_frame_edge_track(buf: &[u8]) -> Option<Vec<u8, MAX_FRAME_BYTES>> {
             }
         }
 
-        // Advance: window anchored at lo = tr+4 covers sample bits
-        // lo..lo+3 = (nc-2)..(nc+1) for nc = tr+6. Guard proves
-        // (tr+19) < ns_full ⇒ byte index (lo>>3)+1 <= (tr+12)>>3 < buf.len().
+        // Window lo..lo+3 = (nc-2)..(nc+1), nc = tr+6. The loop guard keeps
+        // byte (lo>>3)+1 in bounds.
         let lo = tr + 4;
         let bi = lo >> 3;
         // SAFETY: bi+1 < buf.len() per the loop guard (see above).
@@ -196,8 +153,7 @@ pub fn decode_frame_edge_track(buf: &[u8]) -> Option<Vec<u8, MAX_FRAME_BYTES>> {
         pending = Some((w >> (1 + delta) as u32) & 1);
     }
 
-    // Tail: original per-sample loop, preserving the boundary-coast and
-    // termination semantics for the last few bits near the buffer end.
+    // Tail: per-sample loop for the last bits near the buffer end.
     loop {
         // Sample the data bit one before the resync'd edge.
         if tr == 0 || tr > ns_full {
@@ -216,9 +172,7 @@ pub fn decode_frame_edge_track(buf: &[u8]) -> Option<Vec<u8, MAX_FRAME_BYTES>> {
             }
             byte = 0;
             bit_idx = 0;
-            // Right after the full header is in (14 eth + 4 IP-start = 18),
-            // derive the frame-length cap. Same logic as the open-loop
-            // decoder's `derive_frame_len` and the Python `fcs_ok`.
+            // Header in: derive the length cap.
             if frame.len() == 18 && cap_bytes == MAX_FRAME_BYTES {
                 let f_slice = frame.as_slice();
                 let ethertype = u16::from_be_bytes([f_slice[12], f_slice[13]]);
@@ -233,11 +187,8 @@ pub fn decode_frame_edge_track(buf: &[u8]) -> Option<Vec<u8, MAX_FRAME_BYTES>> {
             }
         }
 
-        // Find next mid-bit edge at tr + 6, W=1 window. Near the buffer
-        // boundary the window is partly out of range — coast (use center
-        // unchanged) instead of breaking, so the loop's `tr - 1 < ns_full`
-        // termination at the top picks up the very last bit. (Matches the
-        // Python `find_edge`'s `hi = min(ns-1, center+W)` clamp behaviour.)
+        // Next edge near tr + 6. Coast near the buffer end so the last bit
+        // still decodes.
         let next_center = match tr.checked_add(6) {
             Some(v) => v,
             None => break,

@@ -1,7 +1,7 @@
-//! Manchester encoding lookup table (data byte 0..=255 -> 32-bit PIO instruction stream).
-//! Copied verbatim from src/udp.c in the C reference repo. See its comments for the mapping:
-//!   each byte expands to 16 half-bits (= 8 data bits) encoded as PIO dispatch values
-//!   0b00=IDLE, 0b01=LOW, 0b10=HIGH, packed LSB-first.
+//! Manchester table: data byte → 32-bit PIO instruction stream.
+//!
+//! 16 half-bits per byte, LSB-first: 0b00=IDLE, 0b01=LOW, 0b10=HIGH.
+//! Copied from the C reference repo's `udp.c`.
 
 pub const MANCHESTER_TABLE: [u32; 256] = [
     0x66666666, 0x66666669, 0x66666696, 0x66666699, 0x66666966, 0x66666969, 0x66666996, 0x66666999, 0x66669666, 0x66669669, 0x66669696, 0x66669699, 0x66669966, 0x66669969, 0x66669996, 0x66669999, 

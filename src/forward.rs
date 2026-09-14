@@ -1,20 +1,11 @@
-//! R16 — L3 forwarding (LAN ↔ WAN transit, no NAT).
+//! L3 forwarding between LAN and WAN, with NAPT on the WAN side.
 //!
-//! smoltcp is an endpoint stack: a frame arriving with our gateway MAC but a
-//! dst-IP that isn't ours is silently dropped, and its neighbor cache is
-//! private. So forwarding is custom code beside the two `Interface`s.
+//! smoltcp is an endpoint stack, so forwarding is custom. [`ForwardingDevice`]
+//! wraps each phy: `receive` passes local frames to smoltcp and diverts transit
+//! frames to the other interface's channel; `egress` rewrites L2, decrements
+//! TTL, and transmits. Next-hop MACs are learned passively.
 //!
-//! [`ForwardingDevice<D>`] wraps each phy and is what `iface.poll` pulls from.
-//! On `receive()` it peeks every frame and either replays it to smoltcp (local:
-//! ARP / our-IP / broadcast / the stack's own sockets) or **diverts** it to the
-//! other interface via an [`embassy_sync`] channel. Each task drains the channel
-//! pointing at *its* interface and re-emits the frame ([`ForwardingDevice::egress`]),
-//! rewriting the L2 header + decrementing TTL. Next-hop MACs come from a small
-//! per-interface table, **passively learned** from on-subnet source addresses.
-//!
-//! Both tasks run on the one core-0 executor (cooperative), so the shared
-//! channels + tables are guarded by `critical_section` (which also covers the
-//! TIMER0 IRQ). NAPT/conntrack is R17. Full design: `docs/r16-plan.md`.
+//! Both tasks share the core-0 executor; shared tables use `critical_section`.
 
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -27,7 +18,7 @@ use smoltcp::phy::{Device, DeviceCapabilities, RxToken, TxToken};
 use smoltcp::time::Instant;
 use smoltcp::wire::{Ipv4Address, Ipv4Cidr, Ipv4Packet};
 
-use crate::conntrack; // R17 — NAPT connection tracking
+use crate::conntrack;
 
 /// Max bytes of a forwarded L2 frame (matches `eth_mac::MAX_FRAME_BYTES`).
 pub const FRAME_CAP: usize = 1600;
@@ -49,10 +40,7 @@ pub static FWD_W2L: AtomicU32 = AtomicU32::new(0); // diverted WAN→LAN (enqueu
 pub static FWD_SENT: AtomicU32 = AtomicU32::new(0); // egressed (TX'd out the other phy)
 pub static FWD_DROP: AtomicU32 = AtomicU32::new(0); // total dropped (sum of the breakdown below)
 
-// --- Instrumentation (perf characterization) ---
-// Egressed bytes per direction (L2 frame length), for throughput. `up` = the
-// client-side LAN→WAN flow (egress on the WAN device), `dn` = WAN→LAN (egress on
-// the LAN device). u32 wraps ~every 4000 s at 1 MB/s → read as 1 Hz deltas.
+// Egressed L2 bytes per direction. Wraps; read as 1 Hz deltas.
 pub static FWD_BYTES_TO_WAN: AtomicU32 = AtomicU32::new(0);
 pub static FWD_BYTES_TO_LAN: AtomicU32 = AtomicU32::new(0);
 // `FWD_DROP` split by cause, so load tests show *why* frames drop.
@@ -65,8 +53,7 @@ pub static FWD_DROP_OTHER: AtomicU32 = AtomicU32::new(0); // malformed / runt / 
 pub static FWD_QHWM_L2W: AtomicU32 = AtomicU32::new(0);
 pub static FWD_QHWM_W2L: AtomicU32 = AtomicU32::new(0);
 
-/// Record a dropped forwarded frame: bump the aggregate `FWD_DROP` and the
-/// specific reason in one place, so the two can't drift.
+/// Count a drop in both `FWD_DROP` and its reason counter.
 fn count_drop(reason: &AtomicU32) {
     FWD_DROP.fetch_add(1, Ordering::Relaxed);
     reason.fetch_add(1, Ordering::Relaxed);
@@ -145,8 +132,7 @@ fn neigh(iface: Iface) -> &'static Mutex<RefCell<NeighborTable>> {
 // Per-interface forwarding config + frame classification
 // =====================================================================
 
-/// Static config for one interface's [`ForwardingDevice`]. `Copy` so the owning
-/// task can update it (e.g. the WAN gateway as DHCP re-leases).
+/// Forwarding config for one interface. The WAN side updates it per lease.
 #[derive(Clone, Copy)]
 pub struct IfaceCfg {
     pub iface: Iface,
@@ -158,8 +144,7 @@ pub struct IfaceCfg {
     pub subnet: Ipv4Cidr,
     /// This interface's gateway — egress next-hop for off-subnet dsts (WAN only).
     pub gateway: Option<Ipv4Address>,
-    /// Ingress routing filter: divert a transit frame only if its dst is in this
-    /// subnet. `None` = divert any off-local dst (the LAN side → everything to WAN).
+    /// Divert transit only to dsts in this subnet; `None` diverts all.
     pub accept_dst: Option<Ipv4Cidr>,
 }
 
@@ -174,9 +159,7 @@ enum Class {
 
 const ETHERTYPE_IPV4: u16 = 0x0800;
 const ETHERTYPE_ARP: u16 = 0x0806;
-/// Fixed Ethernet/IPv4 ARP header prefix: htype=1 (Ethernet), ptype=0x0800
-/// (IPv4), hlen=6, plen=4. `build_arp_request` writes it; `learn` matches it —
-/// the single source keeps the writer and parser in lockstep.
+/// Ethernet/IPv4 ARP header prefix, shared by the ARP writer and parser.
 const ARP_ETH_IPV4_PREFIX: [u8; 6] = [0x00, 0x01, 0x08, 0x00, 0x06, 0x04];
 
 /// IPv4 dst address of an Ethernet frame, if it is a long-enough IPv4 frame.
@@ -188,13 +171,11 @@ fn ipv4_dst(frame: &[u8]) -> Option<Ipv4Address> {
 }
 
 fn classify(cfg: &IfaceCfg, frame: &[u8]) -> Class {
-    // Forwarding is off until this interface is configured (the WAN side has no
-    // IP/route until DHCP leases) — pass everything to smoltcp until then.
+    // Until this interface has an IP, everything goes to smoltcp.
     if frame.len() < 14 || cfg.our_ip.is_unspecified() {
         return Class::Local;
     }
-    // Only unicast-to-our-MAC is a forwarding candidate. Broadcast / multicast /
-    // ARP go to smoltcp (which answers ARP and the LAN DHCP/ICMP, etc.).
+    // Only unicast to our MAC can be transit; the rest goes to smoltcp.
     if frame[0..6] != cfg.our_mac {
         return Class::Local;
     }
@@ -212,22 +193,15 @@ fn classify(cfg: &IfaceCfg, frame: &[u8]) -> Class {
     }
 }
 
-/// Learn `IP → MAC` for next-hop resolution, but only when the source is on this
-/// interface's subnet — otherwise an off-subnet sender (e.g. an `8.8.8.8` reply,
-/// which arrives with the *gateway's* MAC) would poison the table.
-///
-/// Learns from **ARP** (the reliable source — both request and reply advertise
-/// sender IP + sender MAC, and ARP precedes IP traffic) *and* IPv4 source
-/// addresses. ARP is what actually populates the gateway/client MACs, since the
-/// useful IPv4 traffic (ping replies) carries off-subnet source IPs.
+/// Learn IP → MAC from ARP and IPv4 sources on this subnet only.
+/// Off-subnet sources carry the gateway's MAC and would poison the table.
 fn learn(cfg: &IfaceCfg, frame: &[u8]) {
     if frame.len() < 14 || cfg.our_ip.is_unspecified() {
         return;
     }
     let (src_ip, src_mac): (Ipv4Address, [u8; 6]) = match u16::from_be_bytes([frame[12], frame[13]])
     {
-        // Ethernet/IPv4 ARP (fixed layout): htype=1 ptype=0x0800 hlen=6 plen=4,
-        // then oper(2), sha(6)=frame[22..28], spa(4)=frame[28..32].
+        // ARP: sha = frame[22..28], spa = frame[28..32].
         ETHERTYPE_ARP
             if frame.len() >= 14 + 28 && frame[14..20] == ARP_ETH_IPV4_PREFIX =>
         {
@@ -258,16 +232,12 @@ fn nexthop(dst: Ipv4Address, subnet: Ipv4Cidr, gateway: Option<Ipv4Address>) -> 
     }
 }
 
-/// Whether `ip`'s MAC is already in the WAN neighbor table — lets `wan_task`
-/// stop re-ARPing the gateway once the table is warm (R19 cold-start fix).
+/// True if `ip`'s MAC is in the WAN neighbor table.
 pub fn wan_neigh_known(ip: Ipv4Address) -> bool {
     critical_section::with(|cs| WAN_NEIGH.borrow_ref(cs).lookup(ip).is_some())
 }
 
-/// Build a broadcast ARP request ("who-has `tpa`, tell `spa`") as a 42-byte
-/// Ethernet/IPv4 frame. `EthMac::send_raw_frame` pads it to the 60-byte minimum
-/// and appends the FCS. The byte layout matches [`learn`]'s ARP parser, so the
-/// target's *reply* repopulates the neighbor table. R19 cold-start pre-warm.
+/// Broadcast ARP request "who-has `tpa`, tell `spa`" (42 bytes; TX pads it).
 fn build_arp_request(our_mac: [u8; 6], spa: Ipv4Address, tpa: Ipv4Address) -> [u8; 42] {
     let mut f = [0u8; 42];
     f[0..6].copy_from_slice(&[0xff; 6]); // dst MAC = broadcast
@@ -283,17 +253,14 @@ fn build_arp_request(our_mac: [u8; 6], spa: Ipv4Address, tpa: Ipv4Address) -> [u
 }
 
 // =====================================================================
-// R17 — NAPT: the single conntrack table + L4 parse / src-dst rewrite
+// NAPT: conntrack table, L4 parse, and address rewrite
 // =====================================================================
 
-/// The one NAPT conntrack table, owned by the WAN `ForwardingDevice`. Touched only
-/// from `wan_task` (core 0); the `critical_section` matches the neighbor-table
-/// pattern and guards against the TIMER0 IRQ. The LAN device never touches it, so
-/// it carries no per-device cost (vs. an `Option<Conntrack>` field).
+/// The NAPT conntrack table, used only by the WAN device on `wan_task`.
 static WAN_CT: Mutex<RefCell<conntrack::Conntrack>> =
     Mutex::new(RefCell::new(conntrack::Conntrack::new()));
 
-/// Periodic idle-entry sweep + the live count, for `wan_task` / the `[Nat]` line.
+/// Sweep idle NAPT entries. Called once a second by `wan_task`.
 pub fn nat_reap(now_ms: u64) {
     critical_section::with(|cs| WAN_CT.borrow_ref_mut(cs).reap(now_ms));
 }
@@ -302,8 +269,7 @@ const IPPROTO_ICMP: u8 = 1;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
 
-/// Where a frame's L4 ports/id + checksum live (offsets honor the IHL), plus the
-/// proto + TCP flags. `src_id`/`dst_id` are TCP/UDP ports, or the ICMP echo id.
+/// L4 offsets (IHL-aware), ids, and TCP flags. Ids are ports or the ICMP echo id.
 struct L4 {
     proto: conntrack::Proto,
     l4_off: usize,
@@ -359,9 +325,8 @@ fn wr16(b: &mut [u8], i: usize, v: u16) {
     b[i..i + 2].copy_from_slice(&v.to_be_bytes());
 }
 
-/// NAPT the **source**: IP src → `new_ip`, L4 src port / ICMP id → `new_id`. Fixes
-/// the L4 checksum incrementally; the IPv4 header checksum is recomputed by
-/// `egress()` after TTL--, so it's left untouched here.
+/// Rewrite source IP and port/id, fixing the L4 checksum.
+/// `egress` recomputes the IPv4 header checksum after the TTL change.
 fn napt_rewrite_src(frame: &mut [u8], l4: &L4, new_ip: Ipv4Address, new_id: u16) {
     let old_ip = Ipv4Address::new(frame[26], frame[27], frame[28], frame[29]);
     match l4.proto {
@@ -389,7 +354,7 @@ fn napt_rewrite_src(frame: &mut [u8], l4: &L4, new_ip: Ipv4Address, new_id: u16)
     frame[26..30].copy_from_slice(&new_ip.octets()); // IP src (read above, write last)
 }
 
-/// NAPT the **destination**: IP dst → `new_ip`, L4 dst port / ICMP id → `new_id`.
+/// Rewrite destination IP and port/id, fixing the L4 checksum.
 fn napt_rewrite_dst(frame: &mut [u8], l4: &L4, new_ip: Ipv4Address, new_id: u16) {
     let old_ip = Ipv4Address::new(frame[30], frame[31], frame[32], frame[33]);
     match l4.proto {
@@ -420,17 +385,13 @@ fn napt_rewrite_dst(frame: &mut [u8], l4: &L4, new_ip: Ipv4Address, new_id: u16)
 // ForwardingDevice<D> — the classifying phy::Device wrapper
 // =====================================================================
 
-/// Wraps an inner `phy::Device` (cyw43 `Cyw43Phy` or 10BT `EthMac`) and the
-/// channel this interface diverts *to*. `iface.poll` drives `receive`, which
-/// skims transit frames into the egress channel and replays only local frames
-/// to smoltcp.
+/// Wraps a phy (`Cyw43Phy` or `EthMac`) and the channel it diverts transit to.
 pub struct ForwardingDevice<D: Device> {
     inner: D,
     cfg: IfaceCfg,
     /// The channel transit frames from *this* interface are pushed onto.
     egress: &'static FwdChannel,
-    /// R17: this is the WAN device → do NAPT (via the `WAN_CT` static) on the
-    /// transit path. The LAN device leaves this `false` and just forwards.
+    /// WAN device: NAPT via `WAN_CT` on transit.
     nat: bool,
 }
 
@@ -440,15 +401,12 @@ impl<D: Device> ForwardingDevice<D> {
         Self { inner, cfg, egress, nat: false }
     }
 
-    /// NAPT device (WAN side): rewrites src on egress + does conntrack-aware
-    /// ingress classification. Shares the single `WAN_CT` table.
+    /// NAPT device (WAN side), using the shared `WAN_CT` table.
     pub fn new_napt(inner: D, cfg: IfaceCfg, egress: &'static FwdChannel) -> Self {
         Self { inner, cfg, egress, nat: true }
     }
 
-    /// Sync this interface's address / subnet / gateway from a DHCP lease (the
-    /// WAN side calls this each time `wan::dhcp_apply` updates the lease). Setting
-    /// a non-`UNSPECIFIED` `our_ip` also *enables* forwarding on this interface.
+    /// Set address, subnet, and gateway from a lease. A real IP enables forwarding.
     pub fn set_lease(&mut self, cidr: Ipv4Cidr, gateway: Option<Ipv4Address>) {
         self.cfg.our_ip = cidr.address();
         self.cfg.subnet = cidr;
@@ -460,11 +418,8 @@ impl<D: Device> ForwardingDevice<D> {
         &mut self.inner
     }
 
-    /// R19: proactively ARP this interface's gateway so its next-hop MAC lands in
-    /// the neighbor table (via the passive [`learn`] on the reply) *before* the
-    /// first forwarded frame — eliminating the cold-start `[Fwd] drop` while
-    /// `WAN_NEIGH` is still empty. No-op until a gateway + IP are leased. The owner
-    /// (`wan_task`) calls this once per second until [`wan_neigh_known`] is true.
+    /// ARP the gateway so its MAC is known before the first forwarded frame.
+    /// No-op until a gateway and IP are leased.
     pub fn arp_gateway(&mut self, now: Instant) {
         let Some(gw) = self.cfg.gateway else {
             return;
@@ -478,17 +433,12 @@ impl<D: Device> ForwardingDevice<D> {
         }
     }
 
-    /// Re-emit one forwarded frame (drained from the *ingress* channel by the
-    /// owning task) out this interface: decrement TTL, refresh the IPv4 header
-    /// checksum, resolve the next-hop MAC, rewrite the L2 header, and TX via the
-    /// inner phy's normal token (EthMac → FCS/IFG/CSMA; cyw43 → NetDriver).
+    /// Send a forwarded frame out this interface: NAPT (WAN), TTL, checksum,
+    /// next-hop MAC, L2 rewrite, then TX.
     pub fn egress(&mut self, frame: &mut Frame, now: Instant) {
-        // Perf step 2: count this core-0 forwarding work toward `FWD_BUSY`.
+        // Count forwarding cycles toward `FWD_BUSY`.
         let _cyc = crate::cycles::CycleSpan::new(&crate::cycles::FWD_BUSY);
-        // R17: NAPT the source on the way out the WAN (LAN→WAN). Rewrite IP src →
-        // our WAN IP + L4 src port/id → an allocated WAN id, tracked in conntrack so
-        // the reply can be matched back. The IP-header checksum fixup is handled by
-        // the `fill_checksum()` below (after TTL--); we only fix the L4 checksum.
+        // WAN: NAPT the source and track the flow. L4 checksum is fixed here.
         if self.nat {
             if let Some(l4) = parse_l4(&frame[..]) {
                 let src_ip = Ipv4Address::new(frame[26], frame[27], frame[28], frame[29]);
@@ -514,10 +464,10 @@ impl<D: Device> ForwardingDevice<D> {
                     }
                 }
             }
-            // non-IPv4 / non-TCP-UDP-ICMP transit forwards unmodified (rare).
+            // Other protocols forward unmodified.
         }
 
-        // L3: TTL + checksum + capture dst (drop non-IPv4 / runt / TTL-expired).
+        // L3: TTL, checksum, and dst; drop runts and expired TTL.
         let dst = {
             let Ok(mut ip) = Ipv4Packet::new_checked(&mut frame[14..]) else {
                 count_drop(&FWD_DROP_OTHER); // malformed / runt
@@ -549,8 +499,7 @@ impl<D: Device> ForwardingDevice<D> {
         if let Some(tx) = self.inner.transmit(now) {
             tx.consume(len, |buf| buf.copy_from_slice(&frame[..len]));
             FWD_SENT.fetch_add(1, Ordering::Relaxed);
-            // Throughput accounting: attribute egressed bytes by direction
-            // (WAN device egresses LAN→WAN = `up`; LAN device egresses WAN→LAN = `dn`).
+            // Count egressed bytes by direction.
             match self.cfg.iface {
                 Iface::Wan => FWD_BYTES_TO_WAN.fetch_add(len as u32, Ordering::Relaxed),
                 Iface::Lan => FWD_BYTES_TO_LAN.fetch_add(len as u32, Ordering::Relaxed),
@@ -560,11 +509,8 @@ impl<D: Device> ForwardingDevice<D> {
         }
     }
 
-    /// Classify an ingress frame. On the WAN (NAPT) device, a reply addressed to
-    /// our WAN IP that matches a tracked flow is a NAT-return: rewrite the dst back
-    /// to the LAN client (in place) and forward it (`Transit`). Everything else
-    /// falls through to the plain R16 classifier — so a conntrack *miss* on a frame
-    /// to our WAN IP stays `Local` (the Pico's own ping/DNS), untouched.
+    /// Classify an ingress frame. On WAN, a reply matching conntrack is rewritten
+    /// to the LAN client and marked `Transit`; misses fall through to `classify`.
     fn classify_frame(&self, frame: &mut Frame, ts: Instant) -> Class {
         if self.nat {
             let cfg = self.cfg;
@@ -575,8 +521,7 @@ impl<D: Device> ForwardingDevice<D> {
             {
                 if let Some(l4) = parse_l4(&frame[..]) {
                     let remote_ip = Ipv4Address::new(frame[26], frame[27], frame[28], frame[29]);
-                    // Inbound key: the WAN peer is the *source*; our allocated id is
-                    // the *dst* port (TCP/UDP) or the echo id (ICMP).
+                    // The WAN peer is the source; our id is the dst port or echo id.
                     let (remote_id, wan_id) = match l4.proto {
                         conntrack::Proto::IcmpEcho => (0, l4.src_id),
                         _ => (l4.src_id, l4.dst_id),
@@ -614,21 +559,14 @@ impl<D: Device> Device for ForwardingDevice<D> {
         Self: 'a;
 
     fn receive(&mut self, ts: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        // Perf step 2: bracket the ingress classify/skim path toward `FWD_BUSY`.
-        // The span's Drop fires on every exit — including the `?` early-returns
-        // below — and before smoltcp consumes the returned tokens, so it captures
-        // forwarding work only, not the endpoint stack's processing.
+        // Count ingress classify cycles toward `FWD_BUSY`. Drop runs on every exit.
         let _cyc = crate::cycles::CycleSpan::new(&crate::cycles::FWD_BUSY);
-        // Phase 1 — skim transit/drop frames (so they don't stall local ones
-        // queued behind them) until the inbox yields a *local* frame or empties.
-        // Each iteration's inner `tx` (a reply token) is dropped in-iteration; we
-        // must NOT return it from the loop, or its `&mut self.inner` borrow would
-        // collide with the next iteration's `receive` (no Polonius on stable).
+        // Skim transit and drop frames until a local frame arrives or the inbox empties.
+        // Reply tokens drop each iteration; returning one would double-borrow `inner`.
         let frame = loop {
             let mut frame: Frame = Vec::new();
             {
-                // Scope the RX/TX tokens so the inner-device borrow ends before
-                // classify_frame borrows `&self` (the skim phase never replies).
+                // Scope the tokens so the inner borrow ends before `classify_frame`.
                 let (rx, _tx) = self.inner.receive(ts)?;
                 rx.consume(|buf| {
                     let n = buf.len().min(FRAME_CAP);
@@ -661,10 +599,7 @@ impl<D: Device> Device for ForwardingDevice<D> {
                 }
             }
         };
-        // Phase 2 — hand the local frame to smoltcp with a *fresh* TX token for
-        // its reply (ARP/ICMP/socket). EthMac::transmit is always `Some`; cyw43
-        // can be `None` under TX pressure, in which case we drop this RX frame
-        // (the upper layer retransmits) rather than stall.
+        // Replay the local frame with a fresh TX token. If TX isn't ready, drop it.
         let tx = self.inner.transmit(ts)?;
         Some((ReplayRxToken { frame }, tx))
     }
@@ -678,8 +613,7 @@ impl<D: Device> Device for ForwardingDevice<D> {
     }
 }
 
-/// Owned RX token replaying a peeked local frame into smoltcp (no borrow, like
-/// `eth_mac::EthRxToken`).
+/// Owned RX token replaying a local frame into smoltcp.
 pub struct ReplayRxToken {
     frame: Frame,
 }

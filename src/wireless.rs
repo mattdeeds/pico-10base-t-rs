@@ -1,23 +1,11 @@
-//! R13 — wireless router scaffolding (Pico 2 W / CYW43439), Option A.
+//! cyw43 (Pico 2 W) LAN on `rp235x-hal`, plus the router's executor tasks.
 //!
-//! This module is gated behind the `wireless` cargo feature and is the
-//! board-independent foundation for the CYW43 integration (see
-//! `docs/router-plan.md` §4/§5). It keeps the Hazard3 RISC-V / `rp235x-hal`
-//! stack and bridges to the embassy/cyw43 world via three shims:
+//! Shims to the embassy/cyw43 world:
+//! 1. **Time driver** — `embassy-time-driver` on TIMER0 (µs counter, ALARM0 IRQ).
+//! 2. **Executor** — `embassy-executor` on `platform-riscv32`, run from main.
+//! 3. **gSPI transport** — [`PioSpiCyw43`] on PIO1, instead of `cyw43-pio`.
 //!
-//! 1. **Time driver** — an `embassy-time-driver` impl backed by RP2350 TIMER0
-//!    (`now()` from the µs counter, `schedule_wake()` via ALARM0 + its IRQ).
-//!    This is what lets `embassy-time` (and therefore cyw43's `Timer::after`
-//!    delays) work without `embassy-rp`.
-//! 2. **Async runtime** — `embassy-executor` with its `platform-riscv32`
-//!    backend, run from inside our `#[hal::entry]` main. Proves async tasks
-//!    run on Hazard3.
-//! 3. **`SpiBusCyw43` transport** — our own half-duplex gSPI implementation on
-//!    the free **PIO1** (instead of embassy-rp's `cyw43-pio`). *Skeleton here;
-//!    the real gSPI PIO program + on-board bring-up is the R13 on-device step.*
-//!
-//! Nothing in here has run on hardware yet — this is the "compiles + links +
-//! reviewable before the Pico 2 W arrives" milestone.
+//! Design: `docs/router-plan.md` §4/§5.
 
 use core::cell::RefCell;
 use core::fmt::Write as _;
@@ -46,36 +34,20 @@ use hal::pio::{
     UninitStateMachine, SM0,
 };
 
-/// WL_ON (GP23) as a push-pull SIO output — the CYW43 `pwr` pin cyw43 owns and
-/// power-cycles during `cyw43::new`. Concrete (not generic) so it can name the
-/// type of the long-lived `Runner` task. GP23 resets to `(PullDown, Null)`, so
-/// `into_push_pull_output()` yields exactly this type.
+/// WL_ON (GP23) push-pull output, concrete so the Runner task can name it.
 pub type WlOnPin =
     hal::gpio::Pin<hal::gpio::bank0::Gpio23, hal::gpio::FunctionSioOutput, hal::gpio::PullDown>;
 
 // =====================================================================
-// 0. Synchronous gSPI bring-up probe (R13 first on-board milestone)
+// 0. Bit-bang gSPI probe (unused bring-up code)
 // =====================================================================
 //
-// Before the full async cyw43 stack, prove the most uncertain things — the
-// pin map, the power sequence, and our understanding of the gSPI protocol —
-// with a slow software bit-bang that reads the CYW43's bus *test register*
-// (REG_BUS_TEST_RO = 0x14), which must read back `0xFEEDBEAD`. The result is
-// stashed in `CYW43_PROBE` and logged over the existing 10BASE-T CDC/UDP
-// telemetry (this probe runs inside the normal production build, gated by the
-// `wireless` feature — so we keep that telemetry instead of needing USB-in-async
-// or LED visibility). Once this reads 0xFEEDBEAD, the transport is proven and we
-// move the same wire format onto the PIO1 gSPI program + the async cyw43 driver.
-//
-// Pico 2 W CYW43 pins (fixed on the PCB): GP23 = WL_ON (power), GP24 = DATA
-// (bidir gSPI), GP25 = CS, GP29 = CLK.
+// Reads the bus test register (0x14), expecting 0xFEEDBEAD.
+// Pico 2 W CYW43 pins: GP23 = WL_ON, GP24 = DATA, GP25 = CS, GP29 = CLK.
 
-/// Result of the last gSPI test-register probe. 0 = not run; otherwise the
-/// (byte-order-corrected) value read — `0xFEEDBEAD` means the bus is alive.
+/// Last probe read; 0xFEEDBEAD means the bus is alive. 0 = not run.
 pub static CYW43_PROBE: AtomicU32 = AtomicU32::new(0);
-/// First read of the probe loop + a "all 64 reads identical?" flag, for
-/// diagnosis: first==last & stable ⇒ chip driving a mis-framed value (timing);
-/// varying ⇒ DATA floating / chip not responding (power/setup).
+/// First probe read, and whether all reads matched (stable = timing, varying = floating).
 pub static CYW43_PROBE_FIRST: AtomicU32 = AtomicU32::new(0);
 pub static CYW43_PROBE_STABLE: AtomicU32 = AtomicU32::new(0);
 
@@ -83,9 +55,8 @@ const PIN_PWR: u32 = 23;
 const PIN_DATA: u32 = 24;
 const PIN_CS: u32 = 25;
 const PIN_CLK: u32 = 29;
-/// Half-clock-phase spin (~0.25 µs @ 240 MHz → ~2 MHz gSPI). Slow + safe for
-/// bring-up; the real PIO transport will run far faster.
-#[allow(dead_code)] // bit-bang probe machinery — superseded by probe_cyw43_pio, kept for reference
+/// Bit-bang half-clock spin (~2 MHz gSPI at 240 MHz).
+#[allow(dead_code)] // unused bring-up probe
 const PHASE: u32 = 60;
 
 #[inline]
@@ -98,9 +69,7 @@ fn swap16(x: u32) -> u32 {
     x.rotate_left(16)
 }
 
-// Raw SIO/IO_BANK0/PADS_BANK0 GPIO bit-banging — the probe doesn't consume the
-// typed HAL pins (avoids the ownership tangle with the production `led` on
-// GP25); it poetically pokes the registers directly. Experimental + gated.
+// Raw SIO GPIO access, without claiming typed HAL pins.
 #[inline]
 fn gpio_set(n: u32) {
     unsafe { (*hal::pac::SIO::ptr()).gpio_out_set().write(|w| w.bits(1 << n)) };
@@ -119,14 +88,12 @@ fn gpio_oe(n: u32, output: bool) {
     }
 }
 #[inline]
-#[allow(dead_code)] // only the bit-bang read needs this; the PIO probe reads via the SM
+#[allow(dead_code)] // bit-bang probe only
 fn gpio_read(n: u32) -> u32 {
     (unsafe { (*hal::pac::SIO::ptr()).gpio_in().read().bits() } >> n) & 1
 }
 
-/// Route a pin to SIO function and de-isolate its pad (RP2350 pads power up
-/// isolated — the `iso` bit must be cleared before use). `ie` enabled so we can
-/// also read it (for the bidirectional DATA line).
+/// Route a pin to SIO and clear pad isolation (RP2350 pads boot isolated).
 fn gpio_to_sio(n: u32) {
     let io = unsafe { &*hal::pac::IO_BANK0::ptr() };
     let pads = unsafe { &*hal::pac::PADS_BANK0::ptr() };
@@ -140,10 +107,8 @@ fn gpio_to_sio(n: u32) {
         .write(|w| unsafe { w.funcsel().bits(5) }); // 5 = SIO
 }
 
-/// One gSPI command+read transaction, bit-banged. Clocks `cmd` out MSB-first on
-/// DATA (chip latches on the rising CLK edge), turns the line around, then
-/// clocks 32 bits back in (sampled while CLK high). CS held low throughout.
-#[allow(dead_code)] // superseded by the PIO1 transport (pio_cmd_read32)
+/// Bit-banged gSPI command + 32-bit read. CS low throughout.
+#[allow(dead_code)] // unused bring-up probe
 fn bitbang_cmd_read(cmd: u32) -> u32 {
     gpio_clr(PIN_CS); // CS low — start transaction
     hal::arch::delay(PHASE);
@@ -180,11 +145,8 @@ fn bitbang_cmd_read(cmd: u32) -> u32 {
     r
 }
 
-/// R13 bring-up probe: power the CYW43, read its bus test register, stash the
-/// result in [`CYW43_PROBE`]. Synchronous; call once at boot (it spins ~270 ms
-/// for the power-up sequence). Reads `0xFEEDBEAD` iff the transport + chip are
-/// alive. Uses `arch::delay` for timing (no Timer needed).
-#[allow(dead_code)] // superseded by probe_cyw43_pio (R13 Step 1); kept for reference
+/// Power the CYW43 and read TEST_RO into [`CYW43_PROBE`]. Blocks ~270 ms.
+#[allow(dead_code)] // unused bring-up probe
 pub fn probe_cyw43() {
     // Pins: CLK/CS/PWR as outputs (CS + CLK idle high/low), DATA starts output.
     for &n in &[PIN_CLK, PIN_CS, PIN_PWR, PIN_DATA] {
@@ -202,10 +164,7 @@ pub fn probe_cyw43() {
     gpio_set(PIN_PWR);
     ms(250);
 
-    // read32_swapped(FUNC_BUS=0, REG_BUS_TEST_RO=0x14) — the initial gSPI mode
-    // is 16-bit-swapped, so swap the cmd and the result (per cyw43 spi.rs). The
-    // real driver loops `while != FEEDBEAD` because the bus can take a few reads
-    // to settle after power-up — do the same, reporting if it ever latches.
+    // TEST_RO read. Initial gSPI mode is 16-bit swapped; retry until it settles.
     let cmd = swap16(cmd_word(false /*read*/, true /*incr*/, 0, 0x14, 4));
     let mut last = 0u32;
     let mut first = 0u32;
@@ -230,32 +189,16 @@ pub fn probe_cyw43() {
 }
 
 // =====================================================================
-// 0b. PIO1 gSPI bring-up probe (R13 Step 1 — supersedes the bit-bang)
+// 0b. PIO1 gSPI state machine, plus an unused probe
 // =====================================================================
 //
-// Same goal as `probe_cyw43` (read TEST_RO, expect 0xFEEDBEAD) but over a real
-// PIO1 gSPI state machine instead of a CPU bit-bang — so the chip's input
-// synchronizer sees the clock/data timing it actually expects (the bit-bang's
-// documented blind spot). This is the de-risk before the async cyw43 stack:
-// 0xFEEDBEAD here ⇒ our transport is proven, and we layer cyw43 on top.
-//
-// Self-contained + FIFO-driven (rp235x-hal has no easy set_x/set_y on a running
-// SM): each transaction pushes [write_bits-1, read_bits-1, data words...]. The
-// program loads X/Y from the first two words (autopull), clocks `write_bits` out
-// MSB-first (DATA driven, latched on the rising CLK edge), turns DATA around,
-// then clocks `read_bits` in (sampled while CLK is high) and autopushes — phase
-// + turnaround matched to embassy's proven cyw43-pio default program.
-//
-// Wiring: CLK = GP29 (side-set), DATA = GP24 (out/set/in — bidirectional), both
-// routed to FunctionPio1 by the caller. CS = GP25 and WL_ON = GP23 are driven
-// directly as SIO here (CS held low for the whole transaction).
+// Each transaction pushes [write_bits-1, read_bits-1, words...]. The SM clocks
+// writes out MSB-first (latched on CLK rise), turns DATA around, then samples
+// reads while CLK is high. Timing matches embassy's cyw43-pio program.
+// CLK = GP29 (side-set), DATA = GP24; CS and WL_ON are SIO.
 
-/// Build + configure the PIO1 gSPI state machine — the single source of truth
-/// for the program, shared by the probe and the async [`PioSpiCyw43`] transport.
-/// Drives the bus idle (CLK low, DATA low via `set_pins`) and returns the
-/// *stopped* SM so the caller starts it at the right moment: the probe starts it
-/// *after* the WL_ON power-up (gotcha #11); `PioSpiCyw43::new` starts it in
-/// `new()` (before cyw43 powers the chip). Does NOT touch CS or WL_ON.
+/// Build the PIO1 gSPI SM with the bus idle (CLK, DATA low); returned stopped.
+/// Doesn't touch CS or WL_ON.
 fn build_gspi_sm(
     pio: &mut hal::pio::PIO<PIO1>,
     sm: UninitStateMachine<(PIO1, SM0)>,
@@ -265,11 +208,7 @@ fn build_gspi_sm(
     Tx<(PIO1, SM0)>,
     Rx<(PIO1, SM0)>,
 ) {
-    // Self-contained FIFO-driven gSPI program (docs/router-plan.md §11 #1): each
-    // txn pushes [write_bits-1, read_bits-1, words...]. MSB-first; CLK side-set
-    // idles low; chip latches our DATA on the rising edge, drives its DATA which
-    // we sample while CLK is high. Phase + turnaround matched to embassy
-    // cyw43-pio 0.7.0's default program.
+    // Program format: see the section comment (docs/router-plan.md §11 #1).
     let program = pio::pio_asm!(
         ".side_set 1",
         ".wrap_target",
@@ -288,13 +227,7 @@ fn build_gspi_sm(
     );
     let installed = pio.install(&program.program).unwrap();
 
-    // gSPI bit clock = GSPI_PIO_HZ / 2 (the program is 2 PIO cycles/bit). Bring-up
-    // ran at 2 MHz (PIO 4 MHz), "slow + safe"; the LAN-isolation run (§3.5) proved
-    // that 2 MHz bus — not the 2.4 GHz radio — was the throughput ceiling (≈250 KB/s
-    // raw; download landed at 168 KB/s right under it). 30 MHz PIO → 15 MHz gSPI
-    // (÷8 at 240 MHz, ÷5 at 150 MHz; ~7.5× the bus). embassy's cyw43-pio runs this
-    // same 2-cycle program at ~33 MHz, so the chip is fine — the only unknown is
-    // this board's off-header CLK/DATA wiring, validated on-device after the bump.
+    // 30 MHz PIO = 15 MHz gSPI (2 cycles per bit). embassy runs ~33 MHz.
     const GSPI_PIO_HZ: f32 = 30_000_000.0;
     let (div_int, div_frac) = crate::pio_util::clock_divider(sys_clk_hz, GSPI_PIO_HZ);
     let (mut sm, rx, tx) = PIOBuilder::from_installed_program(installed)
@@ -310,8 +243,7 @@ fn build_gspi_sm(
         .push_threshold(32)
         .clock_divisor_fixed_point(div_int, div_frac)
         .build(sm);
-    // Bus idle: CLK + DATA outputs, both low. set_pins latches the pad outputs
-    // low and they hold until the caller start()s the SM.
+    // Bus idle: CLK and DATA driven low until start().
     sm.set_pindirs([
         (PIN_CLK as u8, PinDir::Output),
         (PIN_DATA as u8, PinDir::Output),
@@ -323,12 +255,9 @@ fn build_gspi_sm(
     (sm, tx, rx)
 }
 
-/// Build the PIO1 gSPI SM, power the CYW43, and read TEST_RO. Result lands in
-/// [`CYW43_PROBE`] (0xFEEDBEAD = transport + chip alive; 0xDEAD_0001 = the SM
-/// produced no word = stalled; 0xDEAD_0000 = never read). One-shot at boot —
-/// the SM is dropped (stopped) on return. `sys_clk_hz` sizes the PIO divider
-/// (~2 MHz gSPI clock — conservative for first bring-up) and the power delays.
-#[allow(dead_code)] // Step 1 transport probe — superseded by cyw43_new_blocking; kept as a minimal fallback
+/// PIO1 probe: power the CYW43 and read TEST_RO into [`CYW43_PROBE`].
+/// 0xDEAD_0001 = SM stalled; 0xDEAD_0000 = read zeros.
+#[allow(dead_code)] // unused bring-up probe
 pub fn probe_cyw43_pio(
     pio: &mut hal::pio::PIO<PIO1>,
     sm: UninitStateMachine<(PIO1, SM0)>,
@@ -345,23 +274,18 @@ pub fn probe_cyw43_pio(
     let cyc_per_ms = (sys_clk_hz / 1000).max(1);
     let ms = |n: u32| hal::arch::delay(n.saturating_mul(cyc_per_ms));
 
-    // Build the gSPI SM (shared with PioSpiCyw43); drives CLK/DATA low so the bus
-    // is held idle through the WL_ON power-up below. Returned stopped — we start
-    // it AFTER power-up (the proven ordering).
+    // Bus idles low through power-up; start the SM after.
     let (sm, mut tx, mut rx) = build_gspi_sm(pio, sm, sys_clk_hz);
 
-    // Power-cycle WL_ON *after* the bus is held idle (CLK low, CS high, DATA low),
-    // matching embassy/cyw43 (PioSpi is built — pins low — then init() powers the
-    // chip). A floating CLK/DATA during power-up can latch the CYW43 into a wrong
-    // gSPI mode; this ordering was the one thing mine got wrong vs the driver.
+    // Power-cycle WL_ON only after the bus is idle. A floating bus during
+    // power-up can latch the wrong gSPI mode.
     ms(20); // WL_ON held low ≥20 ms (chip off)
     gpio_set(PIN_PWR); // WL_ON high
     ms(250); // settle while the chip boots its gSPI
 
     let _sm = sm.start(); // keep alive (drop would stop the SM)
 
-    // Read TEST_RO (FUNC_BUS=0, addr=0x14) — initial gSPI mode is 16-bit-swapped,
-    // so swap the cmd and the result (same as the bit-bang / cyw43 read32_swapped).
+    // TEST_RO read; initial gSPI mode is 16-bit swapped.
     let cmd = swap16(cmd_word(false /*read*/, true /*incr*/, 0, 0x14, 4));
     let mut last = 0u32;
     let mut first = 0u32;
@@ -384,13 +308,9 @@ pub fn probe_cyw43_pio(
     CYW43_PROBE_STABLE.store(stable as u32, Ordering::Relaxed);
 }
 
-/// One gSPI cmd+read32 transaction over the PIO1 SM. CS is held low for the
-/// whole transaction. Pushes `[31, 63, cmd]` — X=write_bits-1 (32 cmd bits out),
-/// Y=read_bits-1 (64 bits in = data word + trailing status word, exactly as
-/// cyw43's `cmd_read` does: `read.len()*32 + 32 - 1` with `read.len()==1`). The
-/// SM autopushes two words; we return the first (the data). Returns
-/// `0xDEAD_0001` if the SM produced nothing (stalled).
-#[allow(dead_code)] // used by the Step 1 probe (probe_cyw43_pio), kept as a fallback
+/// gSPI cmd + read32 over PIO1: 32 bits out, 64 in (data + status).
+/// Returns the data word, or 0xDEAD_0001 if the SM stalled.
+#[allow(dead_code)] // unused bring-up probe
 fn pio_cmd_read32(
     tx: &mut Tx<(PIO1, SM0)>,
     rx: &mut Rx<(PIO1, SM0)>,
@@ -425,29 +345,21 @@ fn pio_cmd_read32(
 }
 
 // =====================================================================
-// 0c. Pin self-test (R13 Step 1 debug)
+// 0c. Pin self-test (unused bring-up code)
 // =====================================================================
 //
-// The PIO gSPI probe read floating data — same as the bit-bang — despite the
-// board being MicroPython-verified good. Before blaming the transport, confirm
-// the RP2350 can actually *drive* the four CYW43 pins: drive each as a plain
-// SIO output, low then high, and read it back via GPIO_IN. For a healthy pad
-// (OE on, RP2350 pad iso cleared, IE on, nothing external holding it) the
-// readback follows the driven level. A pin whose readback doesn't follow points
-// at a pad/funcsel/iso/OE fault on our side; WL_ON not following ⇒ the chip is
-// never powered (would explain everything). Result bits land at each pin's index.
+// Drives each CYW43 pin low then high as SIO and reads it back.
+// Bits land at each pin's index.
 
 /// Per-pin GPIO_IN readback when the pin was driven LOW (want 0 at bits 23/24/25/29).
-#[allow(dead_code)] // pin self-test (Step 1 debug) — pads proven; kept for reference
+#[allow(dead_code)] // unused bring-up code
 pub static CYW43_PIN_LO: AtomicU32 = AtomicU32::new(0);
 /// Per-pin GPIO_IN readback when the pin was driven HIGH (want 1 at bits 23/24/25/29).
-#[allow(dead_code)] // pin self-test (Step 1 debug) — pads proven; kept for reference
+#[allow(dead_code)] // unused bring-up code
 pub static CYW43_PIN_HI: AtomicU32 = AtomicU32::new(0);
 
-/// Drive WL_ON/CS/CLK/DATA low then high as SIO outputs, read each back. See the
-/// section comment. Leaves WL_ON high; the gSPI probe re-power-cycles after, so
-/// any toggling here is reset before the real transaction.
-#[allow(dead_code)] // pin self-test (Step 1 debug) — pads proven; kept for reference
+/// Drive each CYW43 pin low then high and record readbacks. Leaves WL_ON high.
+#[allow(dead_code)] // unused bring-up code
 pub fn pin_selftest() {
     let mut lo = 0u32;
     let mut hi = 0u32;
@@ -469,12 +381,9 @@ pub fn pin_selftest() {
 // 1. embassy-time driver on RP2350 TIMER0
 // =====================================================================
 //
-// embassy-time is configured for a 1 MHz tick (`tick-hz-1_000_000`), which
-// matches TIMER0's 1 µs counter exactly — so `now()` is the raw µs count and
-// no scaling is needed. ALARM0 (+ TIMER0_IRQ_0) drives the wakeups.
+// A 1 MHz tick matches TIMER0's µs counter. ALARM0 drives wakeups.
 
-/// We drive wakeups off TIMER0 ALARM0 → the TIMER0_IRQ_0 line.
-// Part of the async-runtime scaffolding (not used by the sync bring-up probe).
+/// Time-driver alarm IRQ.
 #[allow(dead_code)]
 const ALARM_IRQ: hal::pac::Interrupt = hal::pac::Interrupt::TIMER0_IRQ_0;
 
@@ -506,11 +415,8 @@ impl RpTimeDriver {
         }
     }
 
-    /// Arm (or disarm) ALARM0 for the next deadline `at` (µs). ALARM0 compares
-    /// only the low 32 bits, so for a deadline more than ~71 min out we arm a
-    /// near-max intermediate point and re-arm when it fires (the IRQ handler
-    /// finds nothing expired and reschedules). `u64::MAX` = no pending timer →
-    /// mask the IRQ.
+    /// Arm ALARM0 for `at` (µs), or mask it for `u64::MAX`. ALARM0 is 32-bit,
+    /// so far deadlines chain through an intermediate fire.
     fn arm_alarm(&self, at: u64) {
         let t = unsafe { &*hal::pac::TIMER0::ptr() };
         if at == u64::MAX {
@@ -566,21 +472,13 @@ fn TIMER0_IRQ_0() {
 }
 
 // =====================================================================
-// 2. SpiBusCyw43 transport on PIO1 (skeleton — real gSPI PIO is on-board work)
+// 2. gSPI transport for cyw43 (`SpiBusCyw43` on PIO1)
 // =====================================================================
 //
-// cyw43's core is transport-agnostic via `SpiBusCyw43`. embassy's `cyw43-pio`
-// is the embassy-rp reference impl; we provide our own on `rp235x-hal`'s free
-// PIO1 (a half-duplex "gSPI": shared DATA line, ~33 MHz clock). The cyw43 CS is
-// held low for the whole transfer by the impl.
-//
-// R13 Step 2: real cmd_write/cmd_read over the proven PIO1 FIFO push/pull
-// (busy-poll; DMA later). Bit counts match embassy cyw43-pio 0.7.0.
+// Synchronous busy-poll over the PIO1 FIFOs. Bit counts match cyw43-pio 0.7.0.
 
-/// Our PIO1-based half-duplex gSPI transport for the CYW43439. Owns the running
-/// gSPI SM + its FIFOs; CS (GP25) is driven directly as SIO. Built by
-/// [`PioSpiCyw43::new`] *before* `cyw43::new`, so the bus is already idle through
-/// the chip's WL_ON power-up (gotcha #11). (Constructed in R13 Step 3.)
+/// PIO1 gSPI transport for the CYW43439. CS (GP25) is SIO.
+/// Build before `cyw43::new` so the bus idles through power-up.
 #[allow(dead_code)]
 pub struct PioSpiCyw43 {
     _sm: StateMachine<(PIO1, SM0), Running>,
@@ -590,11 +488,8 @@ pub struct PioSpiCyw43 {
 
 #[allow(dead_code)]
 impl PioSpiCyw43 {
-    /// Build the gSPI transport: CS (GP25) as SIO output idle-high, the PIO1 gSPI
-    /// SM built with the bus held idle (CLK low, DATA low) and started. Does NOT
-    /// power WL_ON — that's cyw43's `pwr` pin, raised inside `cyw43::new` *after*
-    /// this exists, so the bus stays idle through the chip's power-up. Construct
-    /// BEFORE `cyw43::new`.
+    /// CS idle high, gSPI SM started with the bus idle. Doesn't power WL_ON;
+    /// `cyw43::new` does that later.
     pub fn new(
         pio: &mut hal::pio::PIO<PIO1>,
         sm: UninitStateMachine<(PIO1, SM0)>,
@@ -616,9 +511,7 @@ impl PioSpiCyw43 {
         while self.rx.read().is_some() {}
     }
 
-    /// Push one word to the TX FIFO. Bounded busy-wait so a stalled SM can't wedge
-    /// the executor forever — a timeout corrupts the txn (which cyw43's handshake
-    /// then catches) rather than hanging hard.
+    /// Push one word, bounded so a stalled SM can't hang the executor.
     fn push(&mut self, w: u32) {
         let mut spins = 0u32;
         while !self.tx.write(w) {
@@ -648,9 +541,7 @@ impl cyw43::SpiBusCyw43 for PioSpiCyw43 {
     /// Clock `write` out MSB-first, then read back the gSPI status word.
     /// X = write.len()*32 - 1 (write bits); Y = 31 (read one status word).
     async fn cmd_write(&mut self, write: &[u32]) -> u32 {
-        // Perf §3.5 step 4: this transport is synchronous busy-poll (no await in
-        // the body), so a CycleSpan over it measures the gSPI cost the cyw43
-        // Runner pays on core 0 — the `spi0%` readout.
+        // Count gSPI cycles toward `spi0` (router).
         #[cfg(feature = "router")]
         let _span = crate::cycles::CycleSpan::new(&crate::cycles::CYW43_SPI_BUSY);
         self.drain_rx();
@@ -666,10 +557,8 @@ impl cyw43::SpiBusCyw43 for PioSpiCyw43 {
         status
     }
 
-    /// Clock the 32-bit `write` cmd out, then read `read.len()` data words plus
-    /// the trailing status word. X = 31 (32 cmd bits); Y = (read.len()+1)*32 - 1.
-    /// (The backplane's extra leading word is already counted in `read.len()` by
-    /// cyw43's caller — see the trait docs.) Matches embassy cyw43-pio.
+    /// Send the 32-bit cmd, then read `read.len()` words plus status.
+    /// X = 31; Y = (read.len()+1)*32 - 1. Matches cyw43-pio.
     async fn cmd_read(&mut self, write: u32, read: &mut [u32]) -> u32 {
         #[cfg(feature = "router")]
         let _span = crate::cycles::CycleSpan::new(&crate::cycles::CYW43_SPI_BUSY);
@@ -690,101 +579,61 @@ impl cyw43::SpiBusCyw43 for PioSpiCyw43 {
         status
     }
 
-    // `wait_for_event` uses the default (active-polling) impl for now; the real
-    // one waits on the CYW43 IRQ/host-wake line.
+    // `wait_for_event` uses default active polling; host-wake IRQ isn't wired.
 }
 
 // =====================================================================
-// 2b. cyw43 bring-up via block_on (R13 Step 3 — no executor)
+// 2b. cyw43 stage flags and LAN config
 // =====================================================================
-//
-// We drive the whole bring-up with `embassy_futures::block_on` instead of the
-// embassy executor: block_on busy-spins the future, cyw43's `Timer::after`
-// delays resolve against the TIMER0 time-driver's `now()`, and our transport's
-// cmd_read/cmd_write are synchronous busy-polls — so no async runtime / alarm
-// IRQ is needed yet. `cyw43::new()` runs self-contained; `Control::init` + the
-// LED blink need the Runner running *concurrently*, so we `select(runner.run(),
-// seq)`: select returns when `seq` finishes (Runner then dropped) and block_on
-// returns, so the normal 10BASE-T loop continues and reports the stage flags
-// over CDC. (A persistent executor + continuous Runner come with R14+.)
 
 /// 1 once `cyw43::new()` returned (firmware + nvram loaded + bus handshake OK).
 pub static CYW43_NEW_DONE: AtomicU32 = AtomicU32::new(0);
 /// 1 once `Control::init(clm)` returned (CLM loaded + WiFi firmware up).
 pub static CYW43_INIT_DONE: AtomicU32 = AtomicU32::new(0);
-/// 1 once at least one onboard-LED toggle has run (`gpio_set` ioctls work); the
-/// blink loop re-sets it every cycle, so it staying 1 while `hb` climbs proves
-/// the Runner is alive.
+/// 1 once the onboard LED has toggled; stays set while the Runner lives.
 pub static CYW43_LED_DONE: AtomicU32 = AtomicU32::new(0);
-/// 1 once `Control::start_ap_wpa2(...)` returned (R14.2 — AP beaconing).
+/// 1 once the AP is up (`start_ap_wpa2` returned).
 pub static CYW43_AP_DONE: AtomicU32 = AtomicU32::new(0);
-/// 1 once the LAN smoltcp `Interface` is built + polling (R14.3 — data path up).
+/// 1 once the LAN smoltcp `Interface` is polling.
 pub static CYW43_NET_UP: AtomicU32 = AtomicU32::new(0);
 
-/// LAN gateway IP (the Pico's address on the wireless subnet, R14.3).
+/// LAN gateway IP.
 const LAN_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
 const LAN_PREFIX: u8 = 24;
 
 // =====================================================================
-// LAN-isolation perf instrumentation (docs/perf-characterization-plan.md §3.5)
+// LAN-isolation perf: traffic terminated on the Pico
 // =====================================================================
-//
-// Terminate traffic *on the Pico* to isolate the cyw43 LAN link from the
-// forward + 10BT WAN path (which the routed test conflates). The source/sink
-// + their byte counters are LAN-only (no router deps), so they exist in both
-// the `wireless` and `router` builds; only the `spi0/net0` CPU% (step 4) needs
-// the router-only `cycles` module.
 
-/// /bulk download body size (Pico→client, pure cyw43 TX). Large enough to reach
-/// steady state; the rig reads the per-second `[Lan] tx=` rate and Ctrl-C's curl
-/// once it settles (it need not run to completion).
+/// `/bulk` download size (Pico → client, pure cyw43 TX).
 const LAN_BULK_BYTES: usize = 8 * 1024 * 1024;
 
-/// TCP port of the upload sink (client→Pico, pure cyw43 RX). Read-drains +
-/// counts, no echo. Drive with `nc`/`curl -T`/a socket script (iperf3-free).
+/// Upload sink port (client → Pico, pure cyw43 RX). Drains and counts.
 const LAN_SINK_PORT: u16 = 9999;
 
-/// Cumulative bytes streamed out the `/bulk` source (cyw43 TX throughput; the
-/// per-second delta is `[Lan] tx=`). Perf §3.5 step 1.
+/// Bytes sent by `/bulk`; `[Lan] tx=` is the per-second delta.
 pub static LAN_BULK_TX_BYTES: AtomicU32 = AtomicU32::new(0);
-/// Cumulative bytes drained at the upload sink (cyw43 RX throughput; the
-/// per-second delta is `[Lan] rx=`). Perf §3.5 step 2.
+/// Bytes drained at the sink; `[Lan] rx=` is the per-second delta.
 pub static LAN_SINK_RX_BYTES: AtomicU32 = AtomicU32::new(0);
 
-/// LAN mgmt-HTTP connection state — lets the `/bulk` source stream a multi-MB
-/// body across many `net_task` poll iterations (the status page `/` is still a
-/// one-shot). Mirrors `main.rs`'s `HttpBulkState` for the 10BT `http-bulk-test`.
+/// LAN HTTP state, so `/bulk` can stream across many polls.
 enum LanHttp {
     /// Listening / the request hasn't been routed yet.
     Idle,
-    /// A `/bulk` response is in flight: send the header (once `header_sent`) then
-    /// stream the body, `remaining` bytes still to go. Carrying `header_sent` in
-    /// the state (rather than sending the header inline when the request arrives)
-    /// keeps the transfer robust if the socket can't accept the header on the
-    /// same poll the request is read.
+    /// `/bulk` in flight. The header waits for a poll where the socket can send.
     Bulk { remaining: usize, header_sent: bool },
 }
 
-// AP parameters for the LAN-side cyw43 access point.
-//
-// ⚠️  CHANGE THESE before deploying — they are compiled into the firmware. The
-// passphrase is a PLACEHOLDER; shipping a real default WPA2 passphrase publicly
-// would let anyone join a device flashed with defaults. WPA2 passphrase must be
-// 8..=63 bytes; 2.4 GHz channel. (Runtime/flash config is a future enhancement —
-// for now edit these and rebuild.)
+// AP settings, compiled into the firmware.
+// ⚠️ CHANGE before deploying: the passphrase is a placeholder.
+// WPA2 passphrase: 8..=63 bytes. Channel is 2.4 GHz.
 const AP_SSID: &str = "pico-10bt-router";
 const AP_PASSPHRASE: &str = "change-me-please";
 const AP_CHANNEL: u8 = 6;
 
-/// R13 Step 3 — full cyw43 bring-up via `block_on`: `cyw43::new()` (firmware +
-/// nvram over our PIO1 transport) → run the Runner concurrently with
-/// `Control::init(clm)` + a few onboard-LED blinks (`gpio_set` ioctls), then
-/// return. Stage flags ([`CYW43_NEW_DONE`]/[`CYW43_INIT_DONE`]/[`CYW43_LED_DONE`])
-/// are reported by `log_status`. Blocks a few seconds at our 2 MHz gSPI. `spi`
-/// must be a fresh [`PioSpiCyw43`] (bus idle); `pwr` is WL_ON (cyw43 power-cycles
-/// it during init — bus already idle, gotcha #11). Call once at boot, before the
-/// USB/10BASE-T loop. A failure inside cyw43 panics (`.unwrap()`); a chip that
-/// never answers an ioctl would hang here (the corresponding flag stays 0).
+/// Blocking cyw43 bring-up without an executor (unused; `run` replaced it).
+/// Runs `cyw43::new`, then `Control::init` and LED blinks beside the Runner
+/// via `select`, then returns.
 pub fn cyw43_bringup_blocking<PWR: embedded_hal::digital::OutputPin>(pwr: PWR, spi: PioSpiCyw43) {
     let fw = cyw43::aligned_bytes!("../cyw43-firmware/43439A0.bin");
     let nvram = cyw43::aligned_bytes!("../cyw43-firmware/nvram_rp2040.bin");
@@ -801,8 +650,7 @@ pub fn cyw43_bringup_blocking<PWR: embedded_hal::digital::OutputPin>(pwr: PWR, s
         let seq = async {
             control.init(clm).await;
             CYW43_INIT_DONE.store(1, Ordering::Relaxed);
-            // Blink the onboard LED (CYW43 GPIO0) — visible proof + exercises
-            // gpio_set ioctls through the concurrently-running Runner.
+            // Blink the onboard LED through the running Runner.
             for _ in 0..6 {
                 control.gpio_set(0, true).await;
                 Timer::after(Duration::from_millis(150)).await;
@@ -817,7 +665,7 @@ pub fn cyw43_bringup_blocking<PWR: embedded_hal::digital::OutputPin>(pwr: PWR, s
 }
 
 // =====================================================================
-// 3. Async runtime entry
+// 3. cyw43 handle types and USB
 // =====================================================================
 
 // Concrete cyw43 handle types over our PIO1 transport — needed to name the
@@ -825,11 +673,8 @@ pub fn cyw43_bringup_blocking<PWR: embedded_hal::digital::OutputPin>(pwr: PWR, s
 type CywBus = cyw43::SpiBus<WlOnPin, PioSpiCyw43>;
 type CywRunner = cyw43::Runner<'static, CywBus>;
 
-/// Build the USB stack (CDC telemetry + the picotool vendor reset interface) on
-/// a `'static` allocator, so it can move into the executor's `usb_task` and keep
-/// being polled while the executor owns core 0. Mirrors `main`'s 10BASE-T USB
-/// setup (same VID:PID, chip-ID serial number — so `picotool -f`/`cargo run`
-/// keep working). Call once.
+/// Build USB (CDC + picotool reset) on a `'static` allocator for `usb_task`.
+/// Same VID:PID and serial scheme as `main.rs`. Call once.
 #[allow(clippy::type_complexity)] // a 3-tuple of usb-device handles reads fine here
 fn build_usb(
     usb: hal::pac::USB,
@@ -854,9 +699,7 @@ fn build_usb(
     let serial = SerialPort::new(usb_bus);
     let reset_iface = crate::pico_reset::PicoResetInterface::new(usb_bus);
 
-    // Serial = chip ID, so picotool tracks us across the app→BOOTSEL reboot
-    // (see main.rs / gotcha #4). `usb_dev` borrows this string, and we return
-    // `usb_dev`, so the serial must be `'static` — stash it in a one-shot static.
+    // Serial = chip ID so picotool tracks the BOOTSEL reboot. Must be `'static`.
     static mut SERIAL_STR: core::mem::MaybeUninit<String<16>> =
         core::mem::MaybeUninit::uninit();
     let serial_str: &'static str = unsafe {
@@ -887,16 +730,12 @@ fn build_usb(
 }
 
 // =====================================================================
-// 3. Async runtime entry (R14.1 — persistent executor, continuous Runner)
+// 3b. Async runtime entry
 // =====================================================================
 
-/// Write a full byte slice to the CDC, polling the USB device between chunks so
-/// the ~128 B `usbd-serial` IN buffer is flushed to the host as it fills. The
-/// bare `serial.write()` writes only what currently fits and returns a partial
-/// count; ignoring that count silently drops the tail (R16: the longer `[Wan]`
-/// line overflowed it, truncating the `w2l`/`sent`/`drop` counters — and it was
-/// the long-standing "CDC drops bytes under load" limitation generally). The
-/// `guard` bounds the loop so a host that isn't reading (no DTR) can't hang us.
+/// Write all of `bytes` to CDC, polling USB between chunks.
+/// `serial.write` alone drops the tail once the ~128 B buffer fills.
+/// Bounded so a host that isn't reading can't hang us.
 fn cdc_write_all(
     usb_dev: &mut UsbDevice<'static, hal::usb::UsbBus>,
     serial: &mut SerialPort<'static, hal::usb::UsbBus>,
@@ -916,11 +755,8 @@ fn cdc_write_all(
     }
 }
 
-/// RX-hang watchdog feeder (see [`crate::WDT_TIMEOUT_US`]). A dedicated task so a
-/// stalled executor (the observed core-0 hang under sustained full-MTU RX) stops
-/// feeding → the hardware watchdog reboots the chip and it self-recovers. Feeds
-/// every [`crate::WDT_FEED_MS`], well inside the timeout; owns the started
-/// `Watchdog` by value.
+/// Feed the watchdog every [`crate::WDT_FEED_MS`]. If the executor stalls,
+/// feeding stops and the chip reboots.
 #[embassy_executor::task]
 async fn watchdog_feed_task(wd: hal::Watchdog) -> ! {
     loop {
@@ -929,11 +765,8 @@ async fn watchdog_feed_task(wd: hal::Watchdog) -> ! {
     }
 }
 
-/// USB poll loop, in the executor. Keeps CDC + the picotool reset interface
-/// serviced while the executor owns core 0 (so `cargo run`/`picotool -f` still
-/// reboot us into BOOTSEL), and emits a 1 Hz `[Cyw43]` status line so the cyw43
-/// bring-up stages + a live heartbeat are visible over CDC (gotcha #5: the host
-/// must assert DTR to see the bytes).
+/// Service USB (CDC + picotool reset) and emit the 1 Hz status lines.
+/// The host must assert DTR to see output.
 #[embassy_executor::task]
 async fn usb_task(
     mut usb_dev: UsbDevice<'static, hal::usb::UsbBus>,
@@ -941,19 +774,13 @@ async fn usb_task(
     mut reset_iface: crate::pico_reset::PicoResetInterface,
 ) -> ! {
     let mut n: u32 = 0;
-    // Per-second rates are normalised by the *measured* elapsed µs since the last
-    // emission, not an assumed 1 s — under load core 0 saturates and this task's
-    // 1 ms cadence slips, stretching the `n % 1000` window to several seconds
-    // (without this, all rates/% over-read, e.g. spi0 > 100%). See `permille_over`.
+    // Rates use measured elapsed time; the 1 ms cadence slips under load.
     let mut last_emit_us = embassy_time::Instant::now().as_micros();
-    // [Lan] rate state (perf §3.5): previous cumulative cyw43 TX/RX byte counters
-    // for per-second deltas (all wireless builds), plus (router) the core-0
-    // busy-cycle accumulators behind spi0/net0.
+    // Previous counters for `[Lan]` deltas.
     let (mut prev_lan_tx, mut prev_lan_rx) = (0u32, 0u32);
     #[cfg(feature = "router")]
     let (mut prev_spi, mut prev_net) = (0u32, 0u32);
-    // [Perf] rate state: previous cumulative counters (for per-second deltas) +
-    // the conntrack live high-water. Router build only.
+    // Previous counters and conntrack high-water for `[Perf]`.
     #[cfg(feature = "router")]
     let (mut prev_to_wan, mut prev_to_lan, mut prev_sent, mut ct_hwm, mut prev_c1, mut prev_fwd) =
         (0u32, 0u32, 0u32, 0usize, 0u32, 0u32);
@@ -986,11 +813,8 @@ async fn usb_task(
             );
             cdc_write_all(&mut usb_dev, &mut serial, &mut reset_iface, line.as_bytes());
 
-            // [Lan] — LAN-isolation perf (§3.5): pure cyw43 TX (/bulk download) +
-            // RX (sink :9999) throughput as per-second deltas, the TX-backpressure
-            // count, and (router) the core-0 CPU split (spi0 = gSPI transport /
-            // Runner, net0 = net_task stack). Its own line so CDC framing can't
-            // truncate a counter. Available in both the wireless + router builds.
+            // [Lan]: cyw43 TX/RX rates, TX backpressure, and (router) the core-0 split.
+            // Its own line so CDC framing can't truncate it.
             {
                 let tx = LAN_BULK_TX_BYTES.load(Ordering::Relaxed);
                 let rx = LAN_SINK_RX_BYTES.load(Ordering::Relaxed);
@@ -1032,9 +856,7 @@ async fn usb_task(
                 cdc_write_all(&mut usb_dev, &mut serial, &mut reset_iface, lline.as_bytes());
             }
 
-            // R15b — the WAN (10BASE-T) side, when the router build is active.
-            // wan_task publishes a snapshot we format here, so all CDC output
-            // stays on this one task (no serial contention).
+            // [Wan]: formatted from wan_task's snapshot, keeping CDC output on one task.
             #[cfg(feature = "router")]
             {
                 let snap = critical_section::with(|cs| WAN_PUB.borrow(cs).get());
@@ -1053,9 +875,7 @@ async fn usb_task(
                 let _ = write!(wline, "\r\n");
                 cdc_write_all(&mut usb_dev, &mut serial, &mut reset_iface, wline.as_bytes());
 
-                // R16 forwarding counters on their own line, so they can't be
-                // truncated mid-counter by CDC framing (they live past the point
-                // where the combined line used to overflow the IN buffer).
+                // [Fwd] on its own line so CDC framing can't truncate counters.
                 let mut fline: String<96> = String::new();
                 let _ = write!(
                     fline,
@@ -1067,7 +887,7 @@ async fn usb_task(
                 );
                 cdc_write_all(&mut usb_dev, &mut serial, &mut reset_iface, fline.as_bytes());
 
-                // R17 NAPT conntrack counters.
+                // [Nat] conntrack counters.
                 let mut nline: String<96> = String::new();
                 let _ = write!(
                     nline,
@@ -1082,9 +902,7 @@ async fn usb_task(
                 );
                 cdc_write_all(&mut usb_dev, &mut serial, &mut reset_iface, nline.as_bytes());
 
-                // [Perf] — per-second routed throughput + saturation/drop diagnostics.
-                // up = LAN→WAN (client upload), dn = WAN→LAN (download); rates are
-                // the byte/frame deltas over the measured window (elapsed_us).
+                // [Perf]: routed rates (up = LAN→WAN, dn = WAN→LAN) and drop causes.
                 let to_wan = crate::forward::FWD_BYTES_TO_WAN.load(Ordering::Relaxed);
                 let to_lan = crate::forward::FWD_BYTES_TO_LAN.load(Ordering::Relaxed);
                 let sent = crate::forward::FWD_SENT.load(Ordering::Relaxed);
@@ -1100,10 +918,8 @@ async fn usb_task(
                 if ct > ct_hwm {
                     ct_hwm = ct;
                 }
-                // CPU utilisation (perf step 2): busy-cycle deltas over the measured
-                // window → %. cpu1 ≈ core-1 RX-decode load; cpu0 = the share of
-                // core-0 wall-clock spent in the forwarding fast-path (NOT total
-                // core-0 load). Published to atomics so the mgmt page reflects them.
+                // cpu1 = core-1 DMA IRQ time only (thread decode isn't counted).
+                // cpu0 = forwarding share of core 0, not total load.
                 let c1 = crate::cycles::CORE1_BUSY.load(Ordering::Relaxed);
                 let fwd = crate::cycles::FWD_BUSY.load(Ordering::Relaxed);
                 let cpu1 = crate::cycles::permille_over(c1.wrapping_sub(prev_c1), elapsed_us);
@@ -1142,25 +958,18 @@ async fn usb_task(
     }
 }
 
-/// The cyw43 event loop — drives every gSPI transaction + chip event. Must run
-/// continuously for the chip to stay up (this is what R13's `block_on` could not
-/// provide once it returned). `runner.run()` itself diverges.
+/// cyw43 event loop. Must run continuously for the chip to stay up.
 #[embassy_executor::task]
 async fn cyw43_runner_task(runner: CywRunner) -> ! {
     runner.run().await
 }
 
-/// R14.3 — the LAN side: wrap cyw43's `NetDriver` in a smoltcp `phy::Device`
-/// (via [`Cyw43Phy`]) and run the Interface poll loop. Static gateway
-/// `192.168.4.1/24`; with smoltcp's `auto-icmp-echo-reply` the Interface answers
-/// ARP + ICMP echo with no sockets. R14.3 acceptance: a client statically
-/// configured as `192.168.4.2/24` (after joining the AP) pings `192.168.4.1`.
+/// LAN side: smoltcp `Interface` over [`Cyw43Phy`] at `192.168.4.1/24`.
+/// `auto-icmp-echo-reply` answers pings without a socket.
 #[embassy_executor::task]
 async fn net_task(net: cyw43::NetDriver<'static>, mac: [u8; 6]) -> ! {
-    // R16: in the router build, wrap the LAN phy so transit frames (a client's
-    // off-LAN traffic) are diverted to the WAN via LAN_TO_WAN; smoltcp still gets
-    // ARP / DHCP / mgmt / ICMP-to-us. `accept_dst: None` ⇒ forward any off-local
-    // dst. The LAN gateway IP is static, so forwarding is enabled immediately.
+    // Router: wrap the phy so off-LAN traffic diverts to the WAN.
+    // The LAN IP is static, so forwarding starts immediately.
     #[cfg(not(feature = "router"))]
     let mut device = Cyw43Phy::new(net);
     #[cfg(feature = "router")]
@@ -1185,9 +994,7 @@ async fn net_task(net: cyw43::NetDriver<'static>, mac: [u8; 6]) -> ! {
         let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(LAN_IP), LAN_PREFIX));
     });
 
-    // Sockets: the R14.4 DHCP server (UDP :67), the R14.5/R18 mgmt HTTP server
-    // (TCP :80, also the perf §3.5 /bulk download source), and the perf §3.5
-    // upload sink (TCP :9999).
+    // Sockets: DHCP server (UDP :67), mgmt HTTP + `/bulk` (TCP :80), sink (TCP :9999).
     let mut sockets_storage: [SocketStorage; 3] = [SocketStorage::EMPTY; 3];
     let mut sockets = SocketSet::new(&mut sockets_storage[..]);
     let mut dhcp_rx_meta = [udp::PacketMetadata::EMPTY; 4];
@@ -1201,11 +1008,7 @@ async fn net_task(net: cyw43::NetDriver<'static>, mac: [u8; 6]) -> ! {
     let dhcp_handle = sockets.add(dhcp_socket);
     let mut dhcp = DhcpServer::new();
 
-    // R14.5/R18 — mgmt HTTP server on the LAN gateway IP (192.168.4.1:80), also
-    // the perf §3.5 /bulk download source. RX is tiny (requests are short); TX
-    // is large so the /bulk stream stays cyw43-TX-limited, not net_task-cadence-
-    // limited (32 KB / 5 ms poll ≈ 6.4 MB/s ceiling, well above any 2.4 GHz rate;
-    // mirrors the 10BT http-bulk-test's 32 KB window).
+    // Mgmt HTTP: small RX; 32 KB TX so `/bulk` is cyw43-limited, not poll-limited.
     let mut http_rx = [0u8; 1024];
     let mut http_tx = [0u8; 32 * 1024];
     let http_socket = tcp::Socket::new(
@@ -1215,9 +1018,7 @@ async fn net_task(net: cyw43::NetDriver<'static>, mac: [u8; 6]) -> ! {
     let http_handle = sockets.add(http_socket);
     let mut lan_http = LanHttp::Idle;
 
-    // Perf §3.5 step 2 — upload sink (client→Pico, pure cyw43 RX). Large RX
-    // buffer so the advertised TCP window doesn't throttle the upload; TX is just
-    // ACKs. Read-drained + counted (no echo) by `serve_lan_sink`.
+    // Upload sink: large RX buffer so the TCP window doesn't throttle uploads.
     let mut sink_rx = [0u8; 32 * 1024];
     let mut sink_tx = [0u8; 2048];
     let sink_socket = tcp::Socket::new(
@@ -1229,19 +1030,15 @@ async fn net_task(net: cyw43::NetDriver<'static>, mac: [u8; 6]) -> ! {
     CYW43_NET_UP.store(1, Ordering::Relaxed);
     loop {
         {
-            // Perf §3.5 step 4: bracket net_task's per-poll work (smoltcp +
-            // handlers + Cyw43Phy channel ops) on core 0 → the `net0%` readout.
-            // The gSPI cost is the Runner's, measured separately (CYW43_SPI_BUSY).
+            // Count net_task poll cycles toward `net0` (router). gSPI counts separately.
             #[cfg(feature = "router")]
             let _span = crate::cycles::CycleSpan::new(&crate::cycles::LAN_NET_BUSY);
             iface.poll(now(), &mut device, &mut sockets);
-            // Drain + answer DHCP after the iface has delivered inbound datagrams;
-            // the queued replies go out on the next poll.
+            // Answer DHCP after iface.poll; replies go out next poll.
             dhcp.poll(sockets.get_mut::<udp::Socket>(dhcp_handle));
             serve_status_http(sockets.get_mut::<tcp::Socket>(http_handle), &dhcp, &mut lan_http);
             serve_lan_sink(sockets.get_mut::<tcp::Socket>(sink_handle));
-            // R16: re-emit frames the WAN side forwarded to a LAN client out the
-            // cyw43 phy (next-hop = the client, MAC from the LAN neighbor table).
+            // Router: send WAN→LAN forwarded frames out the cyw43 phy.
             #[cfg(feature = "router")]
             while let Ok(mut frame) = crate::forward::WAN_TO_LAN.try_receive() {
                 device.egress(&mut frame, now());
@@ -1251,17 +1048,14 @@ async fn net_task(net: cyw43::NetDriver<'static>, mac: [u8; 6]) -> ! {
     }
 }
 
-/// Perf §3.5 step 2 — the upload sink: a TCP listener on [`LAN_SINK_PORT`] that
-/// read-drains every byte a client uploads (no echo) and accumulates the total
-/// into [`LAN_SINK_RX_BYTES`], so the per-second delta is the *pure cyw43 RX*
-/// throughput. Re-listens after the client closes. Drive it with
-/// `head -c 64M /dev/zero | nc 192.168.4.1 9999` (or `curl -T`).
+/// Upload sink on [`LAN_SINK_PORT`]: drain and count into [`LAN_SINK_RX_BYTES`].
+/// Re-listens after close. Drive with `head -c 64M /dev/zero | nc 192.168.4.1 9999`.
 fn serve_lan_sink(socket: &mut tcp::Socket) {
     if !socket.is_open() {
         let _ = socket.listen(LAN_SINK_PORT);
         return;
     }
-    // Drain all available RX, counting it. recv consumes what the closure returns.
+    // Drain and count all available RX.
     while socket.can_recv() {
         match socket.recv(|buf| {
             let n = buf.len();
@@ -1279,18 +1073,13 @@ fn serve_lan_sink(socket: &mut tcp::Socket) {
     }
 }
 
-/// R14.5/R18 — the LAN mgmt HTTP server on `192.168.4.1:80`, route-aware:
-/// - `GET /bulk` → perf §3.5 step 1: stream [`LAN_BULK_BYTES`] of filler (pure
-///   cyw43 TX, the download-throughput test). State persists in `state` across
-///   polls; mirrors `main.rs`'s `serve_http_bulk`.
-/// - anything else (`GET /`) → the one-shot status page: AP + LAN config, the
-///   DNS handed out, connected clients (active DHCP leases), and — in the router
-///   build — the WAN link state + NAPT/forwarding counters + the LAN-isolation
-///   perf readout.
+/// LAN mgmt HTTP on `192.168.4.1:80`:
+/// - `GET /bulk`: stream [`LAN_BULK_BYTES`] of filler across polls.
+/// - otherwise: one-shot status page (AP, LAN, DNS, clients, router stats).
 ///
 /// Re-listens after each closed connection.
 fn serve_status_http(socket: &mut tcp::Socket, dhcp: &DhcpServer, state: &mut LanHttp) {
-    // Perf §3.5 step 1 — 1 KB filler (matches the UDP-blast 0x55 payload basis).
+    // 1 KB of 0x55 filler.
     const BULK_CHUNK: [u8; 1024] = [0x55; 1024];
 
     if !socket.is_open() {
@@ -1299,9 +1088,7 @@ fn serve_status_http(socket: &mut tcp::Socket, dhcp: &DhcpServer, state: &mut La
         return;
     }
 
-    // Continue an in-flight /bulk stream — send the header (once), then top the
-    // TX buffer up each poll until the body is sent (or the socket can't take
-    // more this cycle, i.e. cyw43 TX is the limiter, which is what we measure).
+    // Continue `/bulk`: header once, then top up the TX buffer each poll.
     if let LanHttp::Bulk {
         remaining,
         header_sent,
@@ -1337,8 +1124,7 @@ fn serve_status_http(socket: &mut tcp::Socket, dhcp: &DhcpServer, state: &mut La
         return;
     }
 
-    // Idle: wait for the request line so we can route it, then dispatch. (The
-    // request is short — "GET /bulk HTTP/1.1\r\n" — so it arrives in one segment.)
+    // Idle: route once the request arrives (it fits in one segment).
     let mut route_bulk = false;
     let mut have_req = false;
     if socket.may_recv() {
@@ -1353,8 +1139,7 @@ fn serve_status_http(socket: &mut tcp::Socket, dhcp: &DhcpServer, state: &mut La
     }
 
     if route_bulk {
-        // Transition unconditionally; the Bulk branch sends the header next poll
-        // (or this one isn't reachable again until then) — robust to can_send.
+        // The Bulk branch sends the header on a later poll.
         *state = LanHttp::Bulk {
             remaining: LAN_BULK_BYTES,
             header_sent: false,
@@ -1370,10 +1155,7 @@ fn serve_status_http(socket: &mut tcp::Socket, dhcp: &DhcpServer, state: &mut La
                 .load(Ordering::Relaxed)
                 .to_be_bytes(),
         );
-        // Body = header block + one line per possible lease + the WAN/NAT/Perf
-        // block, sized from POOL_LEN (~40 B/lease) so it can't silently undersize
-        // if the pool grows. head + body stays under the TX buffer; `write!`
-        // truncation is a graceful backstop.
+        // Body sized from POOL_LEN (~40 B/lease); `write!` truncates gracefully.
         const STATUS_BODY_CAP: usize = 256 + crate::dhcp_server::POOL_LEN * 40 + 768;
         let mut body: String<STATUS_BODY_CAP> = String::new();
         let _ = write!(
@@ -1400,9 +1182,7 @@ fn serve_status_http(socket: &mut tcp::Socket, dhcp: &DhcpServer, state: &mut La
             let _ = write!(body, "  (none)\r\n");
         }
 
-        // LAN-isolation perf (§3.5): cumulative cyw43 TX (/bulk) + RX (sink :9999)
-        // bytes + the TX-backpressure count. Per-second rates + CPU% are on the
-        // `[Lan]` CDC line; the spi0/net0 CPU% are added in the router block below.
+        // Cumulative LAN bytes; rates and CPU% are on `[Lan]`.
         let _ = write!(
             body,
             "LAN perf:    tx={}B rx={}B txbusy={}\r\n",
@@ -1411,8 +1191,7 @@ fn serve_status_http(socket: &mut tcp::Socket, dhcp: &DhcpServer, state: &mut La
             crate::cyw43_phy::CYW43_TX_BUSY.load(Ordering::Relaxed),
         );
 
-        // WAN link + NAPT — router build only (the WAN/conntrack subsystems
-        // don't exist in the wireless-only image).
+        // WAN and NAPT (router only).
         #[cfg(feature = "router")]
         {
             let _ = write!(body, "WAN:         ");
@@ -1446,9 +1225,7 @@ fn serve_status_http(socket: &mut tcp::Socket, dhcp: &DhcpServer, state: &mut La
                 crate::forward::FWD_QHWM_W2L.load(Ordering::Relaxed),
                 crate::forward::CHAN_DEPTH,
             );
-            // CPU utilisation (perf step 2): the last per-second sample published
-            // by usb_task. core1 = RX-decode load; core0 = forwarding fast-path
-            // share of core-0 wall-clock (not total core-0 load).
+            // Latest CPU sample from usb_task. core1 counts DMA IRQ time only.
             let c1 = crate::cycles::CPU1_PERMILLE.load(Ordering::Relaxed);
             let c0 = crate::cycles::CPU0_PERMILLE.load(Ordering::Relaxed);
             let _ = write!(
@@ -1459,8 +1236,7 @@ fn serve_status_http(socket: &mut tcp::Socket, dhcp: &DhcpServer, state: &mut La
                 c0 / 10,
                 c0 % 10,
             );
-            // LAN-isolation core-0 split (perf §3.5 step 4): spi0 = the busy-poll
-            // gSPI transport (cyw43 Runner); net0 = net_task's smoltcp/handler poll.
+            // spi0 = gSPI transport; net0 = net_task stack.
             let spi0 = crate::cycles::SPI0_PERMILLE.load(Ordering::Relaxed);
             let net0 = crate::cycles::NET0_PERMILLE.load(Ordering::Relaxed);
             let _ = write!(
@@ -1486,10 +1262,8 @@ fn serve_status_http(socket: &mut tcp::Socket, dhcp: &DhcpServer, state: &mut La
     }
 }
 
-/// One-shot bring-up: `cyw43::new()` (firmware + nvram over PIO1) → spawn the
-/// Runner → `Control::init(clm)` → blink the onboard LED forever. The LED can
-/// only keep toggling if the Runner task is continuously servicing `gpio_set`
-/// ioctls — so an indefinitely-blinking LED is the R14.1 acceptance signal.
+/// Bring up cyw43: firmware, Runner task, CLM, AP, then `net_task`.
+/// Then blinks the LED forever as a Runner liveness signal.
 #[embassy_executor::task]
 async fn cyw43_bootstrap_task(spawner: Spawner, pwr: WlOnPin, spi: PioSpiCyw43) -> ! {
     let fw = cyw43::aligned_bytes!("../cyw43-firmware/43439A0.bin");
@@ -1510,8 +1284,7 @@ async fn cyw43_bootstrap_task(spawner: Spawner, pwr: WlOnPin, spi: PioSpiCyw43) 
     control.init(clm).await;
     CYW43_INIT_DONE.store(1, Ordering::Relaxed);
 
-    // R14.2 — bring up the AP. No power-save: an AP must stay available for
-    // clients (the default PM would let the radio nap and miss beacons/probes).
+    // AP with power save off, so the radio doesn't miss probes.
     control
         .set_power_management(cyw43::PowerManagementMode::None)
         .await;
@@ -1520,16 +1293,13 @@ async fn cyw43_bootstrap_task(spawner: Spawner, pwr: WlOnPin, spi: PioSpiCyw43) 
         .await;
     CYW43_AP_DONE.store(1, Ordering::Relaxed);
 
-    // R14.3 — wire the NetDriver into a smoltcp LAN Interface. Read our MAC for
-    // the Interface's hardware address, then hand the NetDriver to net_task. The
-    // Runner keeps the chip's RX/TX channel pumped; net_task drains/fills it.
+    // Hand the NetDriver and our MAC to net_task.
     let mac = control.address().await;
     if let Ok(t) = net_task(net, mac) {
         spawner.spawn(t);
     }
 
-    // Keep blinking the onboard LED forever — our liveness proof that the Runner
-    // stays up (AP beaconing + LAN Interface polling alongside it).
+    // Blink forever: proves the Runner stays up.
     let mut on = false;
     loop {
         on = !on;
@@ -1539,15 +1309,10 @@ async fn cyw43_bootstrap_task(spawner: Spawner, pwr: WlOnPin, spi: PioSpiCyw43) 
     }
 }
 
-/// R14.1 wireless-image entry: set up the USB stack, enable the time-driver
-/// alarm IRQ, then hand core 0 to the embassy executor forever. Spawns the USB
-/// poll loop + the cyw43 bring-up (which spawns the continuous Runner). Never
-/// returns — this is the standalone-wireless build, so 10BASE-T is not started
-/// (docs/router-plan.md §11/§12).
+/// Wireless-only entry: USB, time-driver IRQ, then the executor forever.
+/// Spawns the watchdog feeder, `usb_task`, and cyw43 bring-up.
 ///
-/// `spi` must be a fresh [`PioSpiCyw43`] (bus idle); `pwr` is WL_ON (cyw43
-/// power-cycles it during init — bus already idle, gotcha #11). The caller must
-/// not also drive TIMER0 ALARM0 / `TIMER0_IRQ_0` (the time-driver owns them).
+/// `spi` must be a fresh [`PioSpiCyw43`]. The time driver owns TIMER0 ALARM0.
 pub fn run(
     pwr: WlOnPin,
     spi: PioSpiCyw43,
@@ -1573,12 +1338,11 @@ pub fn run(
         &mut *(*p).as_mut_ptr()
     };
 
-    // RX-hang watchdog: arm before the executor runs (see run_router).
+    // Arm the watchdog before the executor runs.
     watchdog.start(hal::fugit::MicrosDurationU32::micros(crate::WDT_TIMEOUT_US));
 
     executor.run(|spawner| {
-        // embassy-executor 0.10's `#[task]` macro returns a `Result` (the task
-        // arena slot can be exhausted); spawn the startup tasks.
+        // `#[task]` returns a `Result` (the task arena can be full).
         if let Ok(t) = watchdog_feed_task(watchdog) {
             spawner.spawn(t);
         }
@@ -1592,20 +1356,13 @@ pub fn run(
 }
 
 // =====================================================================
-// 4. R15b — the router: both interfaces live under one executor
+// 4. Router: both interfaces under one executor
 // =====================================================================
 //
-// `run_router` is `run` plus a `wan_task` that drives the 10BASE-T (WAN) side
-// as a 2nd smoltcp `Interface` over `EthMac`. The 10BT RX IRQ runs on **core 1**
-// (launched by `setup_eth_mac` before we hand core 0 to the executor), so the
-// long decode never starves the executor; `wan_task` only drains the inbox via
-// `EthMac::receive` (a brief `Spinlock<0>`) on its poll cadence. The cyw43 LAN
-// (`cyw43_bootstrap_task` → Runner + `net_task`) is unchanged. See
-// docs/r15-plan.md §6.
+// `run` plus `wan_task`, a second smoltcp `Interface` over `EthMac`. 10BT RX
+// decodes on core 1; `wan_task` only drains the inbox. Design: docs/r15-plan.md §6.
 
-/// WAN-client snapshot published by `wan_task` for `usb_task`'s `[Wan]` line —
-/// keeps all CDC output on the one task. `WanState` is `Copy`, so a plain `Cell`
-/// suffices under the `critical_section` mutex.
+/// `wan_task`'s snapshot for `usb_task`'s `[Wan]` line.
 #[cfg(feature = "router")]
 static WAN_PUB: Mutex<core::cell::Cell<Option<crate::wan::WanState>>> =
     Mutex::new(core::cell::Cell::new(None));
@@ -1613,11 +1370,8 @@ static WAN_PUB: Mutex<core::cell::Cell<Option<crate::wan::WanState>>> =
 #[cfg(feature = "router")]
 static WAN_CORE1_OK: AtomicU32 = AtomicU32::new(0);
 
-/// R15b WAN task: a 2nd smoltcp `Interface` on `EthMac` (the 10BASE-T phy) that
-/// runs the shared `crate::wan` DHCP-client / ping / DNS logic + the NLP
-/// keepalive, polled on a 1 ms cadence. Mirrors `main_10bt`'s WAN handling but
-/// async, beside the cyw43 LAN. `EthMac` is `'static` (owns its TX state), so it
-/// moves into the task cleanly — same shape as `net_task` taking `NetDriver`.
+/// WAN task: smoltcp `Interface` over `EthMac` with DHCP client, ping, DNS,
+/// NAPT forwarding, and NLP keepalive. Polls every 1 ms.
 #[cfg(feature = "router")]
 #[embassy_executor::task]
 async fn wan_task(mut mac: crate::eth_mac::EthMac) -> ! {
@@ -1626,14 +1380,10 @@ async fn wan_task(mut mac: crate::eth_mac::EthMac) -> ! {
     use smoltcp::socket::{dhcpv4, dns, icmp};
     use smoltcp::wire::{EthernetAddress, HardwareAddress};
 
-    // TX checksum caps for emitting/parsing ICMP echoes (read once; the device
-    // computes L3/L4 checksums on egress, no offload).
+    // Checksum caps for ICMP echoes.
     let dev_checksum = mac.capabilities().checksum;
 
-    // R16: wrap the 10BT phy so transit frames (replies destined to a LAN client)
-    // are diverted to the LAN via WAN_TO_LAN. `accept_dst` restricts forwarding to
-    // the LAN subnet; `our_ip`/`subnet`/`gateway` are UNSPECIFIED until the DHCP
-    // lease lands (forwarding stays disabled until then — see set_lease below).
+    // Wrap the phy for NAPT forwarding to the LAN subnet. Disabled until leased.
     let mut device = crate::forward::ForwardingDevice::new_napt(
         mac,
         crate::forward::IfaceCfg {
@@ -1673,28 +1423,21 @@ async fn wan_task(mut mac: crate::eth_mac::EthMac) -> ! {
 
     let mut next_nlp = embassy_time::Instant::now();
     let mut next_ping = embassy_time::Instant::now();
-    // R19: gateway from the last lease — to ARP it the instant it first
-    // appears/changes (cold-start pre-warm, see below).
+    // Last lease's gateway, to ARP it as soon as it changes.
     let mut prev_gw: Option<Ipv4Address> = None;
     loop {
         iface.poll(now(), &mut device, &mut sockets);
         crate::wan::dhcp_apply(&mut iface, &mut sockets, dhcp_handle, dns_handle, &mut wan);
-        // R16: keep the forwarder's WAN address/subnet/gateway in step with the
-        // lease (this also enables WAN-side forwarding once the lease lands).
+        // Sync the forwarder with the lease (enables WAN forwarding).
         if let Some(cidr) = wan.addr {
             device.set_lease(cidr, wan.gw);
         }
-        // R19: the instant the lease first provides a gateway (or it changes), ARP
-        // it right away — don't wait for the 1 Hz retry below — so WAN_NEIGH is warm
-        // before any client's first forwarded frame can race it.
+        // New gateway: ARP it now so the first forwarded frame finds its MAC.
         if wan.gw.is_some() && wan.gw != prev_gw {
             device.arp_gateway(now());
         }
         prev_gw = wan.gw;
-        // R18: hand the WAN-learned upstream resolver to LAN DHCP clients. With
-        // R17 NAPT forwarding their port-53 UDP, no DNS relay is needed — they
-        // query it directly through our NAT. Until a lease provides one, the
-        // 8.8.8.8 default in `LAN_DNS_OFFER` stands.
+        // Offer the WAN resolver to LAN clients; NAPT forwards their queries.
         if let Some(dns) = wan.dns0 {
             crate::dhcp_server::LAN_DNS_OFFER
                 .store(u32::from_be_bytes(dns.octets()), Ordering::Relaxed);
@@ -1703,7 +1446,7 @@ async fn wan_task(mut mac: crate::eth_mac::EthMac) -> ! {
         crate::wan::dns_harvest(&mut sockets, dns_handle, &mut wan);
 
         let nowt = embassy_time::Instant::now();
-        // NLP keepalive every 16 ms — IEEE 802.3 link integrity (gotcha #9).
+        // NLP keepalive every 16 ms (IEEE 802.3 link integrity).
         if nowt >= next_nlp {
             next_nlp = nowt + Duration::from_millis(16);
             device.inner_mut().send_nlp();
@@ -1714,23 +1457,17 @@ async fn wan_task(mut mac: crate::eth_mac::EthMac) -> ! {
             if wan.addr.is_some() {
                 crate::wan::ping_send(&mut sockets, icmp_handle, &mut wan, &dev_checksum);
                 crate::wan::dns_start(&mut iface, &mut sockets, dns_handle, &mut wan);
-                // R19: pre-warm the WAN gateway's MAC so the first forwarded
-                // LAN→WAN frame isn't dropped while WAN_NEIGH is still empty (the
-                // cold-start `[Fwd] drop`). Re-ARP each second until the passive
-                // learner has it — robust to a reply lost on the half-duplex wire
-                // — then stop (no steady-state spam).
+                // Re-ARP the gateway each second until learned.
                 if let Some(gw) = wan.gw {
                     if !crate::forward::wan_neigh_known(gw) {
                         device.arp_gateway(now());
                     }
                 }
             }
-            // R17: sweep idle NAPT conntrack entries once a second.
+            // Sweep idle NAPT entries once a second.
             crate::forward::nat_reap(now().total_millis().max(0) as u64);
         }
-        // R16: re-emit frames the LAN side forwarded toward the WAN out the 10BT
-        // phy (next-hop = the WAN gateway for off-subnet dsts, MAC from the WAN
-        // neighbor table; EthMac TX adds FCS/IFG/CSMA).
+        // Send LAN→WAN forwarded frames out the 10BT phy.
         while let Ok(mut frame) = crate::forward::LAN_TO_WAN.try_receive() {
             device.egress(&mut frame, now());
         }
@@ -1741,10 +1478,8 @@ async fn wan_task(mut mac: crate::eth_mac::EthMac) -> ! {
     }
 }
 
-/// R15b entry: `run` + the WAN task. Core 1 (10BT RX decode) must already be
-/// launched by `setup_eth_mac` before this is called (it seizes core 0). Spawns
-/// the USB poll/telemetry task, the cyw43 bring-up (→ Runner + LAN `net_task`),
-/// and `wan_task(mac)`. Never returns.
+/// Router entry: `run` plus `wan_task(mac)`. Core 1 must already be running
+/// (`setup_eth_mac`). Never returns.
 #[cfg(feature = "router")]
 #[allow(clippy::too_many_arguments)] // dispatch boundary — both interfaces' resources
 pub fn run_router(
@@ -1773,9 +1508,7 @@ pub fn run_router(
         &mut *(*p).as_mut_ptr()
     };
 
-    // RX-hang watchdog: arm before the executor runs; the feeder task (first
-    // spawned below) pets it every WDT_FEED_MS. If the executor stops scheduling
-    // (the observed core-0 hang under sustained full-MTU RX) it reboots us.
+    // Arm the watchdog before the executor runs; the feeder task pets it.
     watchdog.start(hal::fugit::MicrosDurationU32::micros(crate::WDT_TIMEOUT_US));
 
     executor.run(|spawner| {
