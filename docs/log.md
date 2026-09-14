@@ -21,12 +21,7 @@ before that date has the original wording.
   separately in `process_completed_half`. Harmless, but dead.
 - **Mislabeled CPU readouts.** The mgmt page prints `core1(rx-decode)=` and
   `[Perf]` prints `cpu1=`, but both come from `CORE1_BUSY` (IRQ only; see above).
-- **Unused bring-up code in `wireless.rs`:** `probe_cyw43`, `bitbang_cmd_read`,
-  `probe_cyw43_pio`, `pio_cmd_read32`, `pin_selftest`,
-  `cyw43_bringup_blocking`, the `CYW43_PROBE*` / `CYW43_PIN_*` statics, and
-  `PHASE`, `gpio_read`, `cmd_word`, `swap16`. Nothing calls them. Also,
-  `log_status`'s `wireless` `[Cyw43]` block never runs, since only
-  `main_10bt` (non-wireless) calls `log_status`.
+- **`nb` dependency looks unused.** Nothing in `src/` references it.
 
 ## Transport history (RX)
 
@@ -326,3 +321,50 @@ before that date has the original wording.
 - The standalone `wireless` image doesn't start 10BASE-T
   (`docs/router-plan.md` §11/§12). Gotcha #5: the host must assert DTR to see
   CDC output. Gotcha #9: NLP keepalive.
+
+- **Removed 2026-09-14:** the unused R13 bring-up code: the bit-bang probe
+  (`probe_cyw43`, `bitbang_cmd_read`, `PHASE`, `gpio_read`), the PIO probe
+  (`probe_cyw43_pio`, `pio_cmd_read32`), the pin self-test (`pin_selftest`,
+  `CYW43_PIN_LO/HI`), the `CYW43_PROBE*` statics, `cmd_word`, `swap16`,
+  `PIN_PWR`, and `cyw43_bringup_blocking` (the `block_on` bring-up) with its
+  `embassy-futures` dependency. Also the `[Cyw43]` block in `main.rs`'s
+  `log_status`, which could never run. Recover them from git history before
+  that date.
+
+## Build features (`Cargo.toml`)
+
+- **`diag`:** off by default to keep the log short and the binary small. The
+  `[R2b]` heartbeat and `[Rx]` summary always print.
+- **`decoder-openloop`** (FCS-ceiling triage, post-R10): swaps the DPLL for the
+  pre-R10 open-loop decoder at the same call site, for on-wire comparison with
+  Niccle's fixed-stride pipeline. The default binary is byte-identical.
+- **`sample-rate-20mhz`** (experiment 5): tests whether 60 MHz oversampling
+  exposes transient noise that a 20 MHz fixed-stride pipeline can't see.
+- **`clock-150mhz`** (experiment 6): rules out supply-noise or VREG-margin side
+  effects of the overclock. Combined with the decoder features it maps the
+  6-cell decoder × clock matrix.
+- **`http-bulk-test`** (experiment 4): replaces the R8 info page with a 1 MB
+  stream to compare against Niccle's 620 kB/s at "0 invalid CRC". If throughput
+  matched while our FCS counter read 30–70% fail, hypothesis #4 (their counter
+  masks silent SFD-lock failures) would make the gap paper-only.
+- **`full-duplex`:** the ISL3177E is full-duplex capable; half duplex is a MAC
+  policy. A duplex mismatch is worse than half duplex.
+- **`fd-bench`** (`docs/full-duplex-analysis.md` §7.3, Tier 2): push bulk into
+  the device while `http-bulk-test` streams out, to measure the concurrent
+  aggregate (H3) and the core-1 decode ceiling (H4). Used for both the
+  HD-bidir control and the FD-bidir run.
+- **`mss-clamp`** (`docs/rx-bulk-ceiling.md` §5): kept inbound frames under the
+  supposed ~600 B clock-drift decode cliff. That cliff was later found to be
+  DMA starvation.
+- **`wan-dhcp`** (R15a) and **`router`** (R15b): `wan-dhcp` leaves the static-IP
+  NIC build and its R4–R8 host recipes unchanged. Design: `docs/r15-plan.md`.
+- **`cyw43-phy`:** exists so pico-remote-probe's `wifi` build can reuse the
+  adapter with its own runtime.
+- **`wireless`** (R13): "Option A", keeping Hazard3 and porting the cyw43 SPI
+  transport (`docs/router-plan.md` §4/§5). `embassy-executor` is decoupled
+  from `embassy-time` and has the riscv32 backend Hazard3 needs.
+- **`embassy-time` `generic-queue-16`:** a fixed-capacity queue that works with
+  any waker, independent of the executor's timer storage. It is the robust
+  choice for a hand-rolled driver outside embassy-rp.
+- **`embassy-net-driver` 0.2.0** must match cyw43 0.7.0 exactly, or the
+  `Driver` trait is a different type (R14.3 wraps it with a no-op waker).

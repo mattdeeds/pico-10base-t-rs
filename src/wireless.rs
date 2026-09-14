@@ -39,35 +39,14 @@ pub type WlOnPin =
     hal::gpio::Pin<hal::gpio::bank0::Gpio23, hal::gpio::FunctionSioOutput, hal::gpio::PullDown>;
 
 // =====================================================================
-// 0. Bit-bang gSPI probe (unused bring-up code)
+// 0. gSPI pins, raw GPIO helpers, and the PIO1 state machine
 // =====================================================================
 //
-// Reads the bus test register (0x14), expecting 0xFEEDBEAD.
 // Pico 2 W CYW43 pins: GP23 = WL_ON, GP24 = DATA, GP25 = CS, GP29 = CLK.
 
-/// Last probe read; 0xFEEDBEAD means the bus is alive. 0 = not run.
-pub static CYW43_PROBE: AtomicU32 = AtomicU32::new(0);
-/// First probe read, and whether all reads matched (stable = timing, varying = floating).
-pub static CYW43_PROBE_FIRST: AtomicU32 = AtomicU32::new(0);
-pub static CYW43_PROBE_STABLE: AtomicU32 = AtomicU32::new(0);
-
-const PIN_PWR: u32 = 23;
 const PIN_DATA: u32 = 24;
 const PIN_CS: u32 = 25;
 const PIN_CLK: u32 = 29;
-/// Bit-bang half-clock spin (~2 MHz gSPI at 240 MHz).
-#[allow(dead_code)] // unused bring-up probe
-const PHASE: u32 = 60;
-
-#[inline]
-fn cmd_word(write: bool, incr: bool, func: u32, addr: u32, len: u32) -> u32 {
-    (write as u32) << 31 | (incr as u32) << 30 | (func & 0b11) << 28 | (addr & 0x1_FFFF) << 11
-        | (len & 0x7FF)
-}
-#[inline]
-fn swap16(x: u32) -> u32 {
-    x.rotate_left(16)
-}
 
 // Raw SIO GPIO access, without claiming typed HAL pins.
 #[inline]
@@ -87,11 +66,6 @@ fn gpio_oe(n: u32, output: bool) {
         sio.gpio_oe_clr().write(|w| unsafe { w.bits(1 << n) });
     }
 }
-#[inline]
-#[allow(dead_code)] // bit-bang probe only
-fn gpio_read(n: u32) -> u32 {
-    (unsafe { (*hal::pac::SIO::ptr()).gpio_in().read().bits() } >> n) & 1
-}
 
 /// Route a pin to SIO and clear pad isolation (RP2350 pads boot isolated).
 fn gpio_to_sio(n: u32) {
@@ -107,95 +81,10 @@ fn gpio_to_sio(n: u32) {
         .write(|w| unsafe { w.funcsel().bits(5) }); // 5 = SIO
 }
 
-/// Bit-banged gSPI command + 32-bit read. CS low throughout.
-#[allow(dead_code)] // unused bring-up probe
-fn bitbang_cmd_read(cmd: u32) -> u32 {
-    gpio_clr(PIN_CS); // CS low — start transaction
-    hal::arch::delay(PHASE);
-
-    // --- write 32 cmd bits, MSB first ---
-    gpio_oe(PIN_DATA, true);
-    for i in (0..32).rev() {
-        if (cmd >> i) & 1 != 0 {
-            gpio_set(PIN_DATA);
-        } else {
-            gpio_clr(PIN_DATA);
-        }
-        hal::arch::delay(PHASE);
-        gpio_set(PIN_CLK); // rising edge latches the bit
-        hal::arch::delay(PHASE);
-        gpio_clr(PIN_CLK);
-    }
-
-    // --- turnaround: DATA becomes an input ---
-    gpio_oe(PIN_DATA, false);
-    hal::arch::delay(PHASE);
-
-    // --- read 32 bits, MSB first (sample while CLK high) ---
-    let mut r: u32 = 0;
-    for _ in 0..32 {
-        gpio_set(PIN_CLK);
-        hal::arch::delay(PHASE);
-        r = (r << 1) | gpio_read(PIN_DATA);
-        gpio_clr(PIN_CLK);
-        hal::arch::delay(PHASE);
-    }
-
-    gpio_set(PIN_CS); // CS high — end transaction
-    r
-}
-
-/// Power the CYW43 and read TEST_RO into [`CYW43_PROBE`]. Blocks ~270 ms.
-#[allow(dead_code)] // unused bring-up probe
-pub fn probe_cyw43() {
-    // Pins: CLK/CS/PWR as outputs (CS + CLK idle high/low), DATA starts output.
-    for &n in &[PIN_CLK, PIN_CS, PIN_PWR, PIN_DATA] {
-        gpio_to_sio(n);
-        gpio_oe(n, true);
-    }
-    gpio_clr(PIN_CLK);
-    gpio_set(PIN_CS); // CS idle high
-    gpio_clr(PIN_DATA);
-
-    // Power-cycle WL_ON: low 20 ms, high, settle 250 ms (matches cyw43 init).
-    let ms = |n: u32| hal::arch::delay(n.saturating_mul(240_000)); // ~ms @ 240 MHz
-    gpio_clr(PIN_PWR);
-    ms(20);
-    gpio_set(PIN_PWR);
-    ms(250);
-
-    // TEST_RO read. Initial gSPI mode is 16-bit swapped; retry until it settles.
-    let cmd = swap16(cmd_word(false /*read*/, true /*incr*/, 0, 0x14, 4));
-    let mut last = 0u32;
-    let mut first = 0u32;
-    let mut stable = true;
-    for i in 0..64 {
-        let v = swap16(bitbang_cmd_read(cmd));
-        if i == 0 {
-            first = v;
-        } else if v != last {
-            stable = false; // some read differed from the previous → DATA varying
-        }
-        last = v;
-        if v == 0xFEED_BEAD {
-            break;
-        }
-        hal::arch::delay(24_000); // ~100 µs between attempts
-    }
-    // 0xDEAD0000 = ran but read all-zero; otherwise the last value (FEEDBEAD = win).
-    CYW43_PROBE.store(if last == 0 { 0xDEAD_0000 } else { last }, Ordering::Relaxed);
-    CYW43_PROBE_FIRST.store(first, Ordering::Relaxed);
-    CYW43_PROBE_STABLE.store(stable as u32, Ordering::Relaxed);
-}
-
-// =====================================================================
-// 0b. PIO1 gSPI state machine, plus an unused probe
-// =====================================================================
-//
-// Each transaction pushes [write_bits-1, read_bits-1, words...]. The SM clocks
-// writes out MSB-first (latched on CLK rise), turns DATA around, then samples
-// reads while CLK is high. Timing matches embassy's cyw43-pio program.
-// CLK = GP29 (side-set), DATA = GP24; CS and WL_ON are SIO.
+// gSPI SM: each transaction pushes [write_bits-1, read_bits-1, words...].
+// Clocks writes out MSB-first (latched on CLK rise), turns DATA around, then
+// samples reads while CLK is high. Timing matches embassy's cyw43-pio.
+// CLK = GP29 (side-set), DATA = GP24. CS is SIO; WL_ON is cyw43's `pwr` pin.
 
 /// Build the PIO1 gSPI SM with the bus idle (CLK, DATA low); returned stopped.
 /// Doesn't touch CS or WL_ON.
@@ -255,128 +144,6 @@ fn build_gspi_sm(
     (sm, tx, rx)
 }
 
-/// PIO1 probe: power the CYW43 and read TEST_RO into [`CYW43_PROBE`].
-/// 0xDEAD_0001 = SM stalled; 0xDEAD_0000 = read zeros.
-#[allow(dead_code)] // unused bring-up probe
-pub fn probe_cyw43_pio(
-    pio: &mut hal::pio::PIO<PIO1>,
-    sm: UninitStateMachine<(PIO1, SM0)>,
-    sys_clk_hz: u32,
-) {
-    // WL_ON (GP23) + CS (GP25) as SIO; DATA/CLK are PIO (caller-routed).
-    for &n in &[PIN_PWR, PIN_CS] {
-        gpio_to_sio(n);
-        gpio_oe(n, true);
-    }
-    gpio_set(PIN_CS); // CS idle high
-    gpio_clr(PIN_PWR); // WL_ON low (chip off) while we configure the bus pins
-
-    let cyc_per_ms = (sys_clk_hz / 1000).max(1);
-    let ms = |n: u32| hal::arch::delay(n.saturating_mul(cyc_per_ms));
-
-    // Bus idles low through power-up; start the SM after.
-    let (sm, mut tx, mut rx) = build_gspi_sm(pio, sm, sys_clk_hz);
-
-    // Power-cycle WL_ON only after the bus is idle. A floating bus during
-    // power-up can latch the wrong gSPI mode.
-    ms(20); // WL_ON held low ≥20 ms (chip off)
-    gpio_set(PIN_PWR); // WL_ON high
-    ms(250); // settle while the chip boots its gSPI
-
-    let _sm = sm.start(); // keep alive (drop would stop the SM)
-
-    // TEST_RO read; initial gSPI mode is 16-bit swapped.
-    let cmd = swap16(cmd_word(false /*read*/, true /*incr*/, 0, 0x14, 4));
-    let mut last = 0u32;
-    let mut first = 0u32;
-    let mut stable = true;
-    for i in 0..64 {
-        let v = swap16(pio_cmd_read32(&mut tx, &mut rx, cmd));
-        if i == 0 {
-            first = v;
-        } else if v != last {
-            stable = false; // some read differed → DATA varying
-        }
-        last = v;
-        if v == 0xFEED_BEAD {
-            break;
-        }
-        ms(1); // bus can take a few reads to settle after power-up
-    }
-    CYW43_PROBE.store(if last == 0 { 0xDEAD_0000 } else { last }, Ordering::Relaxed);
-    CYW43_PROBE_FIRST.store(first, Ordering::Relaxed);
-    CYW43_PROBE_STABLE.store(stable as u32, Ordering::Relaxed);
-}
-
-/// gSPI cmd + read32 over PIO1: 32 bits out, 64 in (data + status).
-/// Returns the data word, or 0xDEAD_0001 if the SM stalled.
-#[allow(dead_code)] // unused bring-up probe
-fn pio_cmd_read32(
-    tx: &mut Tx<(PIO1, SM0)>,
-    rx: &mut Rx<(PIO1, SM0)>,
-    cmd: u32,
-) -> u32 {
-    while rx.read().is_some() {} // drain any stale words
-    gpio_clr(PIN_CS); // CS low — start transaction
-    hal::arch::delay(60);
-    while !tx.write(31) {} // X = write_bits-1 → clock 32 cmd bits out
-    while !tx.write(63) {} // Y = read_bits-1  → clock 64 bits in (data + status)
-    while !tx.write(cmd) {} // 32-bit command word
-    // Response: two autopushed words — data, then the gSPI status word. Take data.
-    let mut got = 0u32;
-    let mut data = 0xDEAD_0001u32; // default: SM produced nothing
-    let mut spins = 0u32;
-    while got < 2 {
-        if let Some(w) = rx.read() {
-            if got == 0 {
-                data = w;
-            }
-            got += 1;
-        } else {
-            spins += 1;
-            if spins > 2_000_000 {
-                break;
-            }
-        }
-    }
-    hal::arch::delay(60);
-    gpio_set(PIN_CS); // CS high — end transaction
-    data
-}
-
-// =====================================================================
-// 0c. Pin self-test (unused bring-up code)
-// =====================================================================
-//
-// Drives each CYW43 pin low then high as SIO and reads it back.
-// Bits land at each pin's index.
-
-/// Per-pin GPIO_IN readback when the pin was driven LOW (want 0 at bits 23/24/25/29).
-#[allow(dead_code)] // unused bring-up code
-pub static CYW43_PIN_LO: AtomicU32 = AtomicU32::new(0);
-/// Per-pin GPIO_IN readback when the pin was driven HIGH (want 1 at bits 23/24/25/29).
-#[allow(dead_code)] // unused bring-up code
-pub static CYW43_PIN_HI: AtomicU32 = AtomicU32::new(0);
-
-/// Drive each CYW43 pin low then high and record readbacks. Leaves WL_ON high.
-#[allow(dead_code)] // unused bring-up code
-pub fn pin_selftest() {
-    let mut lo = 0u32;
-    let mut hi = 0u32;
-    for &pin in &[PIN_PWR, PIN_CS, PIN_CLK, PIN_DATA] {
-        gpio_to_sio(pin);
-        gpio_oe(pin, true);
-        gpio_clr(pin);
-        hal::arch::delay(200); // let the input synchronizer settle
-        lo |= gpio_read(pin) << pin;
-        gpio_set(pin);
-        hal::arch::delay(200);
-        hi |= gpio_read(pin) << pin;
-    }
-    CYW43_PIN_LO.store(lo, Ordering::Relaxed);
-    CYW43_PIN_HI.store(hi, Ordering::Relaxed);
-}
-
 // =====================================================================
 // 1. embassy-time driver on RP2350 TIMER0
 // =====================================================================
@@ -384,7 +151,6 @@ pub fn pin_selftest() {
 // A 1 MHz tick matches TIMER0's µs counter. ALARM0 drives wakeups.
 
 /// Time-driver alarm IRQ.
-#[allow(dead_code)]
 const ALARM_IRQ: hal::pac::Interrupt = hal::pac::Interrupt::TIMER0_IRQ_0;
 
 struct RpTimeDriver {
@@ -479,14 +245,12 @@ fn TIMER0_IRQ_0() {
 
 /// PIO1 gSPI transport for the CYW43439. CS (GP25) is SIO.
 /// Build before `cyw43::new` so the bus idles through power-up.
-#[allow(dead_code)]
 pub struct PioSpiCyw43 {
     _sm: StateMachine<(PIO1, SM0), Running>,
     tx: Tx<(PIO1, SM0)>,
     rx: Rx<(PIO1, SM0)>,
 }
 
-#[allow(dead_code)]
 impl PioSpiCyw43 {
     /// CS idle high, gSPI SM started with the bus idle. Doesn't power WL_ON;
     /// `cyw43::new` does that later.
@@ -630,39 +394,6 @@ enum LanHttp {
 const AP_SSID: &str = "pico-10bt-router";
 const AP_PASSPHRASE: &str = "change-me-please";
 const AP_CHANNEL: u8 = 6;
-
-/// Blocking cyw43 bring-up without an executor (unused; `run` replaced it).
-/// Runs `cyw43::new`, then `Control::init` and LED blinks beside the Runner
-/// via `select`, then returns.
-pub fn cyw43_bringup_blocking<PWR: embedded_hal::digital::OutputPin>(pwr: PWR, spi: PioSpiCyw43) {
-    let fw = cyw43::aligned_bytes!("../cyw43-firmware/43439A0.bin");
-    let nvram = cyw43::aligned_bytes!("../cyw43-firmware/nvram_rp2040.bin");
-    let clm: &[u8] = include_bytes!("../cyw43-firmware/43439A0_clm.bin");
-
-    // cyw43::State is large (driver + channel buffers) — keep it in a static.
-    static mut STATE: cyw43::State = cyw43::State::new();
-    let state = unsafe { &mut *core::ptr::addr_of_mut!(STATE) };
-
-    embassy_futures::block_on(async move {
-        let (_net, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
-        CYW43_NEW_DONE.store(1, Ordering::Relaxed);
-
-        let seq = async {
-            control.init(clm).await;
-            CYW43_INIT_DONE.store(1, Ordering::Relaxed);
-            // Blink the onboard LED through the running Runner.
-            for _ in 0..6 {
-                control.gpio_set(0, true).await;
-                Timer::after(Duration::from_millis(150)).await;
-                control.gpio_set(0, false).await;
-                Timer::after(Duration::from_millis(150)).await;
-            }
-            CYW43_LED_DONE.store(1, Ordering::Relaxed);
-        };
-        // Drive the Runner (cyw43 event loop) until `seq` completes, then return.
-        embassy_futures::select::select(runner.run(), seq).await;
-    });
-}
 
 // =====================================================================
 // 3. cyw43 handle types and USB

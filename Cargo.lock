@@ -927,7 +927,6 @@ dependencies = [
  "critical-section",
  "cyw43",
  "embassy-executor",
- "embassy-futures",
  "embassy-net-driver",
  "embassy-sync",
  "embassy-time",

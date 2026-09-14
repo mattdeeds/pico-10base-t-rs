@@ -12,91 +12,39 @@ keywords = ["rp2350", "10base-t", "ethernet", "pio", "embedded"]
 categories = ["embedded", "no-std", "network-programming"]
 
 [features]
-# Verbose per-second diagnostics over USB CDC: the [Mac] TX-categorization
-# line, the TX/frame hex dumps, and the decoded-frame pretty-print. Off by
-# default so steady-state builds stay lean (shorter log + smaller binary);
-# enable with `--features diag` when bringing up a feature. The cheap [R2b]
-# heartbeat + [Rx] decode summary always print.
+# Verbose 1 Hz CDC diagnostics ([Stitch], [Mac], hex dumps).
 diag = []
 
-# A/B experiment knob (FCS-ceiling triage, post-R10): swap the productized
-# edge-track DPLL decoder for the pre-R10 open-loop locked-once decoder.
-# Same call site, same downstream pipeline; only the per-bit sampling
-# strategy changes. Default off → DPLL (today's behaviour, byte-identical
-# binary). Enable for on-wire comparison against Niccle-style fixed-stride.
-# See `niccle-comparison-fcs-ceiling` memory + the triage plan.
+# Experiment: open-loop decoder instead of the edge-track DPLL.
 decoder-openloop = []
 
-# A/B experiment knob (FCS-ceiling triage, experiment 5): drop the PIO
-# sampler from 60 MHz (3 samples/half-bit) to 20 MHz (1 sample/half-bit),
-# matching Niccle's digital pipeline exactly. Auto-implies decoder-openloop
-# because edge-tracking is meaningless at 1 sample/half-bit. Tests whether
-# the 60 MHz oversampling itself is what's exposing us to transient noise
-# the 20 MHz fixed-stride pipeline physically can't see. See the triage plan.
+# Experiment: sample RX at 20 MHz (1 per half-bit); implies open-loop.
 sample-rate-20mhz = ["decoder-openloop"]
 
-# A/B experiment knob (FCS-ceiling triage, experiment 6): drop sys_clk from
-# the R10 240 MHz overclock back to the HAL stock 150 MHz. At 150 MHz the
-# PIO dividers go back to fractional (RX ÷2.5, TX ÷7.5, ±3.3 ns jitter) but
-# we lose any second-order supply-noise / VREG-margin contribution of the
-# overclock. Combine with other features to map the 6-cell decoder × clock
-# matrix (DPLL vs openloop vs 20 MHz openloop, each at 240 and 150 MHz).
+# Experiment: stock 150 MHz sys_clk instead of the 240 MHz overclock.
 clock-150mhz = []
 
-# Methodology cross-check (FCS-ceiling triage, experiment 4): swap the R8
-# tiny-info HTTP response for a 1 MB streaming payload on port 80. With
-# this enabled, `curl http://192.168.37.24/` downloads 1 MB so we can
-# measure achieved kB/s vs Niccle's 620 kB/s (which they reported at
-# "0 invalid CRC"). If our throughput is in their ballpark while our FCS
-# counter still reads 30-70 % fail, hypothesis #4 (their counter masks
-# silent SFD-lock failures) is confirmed and the gap is paper-only.
+# Experiment: HTTP :80 streams 1 MB for throughput tests.
 http-bulk-test = []
 
-# Experiment: 10BASE-T full-duplex MAC mode (docs/full-duplex-analysis.md §7).
-# The board's ISL3177E transceiver is full-duplex-capable; half-duplex is a MAC
-# *policy*. This flag disables that policy — the carrier-sense (Phase 3d) +
-# CSMA/CA backoff (Phase 3e) in eth_tx.rs — so TX no longer defers to RX carrier.
-# ONLY safe when the link partner is also forced to 10M full-duplex
-# (`ethtool -s <if> speed 10 duplex full autoneg off`); a duplex mismatch is
-# WORSE than half-duplex. OFF by default → the production NIC binary is unchanged.
+# Experiment: full-duplex MAC with no carrier sense or CSMA/CA. Only safe
+# when the peer is forced to 10M full duplex (docs/full-duplex-analysis.md §7).
 full-duplex = []
 
-# Experiment harness for the full-duplex Tier-2 measurement
-# (docs/full-duplex-analysis.md §7.3): adds a TCP *upload sink* on port 9999
-# (read-drains + counts bytes, re-listens per connection) so a host can push
-# bulk data INTO the device while `http-bulk-test` streams bulk OUT — i.e. drive
-# the 10BT link hard in BOTH directions at once to measure the concurrent
-# (H3) aggregate + the core-1 decode ceiling (H4). Also emits a `[Sink]` CDC
-# line (bytes sunk + core-1 `cpu1`). Enable for BOTH the HD-bidir control and
-# the FD-bidir run; combine with `full-duplex` only for the FD run. Default off
-# → production NIC binary unchanged.
+# Experiment: TCP upload sink on :9999 and a [Sink] rate line.
 fd-bench = []
 
-# Experiment (docs/rx-bulk-ceiling.md §5): clamp the 10BT IP MTU (eth_mac::MTU)
-# so smoltcp advertises a small TCP MSS → peers send sub-knee segments, keeping
-# inbound frames below the ~600 B on-wire clock-drift decode cliff. Tests whether
-# that lifts RX-of-bulk past the ~100 KB/s ceiling without touching the decoder.
-# Default off → production MTU (1500) unchanged.
+# Experiment: 1000-byte MTU so peers send smaller segments.
 mss-clamp = []
 
-# R15a — make the 10BASE-T (WAN) side a DHCP *client* (instead of the static
-# 192.168.37.24): smoltcp's dhcpv4 client gets us an upstream IP + default route
-# + DNS, and the device originates a ping to 8.8.8.8 + resolves a name to prove
-# it reaches the internet out the wired link. OFF by default so the production
-# NIC build (static IP, all the R4–R8 host test recipes) is unchanged. The first
-# of the two R15 sub-steps; R15b (`router`) unifies this under the executor
-# alongside the wireless LAN — see docs/r15-plan.md.
+# WAN DHCP client, ping, and DNS in the blocking NIC loop.
 wan-dhcp = [
-    "smoltcp/socket-dhcpv4",   # DHCP client socket (proto-dhcpv4 wire codec already on)
-    "smoltcp/socket-icmp",     # device-originated ping (acceptance: ping 8.8.8.8)
-    "smoltcp/socket-dns",      # device-originated name resolution (acceptance: resolve a name)
+    "smoltcp/socket-dhcpv4",
+    "smoltcp/socket-icmp",
+    "smoltcp/socket-dns",
 ]
 
-# R15b — the router: BOTH interfaces live at once. Pulls in the wireless LAN
-# stack (cyw43 + embassy executor, = `wireless`) AND the WAN-client sockets, and
-# unifies them under one executor — the 10BT RX IRQ on core 1 + a `wan_task`
-# (the R15a dhcpv4/icmp/dns logic, async) on core 0 beside the cyw43 LAN. OFF by
-# default. NAPT/forwarding stay R16/R17. See docs/r15-plan.md §6.
+# Router: cyw43 LAN + 10BASE-T WAN with forwarding and NAPT.
 router = [
     "wireless",
     "smoltcp/socket-dhcpv4",
@@ -104,18 +52,10 @@ router = [
     "smoltcp/socket-dns",
 ]
 
-# The smoltcp phy::Device adapter over cyw43's NetDriver (src/cyw43_phy.rs) as
-# a narrow *library* feature: just the cyw43 driver + the embassy-net-driver
-# trait, NO executor/time runtime. External consumers (pico-remote-probe's
-# `wifi` build) enable this to reuse the adapter while supplying their own
-# runtime; the in-tree `wireless` build pulls it in below.
+# Library: smoltcp device over cyw43, without the executor or time runtime.
 cyw43-phy = ["dep:cyw43", "dep:embassy-net-driver"]
 
-# R13 — wireless router scaffolding (Pico 2 W / CYW43439). Pulls in the cyw43
-# driver + the async runtime (embassy-executor arch-riscv32 + embassy-time on a
-# custom rp235x-hal time-driver). OFF by default so the production 10BASE-T
-# build is unchanged. Architecture = "Option A" (keep Hazard3 RISC-V, port the
-# cyw43 SPI transport) — see docs/router-plan.md §4/§5.
+# cyw43 wireless AP on the Pico 2 W (embassy executor, custom time driver).
 wireless = [
     "cyw43-phy",
     "dep:cyw43",
@@ -124,28 +64,19 @@ wireless = [
     "dep:embassy-time-driver",
     "dep:embassy-time-queue-utils",
     "dep:embassy-sync",
-    "dep:embassy-futures",
     "dep:embassy-net-driver",
-    # DHCP wire codec (DhcpRepr/DhcpPacket) for the LAN DHCP server (R14.4).
-    # Enabled only in the wireless build so the default 10BT smoltcp set is
-    # unchanged.
-    "smoltcp/proto-dhcpv4",
+    "smoltcp/proto-dhcpv4", # DHCP codec for the LAN server
 ]
 
 [dependencies]
 critical-section = "1.2.0"
 cyw43 = { version = "0.7.0", default-features = false, optional = true }
-# R13 wireless stack (all optional, gated by the `wireless` feature). Versions
-# are pinned to the set cyw43 0.7.0 requires: embassy-time 0.5.1 → time-driver
-# 0.2.2 + queue-utils 0.3. embassy-executor is decoupled from embassy-time and
-# has the `arch-riscv32` backend we need for Hazard3 (see docs/router-plan §4).
+# Wireless stack (optional). Versions match what cyw43 0.7.0 requires.
 embassy-executor = { version = "0.10.0", default-features = false, features = [
     "platform-riscv32",
     "executor-thread",
 ], optional = true }
-# `generic-queue-16` = a fixed-capacity (16) timer queue that works with any
-# waker, decoupled from the executor's integrated-timer storage — the robust
-# choice for our hand-rolled driver on a non-embassy-rp target.
+# Fixed 16-slot timer queue that works with our hand-rolled time driver.
 embassy-time = { version = "0.5.1", features = [
     "tick-hz-1_000_000",
     "generic-queue-16",
@@ -153,10 +84,7 @@ embassy-time = { version = "0.5.1", features = [
 embassy-time-driver = { version = "0.2.2", optional = true }
 embassy-time-queue-utils = { version = "0.3.2", optional = true }
 embassy-sync = { version = "0.8.0", optional = true }
-embassy-futures = { version = "0.1.2", optional = true }
-# The `Driver` trait cyw43's NetDriver implements. Pinned to the exact version
-# cyw43 0.7.0 uses (0.2.0) so the trait identity matches — R14.3 wraps this
-# behind a noop-waker Context to expose a smoltcp phy::Device.
+# Same version cyw43 0.7.0 uses, so the `Driver` trait types match.
 embassy-net-driver = { version = "0.2.0", optional = true }
 embedded-hal = "1.0.0"
 fugit = "0.3.6"

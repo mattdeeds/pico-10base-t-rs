@@ -734,20 +734,6 @@ fn log_status<B: UsbBus>(
     );
     let _ = serial.write(line.as_bytes());
 
-    // cyw43 stage flags. Never runs: only non-wireless builds call log_status.
-    #[cfg(feature = "wireless")]
-    {
-        line.clear();
-        let _ = writeln!(
-            line,
-            "[Cyw43] new={} init={} led={} (1=ok: new=fw+nvram, init=CLM+wifi, led=gpio_set blink)",
-            wireless::CYW43_NEW_DONE.load(Ordering::Relaxed),
-            wireless::CYW43_INIT_DONE.load(Ordering::Relaxed),
-            wireless::CYW43_LED_DONE.load(Ordering::Relaxed),
-        );
-        let _ = serial.write(line.as_bytes());
-    }
-
     // Snapshot and reset RX stats.
     let rx = eth_mac::snapshot_rx_stats();
     let last_dst_mac: [u8; 6] = if rx.last_frame_snapshot_len >= 6 {
